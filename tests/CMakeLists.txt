@@ -179,6 +179,8 @@ llama_build(test-inkmiss-cpu.cpp LINK ggml) # [INKMISS] CPU MUL_MAT_ID hashes: r
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 llama_build_and_test(test-kq-mask-pack.cpp)
+llama_build_and_test(test-kld-topk.cpp)
+target_include_directories(test-kld-topk PRIVATE ${PROJECT_SOURCE_DIR}/tools/perplexity)
 llama_build_and_test(test-gdn-prefix-lanes.cpp LABEL "turbo") # [TAG_GDN_REPLAY_LANES] per-lane prefix mask
 llama_build_and_test(test-sjkvarn-codec.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
@@ -891,6 +893,8 @@ llama_build_and_test(test-ai4-u2.cpp)
 llama_build_and_test(test-ai4-turbo-ids-route.cpp)   # [TURBO-IDS] direct-ids routing math vs the ids_helper contract (CPU only)
 llama_build_and_test(test-gguf-deprecated-ai.cpp)
 
+llama_build_and_test(test-i8qk-ext-cpu.cpp LABEL "cpu" LINK ggml-base)
+
 if (GGML_CUDA AND NOT GGML_BACKEND_DL) # test-magic2-v2 links ggml-cuda directly (a MODULE under GGML_BACKEND_DL)
     enable_language(CUDA)
     add_executable(test-magic2-v2 test-magic2-v2.cu)
@@ -903,6 +907,10 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL) # test-magic2-v2 links ggml-cuda directly
     target_link_libraries(bench-prefill-glue PRIVATE ggml-base ggml-cuda)
     target_include_directories(bench-prefill-glue PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/ggml/src)
     set_target_properties(bench-prefill-glue PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 86)
+    add_executable(bench-i8qk-unblock bench-i8qk-unblock.cu)
+    target_link_libraries(bench-i8qk-unblock PRIVATE ggml ggml-base ggml-cpu ggml-cuda)
+    target_include_directories(bench-i8qk-unblock PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    set_target_properties(bench-i8qk-unblock PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 86)
 endif()
 
 # Pure-CPU verification harness for prefill-glue numerics (zero CUDA runtime / GPU device usage)

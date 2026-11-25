@@ -1567,6 +1567,12 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // [EXACTHEAD] LLAMA_D1_HEAD=@model/<file>: the exact-head add-on file beside the model (off when unset)
+    if (const char * d1 = std::getenv("LLAMA_D1_HEAD"); d1 && std::strncmp(d1, "@model/", 7) == 0) {
+        const std::string path = (std::filesystem::path(params.model.path).parent_path() / (d1 + 7)).string();
+        common_set_env("LLAMA_D1_HEAD", path);
+        LOG_INF("LLAMA_D1_HEAD=%s\n", path.c_str());
+    }
     if (!params.card_preset.empty()) {
         const auto & card = common_card_preset_get(params.card_preset);
         const std::string preset_env = common_card_preset_apply_env(params);

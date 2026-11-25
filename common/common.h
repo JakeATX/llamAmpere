@@ -371,6 +371,7 @@ struct common_params_speculative_draft {
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
     int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (also the starting depth)
     int32_t dspark_n_max_prev = 0;   // INKSPEC2: n_max before the DSpark mb default raised it (0 = not raised); non-Inkling DSpark drafters restore it
+    int32_t dspark_inkdepth_legacy = 0; // INKDEPTH: the fixed DSpark depth the per-round depth replaces (0 = INKDEPTH not set up)
     bool    dspark_adaptive = false; // INKSPEC2: DSpark drafts at the streak-controller depth in [n_min_adaptive, n_max] (with --spec-draft-n-min-adaptive, or mb on with no depth flags and LLAMA_DSPARK_ADAPT=1)
 
     // CDEPTH (draft-mtp-adaptive only): "streak" = the streak controller (default); "cdepth" = per-token confidence

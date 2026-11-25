@@ -16,6 +16,7 @@
 
 #include "inksjd128.cuh"
 #include "fattn-common.cuh"
+#include "fattn-i8qk.cuh"
 #include "fattn-mma-f16.cuh"
 #include "inkgqa.cuh"
 #include "qsa-resident.cuh"
@@ -284,14 +285,21 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const size_t pool_cap = size_t(256) << 20;
     const bool reserved = avail_r >= kv_head_bytes;
     const size_t qu_bytes = GGML_PAD((size_t) n_head*T*128*sizeof(float), 128);
-    // the pool part (Q, the group's output and LSE, and K/V unless reserved) stays within pool_cap: shrink the group
-    auto pool_bytes = [&](int G_) {
+    bool try_i8qk = ggml_cuda_fattn_i8qk_enabled() && ggml_cuda_fattn_i8qk_f16_enabled() &&
+        T >= ggml_cuda_fattn_i8qk_min_q() && ((!snk && !lse) || ggml_cuda_fattn_i8qk_ext_enabled());
+    // the pool part (Q, the group's output and LSE, K/V unless reserved, and i8qk Kq when enabled) stays within pool_cap:
+    // shrink the group if needed, or fall back to f16 if even G=1 with Kq would exceed pool_cap
+    auto pool_bytes = [&](int G_, bool with_i8qk) {
         const size_t Hg_ = (size_t) 2*g*G_;
         return qu_bytes + GGML_PAD(Hg_*T*128*sizeof(float), 128) + (lse ? GGML_PAD(Hg_*T*sizeof(float), 128) : 0) +
-            (reserved ? 0 : GGML_PAD((size_t) G_*kv_head_bytes, 128));
+            (reserved ? 0 : GGML_PAD((size_t) G_*kv_head_bytes, 128)) +
+            (with_i8qk ? GGML_PAD((size_t) G_*n_kv*256, 128) : 0);
     };
     int G = (int) std::min<size_t>(P, reserved ? avail_r/kv_head_bytes : pool_cap/kv_head_bytes);
-    while (G >= 1 && pool_bytes(G) > pool_cap) {
+    if (try_i8qk && G >= 1 && pool_bytes(1, true) > pool_cap) {
+        try_i8qk = false;
+    }
+    while (G >= 1 && pool_bytes(G, try_i8qk) > pool_cap) {
         --G;
     }
     if (G < 1) {
@@ -300,14 +308,16 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int Hg_max = 2*g*G;
     const size_t ou_bytes = GGML_PAD((size_t) Hg_max*T*128*sizeof(float), 128);
     const size_t lg_bytes = lse ? GGML_PAD((size_t) Hg_max*T*sizeof(float), 128) : 0;
-    const size_t pool_need = pool_bytes(G);
+    const size_t kv_bytes = reserved ? 0 : GGML_PAD((size_t) G*kv_head_bytes, 128);
+    const size_t pool_need = pool_bytes(G, try_i8qk);
     ggml_cuda_pool_alloc<char> pool(ctx.pool(), pool_need);
-    float * Qu  = (float *) pool.get();
-    float * Ou  = (float *) (pool.get() + qu_bytes);
-    float * Lg  = lse ? (float *) (pool.get() + qu_bytes + ou_bytes) : nullptr;
-    char  * kvp = reserved ? (char *) dst->data + offset : pool.get() + qu_bytes + ou_bytes + lg_bytes;
-    half  * Ks  = (half *) kvp;
-    half  * Vs  = Ks + (size_t) G*n_kv*256;
+    float * Qu    = (float *) pool.get();
+    float * Ou    = (float *) (pool.get() + qu_bytes);
+    float * Lg    = lse ? (float *) (pool.get() + qu_bytes + ou_bytes) : nullptr;
+    char  * kvp   = reserved ? (char *) dst->data + offset : pool.get() + qu_bytes + ou_bytes + lg_bytes;
+    char  * kq_ws = try_i8qk ? (pool.get() + qu_bytes + ou_bytes + lg_bytes + kv_bytes) : nullptr;
+    half  * Ks    = (half *) kvp;
+    half  * Vs    = Ks + (size_t) G*n_kv*256;
 
     {
         const int64_t rows_q = (int64_t) T*n_head;
@@ -384,7 +394,12 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         out.data = Ou; out.buffer = nullptr; out.view_src = nullptr; out.view_offs = 0;
         if (!ggml_cuda_inkgqa_fa_try(ctx, &out)) { // [INKGQA] GGML_CUDA_INKGQA_FAR=1: one K/V tile per 3 q heads
             GGML_ASSERT(!mpk && "INKGQA declined a packed-mask D128 group");
-            ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
+            // [I8X] opt-in (GGML_CUDA_FA_I8QK_F16=1): int8 Q.K on the group's expanded f16 K/V; INKGQA keeps priority
+            if (try_i8qk && ggml_cuda_fattn_i8qk_applies_f16kv(cc, &out)) {
+                ggml_cuda_flash_attn_ext_i8qk(ctx, &out, 0, 2*Gc, kq_ws, nullptr);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
+            }
         }
 
         const int64_t rows_o = (int64_t) T*Hg;

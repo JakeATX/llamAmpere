@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include "split-waves.cuh"
 
 static int ait_env_int(const char * name, int def) {
     const char * v = getenv(name);
@@ -1835,7 +1836,7 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     }();
     if (midt > 0 && code == 0 && T >= 9 && T <= midt_max) {
         const int ctas = (M / 32 + 7) / 8;
-        int sp = midt > 1 ? midt : ggml_cuda_info().devices[id].nsm / ctas;
+        int sp = midt > 1 ? midt : ggml_cuda_midt_splits(ctas, ggml_cuda_info().devices[id].nsm, std::min(8, S / 2));
         sp = std::max(1, std::min(sp, std::min(8, S / 2)));
         const int nb = T <= 16 ? 2 : (int) ((T + 7) / 8), t = (int) T;
         switch (k * 16 + nb) {

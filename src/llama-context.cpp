@@ -879,12 +879,52 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             case LLAMA_D1_SCOPE_ERROR: throw std::runtime_error("d1: " + d1_msg);
             case LLAMA_D1_SCOPE_ON:
                 {
-                    const int n_top = (int) std::max(0L, env_int("LLAMA_D1_N", 256));
+                    // [EXACTHEAD] the 8 GB AIF25 head needs only the top 64 (study: sampled TV 0 at R=64)
+                    const bool aif25 = din.out_type == (int) GGML_TYPE_AIF25_U2;
+                    const int n_top = (int) std::max(0L, env_int("LLAMA_D1_N", aif25 ? 64 : 256));
                     const int eager = (int) std::max(0L, env_int("LLAMA_D1_EAGER_MAX", std::max<long>(64, 8L * cparams.n_seq_max)));
                     const int n_thr = (int) std::max(1L, env_int("LLAMA_D1_THREADS", std::min<long>(cparams.n_threads, 8)));
-                    d1 = std::make_unique<llama_d1_ctx>(d1_head, n_top, eager, n_thr);
-                    LLAMA_LOG_INFO("d1: AIT2 head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d)\n",
-                            n_top, d1_head->path.c_str(), d1_head->type == GGML_TYPE_F16 ? "f16" : "q8_0", eager, n_thr);
+                    // [EXACTHEAD] the sigma certificate: statistically exact (Jake 11-21), so on by default whenever the
+                    // sidecar carries output_exact.gl2; LLAMA_D1_CERT=0 is its kill switch, LLAMA_D1_CERT=1 requires it
+                    llama_d1_cert cert;
+                    const long cert_env = env_int("LLAMA_D1_CERT", -1);
+                    cert.on = cert_env != 0 && (cert_env > 0 || d1_head->gl2 != nullptr);
+                    if (cert.on) {
+                        if (!d1_head->gl2) {
+                            throw std::runtime_error("d1: LLAMA_D1_CERT=1 but the sidecar " + d1_head->path +
+                                    " has no output_exact.gl2 (remake it with d1_make_sidecar.py --stats)");
+                        }
+                        const auto env_float = [](const char * name, float def) {
+                            const char * v = getenv(name);
+                            return v && v[0] ? strtof(v, nullptr) : def;
+                        };
+                        cert.k      = (int) std::max(1L, env_int("LLAMA_D1_CERT_K", 20));
+                        cert.sigma  = std::max(0.0f, env_float("LLAMA_D1_CERT_SIGMA", 6.0f));
+                        cert.margin = std::max(0.0f, env_float("LLAMA_D1_CERT_MARGIN", 0.1f));
+                    }
+                    d1 = std::make_unique<llama_d1_ctx>(d1_head, n_top, eager, n_thr, cert);
+                    d1->fused       = env_int("LLAMA_D1_FUSED", 0) != 0; // [EXACTHEAD] r3 fused pick: OFF (f100 11-22: 4x slower on real rows)
+                    d1->audit_every = (int) std::max(0L, env_int("LLAMA_D1_AUDIT", 0));
+                    if (d1->audit_every > 0) {
+                        LLAMA_LOG_WARN("d1: LLAMA_D1_AUDIT=%d: every %d-th rescored row is checked against the full exact head "
+                                "(slow, exactness gate only)\n", d1->audit_every, d1->audit_every);
+                    }
+                    LLAMA_LOG_WARN("d1: %s head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d, pick %s)\n",
+                            ggml_type_name(model.output->type), n_top, d1_head->path.c_str(),
+                            ggml_type_name(d1_head->type), eager, n_thr, d1->fused ? "fused (LLAMA_D1_FUSED=1)" : "separate");
+                    if (cert.on) {
+                        LLAMA_LOG_WARN("d1: certificate on (statistically exact: a missed top-%d row has probability ~1e-9 per "
+                                "row at %.1f sigma): k=%d sigma=%.2f margin=%.3f (head max group error %.4g); LLAMA_D1_CERT=0 turns it off\n",
+                                cert.k, cert.sigma, cert.k, cert.sigma, cert.margin, d1_head->gl2_max);
+                    } else {
+                        LLAMA_LOG_WARN("d1: certificate off (%s)\n", cert_env == 0 ? "LLAMA_D1_CERT=0" : "sidecar has no output_exact.gl2");
+                    }
+                    const char * gv = getenv("LLAMA_MTP_GPU_VERIFY");
+                    const char * tv = getenv("LLAMA_MTP_TOPK_VERIFY");
+                    if ((gv && gv[0] && strcmp(gv, "0") != 0) || (tv && tv[0] && atoi(tv) != 0)) {
+                        LLAMA_LOG_WARN("d1: LLAMA_MTP_GPU_VERIFY / LLAMA_MTP_TOPK_VERIFY are set, but they would verify on the "
+                                "coarse card head: refused, verification stays on the CPU with the exact rows\n");
+                    }
                 } break;
         }
     }
@@ -1936,7 +1976,11 @@ llama_context::~llama_context() {
         ink_stream.reset();
     }
     if (d1) {
-        LLAMA_LOG_INFO("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
+        d1->drain(); // [EXACTHEAD] count the async rows still in flight
+        LLAMA_LOG_WARN("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
+        if (d1->audit_every > 0) {
+            LLAMA_LOG_WARN("%s\n", d1->audit_summary().c_str());
+        }
     }
     if (pp_warm_thread.joinable()) {
         pp_warm_thread.join();
@@ -3333,6 +3377,9 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
 }
 
 void llama_context::synchronize() {
+    if (d1) {
+        d1->drain(); // [EXACTHEAD] async d1 rows: every reader and writer of the outputs synchronizes first
+    }
     if (!sched) {
         return;
     }
@@ -3621,7 +3668,7 @@ int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_
 void llama_d1_log_counters(llama_context * ctx, const char * tag) {
     const std::string s = ctx ? ctx->d1_counters_delta() : std::string();
     if (!s.empty()) {
-        LLAMA_LOG_INFO("d1 req: %s %s\n", tag ? tag : "", s.c_str());
+        LLAMA_LOG_WARN("d1 req: %s %s\n", tag ? tag : "", s.c_str());
     }
 }
 
@@ -5697,7 +5744,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         // [D1] backend sampling (-bs, GPU greedy/sampled verify, top-K verify) would sample coarse logits on the card
         static bool warned = false;
         if (!warned) {
-            LLAMA_LOG_WARN("d1: backend sampling refused, using CPU sampling\n");
+            LLAMA_LOG_WARN("d1: backend sampling refused (-bs, LLAMA_MTP_GPU_VERIFY, LLAMA_MTP_TOPK_VERIFY would sample the "
+                    "coarse card head), using CPU sampling\n");
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
@@ -9501,6 +9549,9 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
+    if (d1) {
+        d1->drain(); // [EXACTHEAD] no swap while the d1 pool still writes rows (callers synchronize first anyway)
+    }
     const uint64_t n_vocab    = model.vocab.n_tokens();
     const uint64_t n_embd     = model.hparams.n_embd;
     const uint64_t n_embd_out = model.hparams.n_embd_out();

@@ -20205,6 +20205,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         add_aifuse_cases(test_cases);
         return test_cases;
     }
+    // [WREAD08] GGML_TEST_AI23_DENSE=1: the rate-2/3 dense types of the 12 GB / 8 GB small-card files at their real 27B shapes
+    // (M x K) and the multi-user widths 9..64 (plus 8 and 65 as controls), CUDA vs CPU. Run with GGML_CUDA_AI23_DENSE=0 and =1.
+    if (getenv("GGML_TEST_AI23_DENSE")) {
+        for (int64_t n : { 8, 9, 12, 16, 17, 24, 32, 33, 48, 64, 65 }) {
+            // 1024: the 8 GB file's small AIT2_U2 tensors; 8704 / 3072 / 2560: per-device rows under -sm tensor on two cards
+            for (int64_t m : { 1024, 2560, 6144, 8704, 10240, 17408 }) {
+                test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT2_U2));
+            }
+            for (int64_t m : { 3072, 6144, 10240, 12288, 17408 }) {
+                test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT3_U2));
+            }
+            test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT2_U2_512));
+            test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT3_U2_512));
+            test_cases.emplace_back(new test_mul_mat_ai4(2560, n, 17408, GGML_TYPE_AIT3_U2_512));
+        }
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
         add_ai_parw_shape_cases(test_cases);
         return test_cases;
@@ -23923,6 +23940,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_large_logits(hs, hs, 4, {6, 1}, 1024, 200, true, false, 0, 0, GGML_PREC_F32, types.first, types.second));
         }
     }
+    // [I8QK-EXT] Sinks, per-head masks (mask_heads > 1), LSE output, and non-64-multiple KV tails (GGML_CUDA_FA_I8QK_F16=1 / GGML_CUDA_FA_I8QK_EXT=1).
+    for (const auto & types : {std::pair{GGML_TYPE_F16, GGML_TYPE_F16}, std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+        for (int64_t kv : {512, 531}) {
+            auto * t = new test_flash_attn_ext(128, 128, 4, {6, 1}, kv, 128, true, true, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 1, 2, 3}, true, false, 0, 0, 24);
+            t->lse_out = true;
+            test_cases.emplace_back(t);
+        }
+    }
 
     // SLOWKV (GGML_SLOWKV): the same verify-width coverage for the other fused D256 pairs. Width 5 takes the compact
     // tile when the switch is on, turbo4/tq6_0 widths 5-8 otherwise the fused (8,8) tile, q8_0/q5_1 the fused tiles at
@@ -26165,6 +26190,67 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                         if (mk.second % (t == GGML_TYPE_AIF25_U2 ? 640 : t == GGML_TYPE_AIF25_U ? 128 : 512) != 0) { continue; }
                         test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, t));
                     }
+                }
+            }
+            return test_cases;
+        }
+        // [WREAD08] GGML_TEST_AIV2_PERF=wread (or wread24 / wread8): weight-read GB/s per type at the real 27B shapes of the
+        // P76 AI4 file (AIT3, AIT4, AIT5_U, Q6_K head) and the 8 GB AI2 file (AIF175_U2, AIF25_U2, AIF25_U, AIT2_U2,
+        // AIT3), at decode / verify / multi-user widths 1..32 (GGML_TEST_WREAD_N="1,4,8" overrides the widths)
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")).rfind("wread", 0) == 0) {
+            const std::string mode = getenv("GGML_TEST_AIV2_PERF");
+            std::vector<int64_t> ns = { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 24, 32 };
+            if (const char * e = getenv("GGML_TEST_WREAD_N")) {
+                ns.clear();
+                for (const char * p = e; *p; ) {
+                    ns.push_back(strtoll(p, (char **) &p, 10));
+                    while (*p == ',') { ++p; }
+                }
+            }
+            if (mode == "wread12") {
+                // 12 GB L0 file rate-2/3 dense types (GGML_CUDA_AI23_DENSE A/B)
+                for (int64_t n : ns) {
+                    for (int64_t m : { 6144, 10240, 17408 }) {
+                        test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT2_U2));
+                    }
+                    for (int64_t m : { 6144, 10240, 12288, 17408 }) {
+                        test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT3_U2));
+                    }
+                    test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT2_U2_512));
+                    test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT3_U2_512));
+                }
+                return test_cases;
+            }
+            const bool p24 = mode != "wread8", p8 = mode != "wread24";
+            for (int64_t n : ns) {
+                if (p24) {
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
+                        for (ggml_type t : { GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
+                            test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                        }
+                    }
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 10240, 5120 }, { 6144, 5120 }, { 12288, 5120 }, { 5120, 6144 } }) {
+                        test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
+                    }
+                    if (n <= 8) {
+                        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+                    }
+                }
+                if (p8) {
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 6144, 5120 }, { 10240, 5120 }, { 5120, 6144 } }) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, GGML_TYPE_AIF175_U2));
+                    }
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 10240, 5120 }, { 12288, 5120 } }) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, GGML_TYPE_AIF25_U2));
+                    }
+                    if (n <= 8) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(248320, n, 5120, GGML_TYPE_AIF25_U2));
+                    }
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 5120, 17408 }, { 5120, 6144 } }) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, GGML_TYPE_AIF25_U));
+                        test_cases.emplace_back(new test_mul_mat_ait(GGML_TYPE_AIT3, mk.first, n, mk.second));
+                    }
+                    test_cases.emplace_back(new test_mul_mat_ai4(17408, n, 5120, GGML_TYPE_AIT2_U2));
                 }
             }
             return test_cases;

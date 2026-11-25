@@ -1,8 +1,9 @@
 #pragma once
 
-// [D1] opt-in exact rescore of the coarse output head (LLAMA_D1_HEAD=<sidecar.gguf>).
-// The card runs a coarse type-128 (AIT2_U2_512) output head. The host keeps an exact copy of the original
-// output rows in a sidecar GGUF (F16 or Q8_0, made offline by scripts/d1_make_sidecar.py). For every output
+// [D1] opt-in exact rescore of the coarse output head (LLAMA_D1_HEAD=<sidecar.gguf>, or @model/<file> beside the model).
+// The card runs a coarse output head: a type-128 (AIT2_U2_512) overlay, or the 8 GB file's own type-125 (AIF25_U2) head
+// ([EXACTHEAD]). The host keeps an exact copy of the original output rows in a sidecar GGUF (F16 or Q8_0 decoded from
+// the base head, or BF16 from the source checkpoint with --exact-from; made offline by scripts/d1_make_sidecar.py). For every output
 // row a consumer reads, the coarse top N logits are recomputed as dot(h, exact_row) with h = the post-norm
 // hidden row (res->t_embd). Default off; nothing here runs unless LLAMA_D1_HEAD is set.
 // Design: LSA/REAL8GB/DESIGN_d1_head_rescore.md (r3).
@@ -37,13 +38,20 @@ struct llama_d1_head {
     ~llama_d1_head();
 
     std::string path;
-    ggml_type   type    = GGML_TYPE_F16; // GGML_TYPE_F16 or GGML_TYPE_Q8_0
+    ggml_type   type    = GGML_TYPE_F16; // GGML_TYPE_F16, GGML_TYPE_BF16 or GGML_TYPE_Q8_0
     int64_t     n_embd  = 0;
     int64_t     n_vocab = 0;
     size_t      row_bytes = 0;
     const uint8_t * rows = nullptr; // n_vocab rows of row_bytes
     uint64_t    src_fnv  = 0;
     uint64_t    self_fnv = 0;
+
+    // [EXACTHEAD] optional certificate stats (tensor output_exact.gl2, F32 [n_embd/32, n_vocab]): the L2 norm of
+    // (coarse row - exact row) over each 32-column group. nullptr when the sidecar has none.
+    const float *      gl2     = nullptr;
+    int64_t            n_group = 0;
+    std::vector<float> gl2_rowmax;      // [n_vocab] max over groups of gl2
+    float              gl2_max = 0.0f;  // max over rows of gl2_rowmax
 
     // mapping
     void * map_base = nullptr;
@@ -99,6 +107,24 @@ llama_d1_scope_result llama_d1_scope(const llama_d1_scope_in & in, llama_d1_mode
 // top-n ids of a logits row (ties to the lower id), any order; n <= n_vocab
 void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<int32_t> & ids);
 
+struct llama_d1_cand { float v; int32_t id; };
+
+// [EXACTHEAD] fused pick, one scan of row[i0, i1): heap = the range's top n (llama_d1_cand, any order; ties keep the
+// lower id, as llama_d1_select_top)
+void llama_d1_scan_chunk(const float * row, int64_t i0, int64_t i1, int n, std::vector<llama_d1_cand> & heap);
+
+// [EXACTHEAD] certificate: after the top N are exact, any other row whose coarse logit could still reach the k-th
+// exact logit (coarse + margin + sigma * s_i >= T_k, s_i = sqrt(sum_g ||h_g||^2 * gl2[i][g]^2 / 32)) is rescored too.
+// Statistically exact (Jake 11-21): treating each row's coarse error as Gaussian with std s_i, a row that belongs in
+// the exact top k is left coarse with probability ~1e-9 (one-sided 6 sigma). Default on inside the add-on when the
+// sidecar has output_exact.gl2; LLAMA_D1_CERT=0 is the kill switch. Study: 0 misses in 16,200 positions.
+struct llama_d1_cert {
+    bool  on     = false; // the context turns it on by default when the sidecar has gl2
+    int   k      = 20;    // the sampler's top-k (all presets use 20)
+    float sigma  = 6.0f;
+    float margin = 0.1f;  // card activation quantization vs the host dot (measured max 0.071 on the 8 GB head)
+};
+
 // per-context state (design 3.3-3.5)
 struct llama_d1_ctx {
     enum : uint8_t {
@@ -108,12 +134,14 @@ struct llama_d1_ctx {
         ROW_COARSE  = 3, // full-vocab logits copied on this d1 context but not rescorable (N = 0 or no h)
     };
 
-    llama_d1_ctx(std::shared_ptr<llama_d1_head> head, int n_top, int eager_max, int n_threads);
+    llama_d1_ctx(std::shared_ptr<llama_d1_head> head, int n_top, int eager_max, int n_threads,
+                 const llama_d1_cert & cert = llama_d1_cert());
     ~llama_d1_ctx();
 
     std::shared_ptr<llama_d1_head> head;
     int n_top     = 256;
     int eager_max = 64;
+    llama_d1_cert cert;
 
     std::vector<float>   h;      // [rows x n_embd]
     std::vector<uint8_t> state;  // [rows]
@@ -135,7 +163,27 @@ struct llama_d1_ctx {
     std::atomic<uint64_t> n_majflt{0};
     std::atomic<uint64_t> n_nvcsw{0};    // process context switches during rescore calls (voluntary / involuntary)
     std::atomic<uint64_t> n_nivcsw{0};
-    uint64_t              last[11] = {};  // values at the previous summary_delta
+    // [EXACTHEAD] certificate counters
+    std::atomic<uint64_t> n_cert_rows{0};    // rows certified
+    std::atomic<uint64_t> n_cert_sigma{0};   // non-candidate rows whose s_i was computed
+    std::atomic<uint64_t> n_cert_forced{0};  // non-candidate rows rescored by the certificate
+    std::atomic<uint64_t> n_cert_maxrow{0};  // most rows forced in one row
+    uint64_t              last[14] = {};
+
+    // [EXACTHEAD] LLAMA_D1_AUDIT=n (default 0 = off; slow, for the exactness gate only): every n-th rescored row is
+    // also scored against all n_vocab exact rows. Compared on the preset sampler (top-k 20, temp 1, top-p 0.95):
+    // the served row vs the full exact row, and the coarse row as it was before the rescore vs the full exact row.
+    int audit_every = 0;
+    std::atomic<uint64_t> audit_tick{0};
+    std::mutex audit_mtx;
+    struct audit_t {
+        uint64_t rows = 0, top_same = 0, dist_same = 0, coarse_top_same = 0;
+        double   tv_sum = 0, tv_max = 0, coarse_tv_sum = 0, coarse_tv_max = 0, dlogit_max = 0;
+        double   z_max = 0;           // max |coarse - exact| / s_i over the exact top 20 (needs gl2)
+        uint64_t z_gt6 = 0, z_n = 0;
+    } audit;
+    void audit_row(const float * served, const float * coarse, const float * hr, int64_t n_vocab);
+    std::string audit_summary();  // values at the previous summary_delta
     std::string summary_delta();         // counters since the previous call (not thread safe: one reader)
 
     // a new set of output rows (output_reserve): all rows NONE, seen cleared
@@ -151,8 +199,45 @@ struct llama_d1_ctx {
     void swap_rows(int64_t i0, int64_t i1);
 
     // rescore the PENDING rows in list (threaded when more than one)
-    void rescore_rows(float * logits, int64_t n_vocab, const std::vector<int64_t> & rows);
+    // need >= 0 (fused + pool): may return once row need is exact, the pool finishing the rest (drain() waits)
+    void rescore_rows(float * logits, int64_t n_vocab, const std::vector<int64_t> & rows, int64_t need = -1);
+    void drain();                // wait for async rows (every other entry and llama_context::synchronize call it)
+    bool async_pending = false;
+    std::vector<int64_t> arows;  // rows of the current pool job
     void rescore_one(float * logits, int64_t n_vocab, int64_t r, std::vector<int32_t> & ids);
+    void certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids);
+    struct cert_prep_t { float T = 0, pre = 0, hn = 0; std::vector<float> hg; std::vector<int32_t> sids; };
+    void cert_prepare(const float * row, const float * hr, const std::vector<int32_t> & ids, cert_prep_t & cp) const;
+    void cert_range(float * row, const float * hr, const cert_prep_t & cp, int64_t i0, int64_t i1,
+                    uint64_t & n_sigma, uint64_t & n_forced) const;
+    void cert_count(uint64_t n_sigma, uint64_t n_forced);
+    float cert_slack(const float * hr) const; // D: pre = T - D (a hair below margin + sigma * gl2_max * hn)
+
+    // [EXACTHEAD] fused pick (LLAMA_D1_FUSED=1; default off until gated). Each row is split in n_chunk parts over the
+    // pool, in three phases: (1) one scan per chunk keeps its top N, the last chunk merges the row's ids; (2) the
+    // row's dots are split the same way, the last part prepares the certificate (T, pre); (3) the certificate scan
+    // runs per chunk, each part reading and writing only its range; the last part counts and marks the row done.
+    // Same rows as the separate path. Jobs run in row order, so the first read can return once its row is done.
+    bool fused = false;
+    int64_t fused_min_chunk = 16384;           // ids per chunk at least (tests lower it)
+    struct fchunk_t { std::vector<llama_d1_cand> heap; };
+    struct frow_t {
+        std::vector<int32_t> ids;
+        cert_prep_t cp;
+        std::atomic<uint64_t> n_sigma{0}, n_forced{0};
+        std::vector<float>   coarse;           // audit only
+        bool audit = false;
+        std::atomic<int> left{0}, dleft{0}, ready{0}, done{0}, cleft{0}, cready{0};
+    };
+    std::vector<fchunk_t> fch;                 // [rows x n_chunk]
+    std::unique_ptr<frow_t[]> frow;            // [rows]
+    size_t                frow_n = 0;
+    int                   n_chunk = 1;
+    void fused_scan(int64_t k);   // phase 1 job
+    void fused_merge(int64_t ri);
+    void fused_dots(int64_t k);   // phase 2 job
+    void fused_cert(int64_t k);   // phase 3 job
+    void fused_run(int64_t k);    // job k of the row-ordered list (scans, dot parts, certificate parts, per row)
 
     std::string summary() const;
 
@@ -173,4 +258,5 @@ struct llama_d1_ctx {
     } pool;
     void worker(int idx);
     void run_job();
+    int  n_threads_total() const { return (int) pool.threads.size() + 1; }
 };

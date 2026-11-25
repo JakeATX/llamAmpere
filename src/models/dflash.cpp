@@ -2486,9 +2486,9 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
 // is projected to n_embd and scored by the target's lm head as a bias on the backbone logits, then softcapped.
 // When shortlist_ids != nullptr, scores only the shortlisted rows of dspark_head_fold (via MUL_MAT_ID, fused by
 // ggml-cuda dspark-head.cu with zero duplicate weight copies) using pre-gathered fold_bias_sl and base_sl.
-static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
-        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context,
-        ggml_tensor * shortlist_ids = nullptr, ggml_tensor * fold_bias_sl = nullptr, bool fast_graph = false) {
+// build_inkling2_latent: the recurrent step; updates state, returns the latent [rank, nb]
+static ggml_tensor * build_inkling2_latent(llm_graph_context & g, const llama_model & model,
+        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * context, bool fast_graph = false) {
     auto * ctx0 = g.ctx0;
     const int64_t rank = model.hparams.dspark_markov_rank;
     auto * joint = ggml_concat(ctx0, state, ggml_get_rows(ctx0, model.dspark_markov_w1, prev), 0);
@@ -2507,6 +2507,39 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
         ggml_build_forward_expand(g.gf, state);
         ggml_build_forward_expand(g.gf, latent);
     }
+    return latent;
+}
+
+// INKDEPTH (LLAMA_DSPARK_CAND=C, opt-in): score the markov bias only on the base logits' top C candidates
+// [C, nb] (cand) of this slot; returns the softcapped candidate logits [C, nb]. Rows come from the folded head, so the
+// slot reads C rows instead of the whole [rank, n_vocab] fold.
+static ggml_tensor * build_inkling2_head_cand(llm_graph_context & g, const llama_model & model, const llama_model & target,
+        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context,
+        ggml_tensor * cand) {
+    GGML_UNUSED(target);
+    auto * ctx0 = g.ctx0;
+    const int64_t C  = cand->ne[0];
+    const int64_t nb = cand->ne[1];
+    auto * latent = build_inkling2_latent(g, model, prev, state, hidden, context);
+    auto * flat   = ggml_reshape_1d(ctx0, cand, C*nb);
+    GGML_ASSERT(model.dspark_head_fold && model.dspark_head_fold_b);
+    auto * rows = ggml_get_rows(ctx0, model.dspark_head_fold, flat);                            // [rank, C*nb]
+    rows = ggml_reshape_3d(ctx0, rows, rows->ne[0], C, nb);
+    ggml_tensor * bias = ggml_mul_mat(ctx0, rows, ggml_reshape_3d(ctx0, latent, latent->ne[0], 1, nb)); // [C, 1, nb]
+    auto * fb = model.dspark_head_fold_b;
+    bias = ggml_add(ctx0, ggml_reshape_2d(ctx0, bias, C, nb),
+            ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, fb, 1, fb->ne[0]), flat), C, nb));
+    auto * bv = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, base, 1, base->ne[0], nb), cand), C, nb);
+    auto * logits = ggml_add(ctx0, bv, bias);
+    const float cap = model.hparams.f_final_logit_softcapping;
+    return ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, logits, 1.0f/cap)), cap);
+}
+
+static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
+        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context,
+        ggml_tensor * shortlist_ids = nullptr, ggml_tensor * fold_bias_sl = nullptr, bool fast_graph = false) {
+    auto * ctx0 = g.ctx0;
+    auto * latent = build_inkling2_latent(g, model, prev, state, hidden, context, fast_graph);
     // folded head (lm_head . hidden_out, precomputed): reads [rank, n_vocab] instead of the whole lm head per step
     static const bool use_fold = [] { const char * e = getenv("LLAMA_DSPARK_HEAD_FOLD"); return !e || atoi(e) != 0; }();
     ggml_tensor * bias = nullptr;
@@ -2855,12 +2888,41 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     };
     auto * context  = column(f_rnn, block, 0);
     auto * prev = ids;
+    // LLAMA_DSPARK_CAND=C (opt-in, sampled walk only, 0 = off): the base logits' top C per slot, one launch for the block
+    // (folded head only: the lm-head fallback would need the head's scales/rotations, see build_lora_mm; not with the
+    // draft-vocabulary shortlist or the walk-sliced base, whose base columns are not the full vocabulary per slot)
+    static const int64_t n_cand_env = [] { const char * e = getenv("LLAMA_DSPARK_CAND"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
+    static const bool fold_env = [] { const char * e = getenv("LLAMA_DSPARK_HEAD_FOLD"); return !e || atoi(e) != 0; }();
+    const int64_t n_cand = noise && !use_shortlist && !slice_walk && model.dspark_head_fold && fold_env && n_cand_env >= sk &&
+            n_cand_env < (int64_t) hparams.n_vocab_unpadded ? n_cand_env : 0;
+    ggml_tensor * cand_all = nullptr;
+    if (n_cand > 0) {
+        cand_all = ggml_top_k(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0)), n_cand); // I32 [C, n_tokens]
+    }
     for (int64_t i = 1; i < block; ++i) {
         if (i > walk) {
             states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
             if (!ids_out) {
                 logits = ggml_concat(ctx0, logits, column(base, block, i), 1);
             }
+            continue;
+        }
+        if (noise && cand_all) {
+            // sampled slot over the candidates: Gumbel-max over the top K of the C candidate logits
+            auto * cid    = column(cand_all, block, i);                                                        // I32 [C, nb]
+            auto * base_c = column(base, block, i);
+            auto * lc     = build_inkling2_head_cand(*this, model, *target, prev, state, column(cur, block, i),
+                    ggml_cont(ctx0, ggml_view_2d(ctx0, base_c, hparams.n_vocab_unpadded, nb, base_c->nb[1], 0)), context, cid);
+            auto * sel  = ggml_cont(ctx0, ggml_top_k(ctx0, lc, sk));                                           // I32 [K, nb] into C
+            auto * vals = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lc, 1, n_cand, nb), sel), sk, nb);
+            auto * cand = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cid, 1, n_cand, nb), sel), sk, nb);
+            auto * g    = ggml_view_2d(ctx0, noise, sk, nb, noise->nb[1], (i - 1)*noise->nb[2]);
+            auto * pick = ggml_argmax(ctx0, ggml_add(ctx0, ggml_scale(ctx0, vals, 1.0f/cparams.dspark_sample_t), g)); // [nb]
+            prev = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cand, 1, sk, nb), ggml_reshape_2d(ctx0, pick, 1, nb)), nb);
+            auto * row = ggml_concat(ctx0, state, ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, nb), 0);
+            row = ggml_concat(ctx0, row, ggml_cast(ctx0, cand, GGML_TYPE_F32), 0);
+            row = ggml_concat(ctx0, row, vals, 0);
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, row, n_embd - rank - 1 - 2*sk, 0, 0, 0), 1);
             continue;
         }
         ggml_tensor * base_i = column(base, base_cols_per_seq, slice_walk ? (i - 1) : i);

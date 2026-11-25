@@ -263,7 +263,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const size_t output_elements_per_head = size_t(Q->ne[1])*gqa*256;
     const size_t lse_bytes_per_head = lse ? size_t(Q->ne[1])*gqa*sizeof(float) : 0;
     const size_t output_bytes_per_head = output_elements_per_head*sizeof(float) + lse_bytes_per_head;
-    const bool i8qk = !lse && ggml_cuda_fattn_i8qk_sj_kvarn_wanted(cc, dst);
+    const bool i8qk = (!lse || ggml_cuda_fattn_i8qk_ext_enabled()) && ggml_cuda_fattn_i8qk_sj_kvarn_wanted(cc, dst);
     const size_t i8qk_bytes_per_head = i8qk ? kv_elements_per_head : 0; // int8 K
     // the trellis chunk decision keeps the f16-only test; the int8 K bytes only regroup the expanded (unchunked) plan
     const bool grouped_f16 = size_t(K->ne[2]) > budget/kv_bytes_per_head;
@@ -398,7 +398,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
     }
     const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
     ggml_tensor * lse = ggml_flash_attn_ext_get_lse(dst);
-    GGML_ASSERT(!lse || (!plan.chunked && !plan.i8qk && !master));
+    GGML_ASSERT(!lse || (!plan.chunked && (!plan.i8qk || ggml_cuda_fattn_i8qk_ext_enabled()) && !master));
     GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const int gqa = Q->ne[2]/K->ne[2];
     const bool grouped = plan.grouped;
@@ -570,6 +570,14 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         if (grouped && lse) {
             lse_group = *lse;
             lse_group.ne[0] = q.ne[2];
+            // the group scratch is packed [heads*gqa, T, S]; fattn_sj_kvarn_scatter_lse reads it packed, and i8qk takes its row stride from nb[1]
+            // (only the i8qk route, GGML_CUDA_FA_I8QK_EXT=1, reads these strides; the MMA routes keep the cand base strides)
+            if (plan.i8qk) {
+                lse_group.nb[0] = sizeof(float);
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                    lse_group.nb[d] = lse_group.nb[d - 1]*lse_group.ne[d - 1];
+                }
+            }
             lse_group.data = (char *) scratch_ptr + plan.lse_offset;
             lse_group.buffer = nullptr;
             lse_group.view_src = nullptr;
@@ -872,7 +880,12 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_inksj_prefill(ggml_backend_cuda_context &
                 if (ggml_cuda_inkgqa_fa_try(ctx, &oc)) { // [INKGQA] GGML_CUDA_INKGQA_FAR=1: exact GQA-3 tile, no padded head
                     continue;
                 }
-                if (mc.ne[2] != 1 || oc.src[4] != nullptr) { // (a padded GQA tile reads sinks past the view)
+                // [I8X] opt-in (GGML_CUDA_FA_I8QK_F16=1): int8 Q.K on the chunk's f16 K/V; INKGQA keeps priority
+                if (ggml_cuda_fattn_i8qk_f16_enabled() &&
+                        ggml_cuda_fattn_i8qk_applies_f16kv(ggml_cuda_info().devices[ctx.device].cc, &oc)) {
+                    ggml_cuda_pool_alloc<int8_t> kq_ws(ctx.pool(), (size_t) 2*n_kv*128);
+                    ggml_cuda_flash_attn_ext_i8qk(ctx, &oc, 0, 2, kq_ws.ptr, nullptr);
+                } else if (mc.ne[2] != 1 || oc.src[4] != nullptr) { // (a padded GQA tile reads sinks past the view)
                     ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &oc);
                 } else if (g > 4) {
                     ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 8, 8>(ctx, &oc);
