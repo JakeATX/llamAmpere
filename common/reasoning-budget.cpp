@@ -65,6 +65,8 @@ struct common_reasoning_budget_ctx {
     size_t force_pos;         // next position in forced_tokens to force
 
     int32_t end_match;        // index into end_matcher.seqs of the sequence that transitioned to DONE, -1 if none
+
+    bool no_reopen = false;   // DONE: one-token start sequences are banned, so a closed think block stays closed
 };
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
@@ -166,6 +168,17 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+
+    if (ctx->state == REASONING_BUDGET_DONE && ctx->no_reopen) {
+        for (size_t i = 0; i < cur_p->size; i++) {
+            for (const auto & seq : ctx->start_matcher.seqs) {
+                if (seq.size() == 1 && cur_p->data[i].id == seq[0]) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+            }
+        }
+        return;
+    }
 
     if (ctx->state != REASONING_BUDGET_FORCING) {
         // passthrough — don't modify logits
@@ -307,5 +320,13 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
     ctx->end_matcher.reset();
     COM_TRC("%s", "forced into forcing state (manual transition)\n");
 
+    return true;
+}
+
+bool common_reasoning_budget_block_reopen(struct llama_sampler * smpl) {
+    if (!smpl) {
+        return false;
+    }
+    ((common_reasoning_budget_ctx *) smpl->ctx)->no_reopen = true;
     return true;
 }

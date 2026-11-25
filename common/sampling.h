@@ -215,6 +215,8 @@ bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler
 // true while the think block is open (the budget sampler in the chain, else the tracker, is counting think tokens);
 // false when neither exists
 bool common_sampler_reasoning_in_think(const struct common_sampler * gsmpl, const llama_sampler * tracker);
+// after common_sampler_reasoning_close: keep the think block closed (its one-token start tag is banned from then on)
+bool common_sampler_reasoning_block_reopen(struct common_sampler * gsmpl);
 // an end-of-generation token sampled inside an open think block would end the reply with no answer: close the think
 // block instead (same rules as common_sampler_reasoning_close) and return the token to emit in its place, which the
 // chain has accepted; LLAMA_TOKEN_NULL when the think block is not open

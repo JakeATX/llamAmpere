@@ -97,6 +97,39 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 **Let your coding agent set it up:** paste this into Claude Code, Codex, Cursor or Copilot: *"Set up llamAmpere on this PC for me: https://github.com/JakeATX/llamAmpere - follow docs/AI_SETUP.md in that repository. Ask me before you install system packages or use sudo."* ([what it does](docs/AI_SETUP.md))
 
+### Quick start: Inkling 2 Mini
+
+Download the release for your system from [Releases](https://github.com/JakeATX/llamAmpere/releases) (Linux tar or
+Windows zip, RTX 30-series, NVIDIA driver R550 or newer) and the model files from Hugging Face.
+
+**24 GB cards** ([jakeatx/Inkling-2-Mini-ATX-GGUF](https://huggingface.co/jakeatx/Inkling-2-Mini-ATX-GGUF)): put the
+model and the drafter `Inkling-2-Mini-ATX-Drafter-Q8_0.gguf` in the same folder. `--preset 24ink` finds the drafter beside
+the model (with `-hf` it fetches it from the same repo); without it decode is much slower, and startup prints a warning
+with the fix. Add `--mmproj mmproj-Inkling-2-Mini-F16.gguf` for images.
+
+```bash
+# Linux
+./llama-server --preset 24ink -m /path/to/Inkling-2-Mini-ATX-NVFP4Q8-5.4bpw.gguf -md /path/to/Inkling-2-Mini-ATX-Drafter-Q8_0.gguf
+```
+
+```bat
+:: Windows
+llama-server.exe --preset 24ink -m C:\models\Inkling-2-Mini-ATX-NVFP4Q8-5.4bpw.gguf -md C:\models\Inkling-2-Mini-ATX-Drafter-Q8_0.gguf
+```
+
+**8, 10 and 12 GB cards**
+([jakeatx/Inkling-2-Mini-ATX-SmallCard-GGUF](https://huggingface.co/jakeatx/Inkling-2-Mini-ATX-SmallCard-GGUF)): the
+experts stay in system RAM with a VRAM cache, so plan for at least the model file size in free RAM and a PCIe 4.0 x16
+slot. These presets run without the drafter (it measured slower on small cards).
+
+```bash
+llama-server --preset 12ink -m /path/to/Inkling-2-Mini-ATX-12GB-4.2bpw.gguf
+llama-server --preset 10ink -m /path/to/Inkling-2-Mini-ATX-8GB-10GB-3.7bpw.gguf
+llama-server --preset 8ink  -m /path/to/Inkling-2-Mini-ATX-8GB-10GB-3.7bpw.gguf
+```
+
+On Windows use `llama-server.exe` with the same flags. Speeds and quality are in the release notes of each release.
+
 ### Quick start: pick your card
 
 Card presets assume a display is attached and reserve 1,024 MiB of GPU memory, except 8dense, which is headless-only and reserves 500 MiB. The reserve comes off the card's total memory (a 10 GB card stays at or under 9,216 MiB headed); memory already in use, such as a desktop, counts toward it. An explicit `--fit-target` keeps its free-memory meaning. `8dense headed` prints a note and uses the same headless settings. Append `headless` (`--preset 12dense headless`) or use `12dense-headless` for a 500 MiB margin on 10dense, 12dense, and 24dense. Headed defaults are 180,224 tokens for 10dense and 196,608 for 12dense, with CUDA graphs off for headed 12dense. Headless defaults remain 212,992 for 10dense, 262,144 for 12dense, and 204,800 for 8dense (with `mtp-dm.gguf` the 8 GB file peaks at 7,657 MiB on an RTX 3070 at a 204,640-token fill, under the 7,692 MiB headless line). Headless 12dense at the full 262,144 tokens is tested on an RTX 3080 Ti 12 GB: a 262,142-token fill completed with 11,642 MiB peak (500 MiB margin line 11,788), 1,009 prompt tokens/s and 70.8 writing tokens/s at a 100K prompt. Fitting is on: the dynamic microbatch ladder remains enabled, and fitting may reduce a preset context to honor the margin. An explicit `-c`, `-fitt`, or `-fit` wins in either order. Startup reports the chosen context. Small cards still support one user only; multi-user support is future work. Since v0.7.2.1, 8dense keeps the RAM and disk prompt cache at their defaults (RAM sized from host memory, disk up to 16 GiB in `~/.cache/llamampere/prompt-cache`) and turns on `--warm-prefill`; `--cache-ram 0`, `--no-cache-disk` and `--no-warm-prefill` turn them off. 10dense and 12dense still start with the prompt cache off.

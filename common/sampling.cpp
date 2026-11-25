@@ -1748,7 +1748,7 @@ int32_t common_answer_reserve(int32_t limit, int32_t reserve) {
         return 0;
     }
     if (reserve < 0) {
-        reserve = std::max(limit / 4, std::min(512, limit / 2));
+        reserve = std::min(std::max(limit / 4, std::min(512, limit / 2)), 2048); // auto: 1/4 of the limit, capped at 2048
     }
     return std::min(reserve, limit);
 }
@@ -1798,6 +1798,10 @@ bool common_sampler_reasoning_in_think(const struct common_sampler * gsmpl, cons
     }
     const llama_sampler * think = gsmpl->rbudget ? gsmpl->rbudget : tracker;
     return think && common_reasoning_budget_get_state(think) == REASONING_BUDGET_COUNTING;
+}
+
+bool common_sampler_reasoning_block_reopen(struct common_sampler * gsmpl) {
+    return gsmpl && common_reasoning_budget_block_reopen(gsmpl->rbudget);
 }
 
 llama_token common_sampler_reasoning_rescue_eog(struct common_sampler * gsmpl, llama_sampler ** tracker) {

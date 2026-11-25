@@ -144,7 +144,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cpu-moe", "1"}, {"--op-offload", "0"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
-                {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
+                {"--spec-draft-model", "@model/Inkling-2-Mini-ATX-Drafter-Q8_0.gguf"}, {"--spec-type", "draft-dspark"},
                 {"--spec-draft-ngl", "99"},
                 {"--mmproj-host-weights", "1"} // GHFIX-40, as 10dense (ink10/ink12 copy ink8)
             }, {
@@ -182,7 +182,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "2048"},
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
-                {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
+                {"--spec-draft-model", "@model/Inkling-2-Mini-ATX-Drafter-Q8_0.gguf"}, {"--spec-type", "draft-dspark"},
                 {"--spec-draft-ngl", "99"}, {"--spec-draft-ubatch", "64"}
             }, {
                 {"LLAMA_DEEPCTX_LADDER", "1"}
