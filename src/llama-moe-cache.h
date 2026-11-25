@@ -66,6 +66,10 @@ public:
     ggml_tensor * og_slots(ggml_context * ctx, ggml_tensor * ids, int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
     void          og_prepare();
 
+    // fork (SPLITCAL): boot timings of the CPU expert path and an upload for LLAMA_MOE_CACHE_SPLIT_CAL and
+    // LLAMA_MOE_CACHE_FEWROW_CPU=auto (see llama-moe-cache-policy.h); a no-op with both unset
+    void   calibrate(int32_t n_threads, int32_t n_threads_batch);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

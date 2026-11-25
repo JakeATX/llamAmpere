@@ -6,6 +6,7 @@
 //    and AIT2/3/4_U2: every output within 2e-5 of max |reference| (float summation order differs); the 512-K row-scale
 //    U2 type (not covered) and the flag unset give the reference bytes exactly. dst is NaN-filled before every run.
 //   test-ai4-avx2 [bench reps]: also times MUL_MAT_ID decode (8 experts, 8 used, 1 and 4 tokens) on both paths.
+//   test-ai4-avx2 reps threads ink: AIT3_U / AIT4_U on the Inkling 2 Mini expert shapes, 1..16 rows per expert.
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-ai4.h"
@@ -158,10 +159,9 @@ static bool test_pair_levels() {
 #endif
 }
 
-static void bench(ggml_type type, int reps, int n_threads) {
-    const int64_t K = 2560, M = 640;
+static void bench(ggml_type type, int reps, int n_threads, int64_t K = 2560, int64_t M = 640, std::vector<int> toks = {1, 4}) {
     const int n_exp = 8, n_used = 8;
-    for (int n_tok : {1, 4}) {
+    for (int n_tok : toks) {
         ggml_init_params ip = { (size_t) 512 << 20, nullptr, false };
         ggml_context * ctx = ggml_init(ip);
         ggml_tensor * w   = ggml_new_tensor_3d(ctx, type, K, M, n_exp);
@@ -180,8 +180,9 @@ static void bench(ggml_type type, int reps, int n_threads) {
             for (int r = 0; r < reps; ++r) { run(ctx, y, flag, n_threads); }
             us[flag] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / (2.0*reps);
         }
-        printf("BENCH %-10s mul_mat_id K=%lld M=%lld experts=%d used=%d tokens=%d threads=%d: reference %.1f us, avx2 %.1f us (%.2fx)\n",
-               ggml_type_name(type), (long long) K, (long long) M, n_exp, n_used, n_tok, n_threads, us[0], us[1], us[0]/us[1]);
+        printf("BENCH %-10s mul_mat_id K=%lld M=%lld experts=%d used=%d tokens=%d threads=%d: reference %.1f us, avx2 %.1f us (%.2fx); "
+               "per expert %.4f / %.4f ms\n", ggml_type_name(type), (long long) K, (long long) M, n_exp, n_used, n_tok, n_threads,
+               us[0], us[1], us[0]/us[1], us[0]/1000.0/n_used, us[1]/1000.0/n_used);
         ggml_free(ctx);
     }
 }
@@ -198,8 +199,17 @@ int main(int argc, char ** argv) {
     if (argc > 1) {
         const int reps = std::max(1, atoi(argv[1]));
         const int bench_threads = argc > 2 ? std::max(1, atoi(argv[2])) : 8;
-        for (ggml_type t : {GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U2}) {
-            bench(t, reps, bench_threads);
+        if (argc > 3 && strcmp(argv[3], "ink") == 0) {
+            // Inkling 2 Mini expert shapes: gate_up K=2304 M=2304, down K=1152 M=2304; every token uses all 8 experts,
+            // so tokens = rows per expert (add the two lines for one expert)
+            for (ggml_type t : {GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
+                bench(t, reps, bench_threads, 2304, 2304, {1, 2, 4, 8, 16});
+                bench(t, reps, bench_threads, 1152, 2304, {1, 2, 4, 8, 16});
+            }
+        } else {
+            for (ggml_type t : {GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U2}) {
+                bench(t, reps, bench_threads);
+            }
         }
     }
     printf("test-ai4-avx2: %s\n", ok ? "PASS" : "FAIL");

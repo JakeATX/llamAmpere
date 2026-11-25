@@ -20,6 +20,16 @@
 //     LLAMA_MOE_CACHE_SPLIT=sched     one PCIe fraction for all lookups, start 1-cpu_share clamped to [0.10, 0.60],
 //                                     at most 3 updates after 48, 96 and 96 decode windows from the same fit
 //     LLAMA_MOE_CACHE_SPLIT_Q256=N    fixed PCIe fraction N/256 (no tuning)
+//   SPLITCAL calibrated prior (with minimax or sched; off when unset, then nothing above changes):
+//     LLAMA_MOE_CACHE_SPLIT_CAL=1     at boot, time the CPU expert path (the real expert types on the host experts,
+//                                     GGML_CPU_AI4_AVX2 as set) and an expert upload, and seed the fit with them:
+//                                     slopes c and g from the timings (weight ~8 samples, forgotten like real ones),
+//                                     intercepts and contention left to the samples; the fit is ready at once (no
+//                                     cpu_share fallback). SCHED starts at the fraction of the update rule, and its
+//                                     clamp widens to [0.05, 0.95]
+//     LLAMA_MOE_CACHE_SPLIT_CAL=c,g   the same from given ms per expert (CPU, PCIe) instead of boot timings
+//     LLAMA_MOE_CACHE_FEWROW_CPU=auto (llama-moe-cache.cpp) R = most rows per expert whose boot CPU time is below
+//                                     the upload time (0 = every miss uploads); logged with [SPLITCAL]
 //   GS8 decode boundary overlap:
 //     LLAMA_MOE_CACHE_BOUNDARY=1      the per-window cache work (round admission ranking and swaps, split-policy
 //                                     window close) runs when a decode step has been submitted, while the device still
@@ -120,7 +130,13 @@ struct llama_moe_split_policy {
     int32_t n_updates = 0;
     std::vector<double> frac_hist;
 
+    // SPLITCAL (LLAMA_MOE_CACHE_SPLIT_CAL): cal_c, cal_g given ms per expert (0 = time them at boot)
+    bool   cal_want = false, cal_seeded = false;
+    double cal_c = 0.0, cal_g = 0.0;
+
     void init(float cpu_share);  // reads LLAMA_MOE_CACHE_SPLIT*; mode OFF if unset or no CPU share
+    // SPLITCAL: prior from c (CPU) and g (PCIe) ms per expert
+    void seed(double c_ms, double g_ms);
     bool active() const { return mode != OFF; }
     bool ready() const { return cpu.n >= 8 && gpu.n >= 8 && n_gpu_pcie >= 4; }
 

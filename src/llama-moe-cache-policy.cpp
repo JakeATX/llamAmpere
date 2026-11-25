@@ -347,10 +347,43 @@ void llama_moe_split_policy::init(float cpu_share) {
         LLAMA_LOG_WARN("%s: [SPLIT] unknown LLAMA_MOE_CACHE_SPLIT=%s (minimax|sched), off\n", __func__, m);
         return;
     }
+    if (const char * c = env_str("LLAMA_MOE_CACHE_SPLIT_CAL"); c && mode != FIXED && strcmp(c, "0") != 0) {
+        cal_want = true;
+        if (sscanf(c, "%lf,%lf", &cal_c, &cal_g) != 2 || cal_c <= 0.0 || cal_g <= 0.0) {
+            cal_c = cal_g = 0.0; // "1": time them
+        }
+    }
     frac_hist.push_back(frac);
     static const char * names[] = { "off", "minimax", "sched", "fixed" };
     LLAMA_LOG_WARN("%s: [SPLIT] miss split policy %s, PCIe fraction %.3f, fallback CPU share %.3f\n", __func__,
             names[mode], mode == MINIMAX ? 0.0 : frac, cpu_share);
+}
+
+void llama_moe_split_policy::seed(double c, double g) {
+    if ((mode != MINIMAX && mode != SCHED) || !(c > 0.0) || !(g > 0.0)) {
+        return;
+    }
+    // prior on the slopes only, worth ~8 samples of a few experts: the intercepts get a negligible weight at 0
+    // (the layer time is left to the samples), the CPU contention term d a prior of 0
+    constexpr double w = 32.0;
+    cpu.A[0][0] += 1e-3;
+    gpu.A[0][0] += 1e-3;
+    cpu.A[1][1] += w; cpu.b[1] += w*c;
+    cpu.A[2][2] += w;
+    gpu.A[1][1] += w; gpu.b[1] += w*g;
+    cpu.solve(true);
+    gpu.solve(false);
+    cpu.n      = std::max<int64_t>(cpu.n, 8);
+    gpu.n      = std::max<int64_t>(gpu.n, 8);
+    n_gpu_pcie = std::max<int64_t>(n_gpu_pcie, 4);
+    cal_seeded = true;
+    if (mode == SCHED) {
+        frac = std::clamp(std::round(c/(c + 1.85*g)/0.05)*0.05, 0.05, 0.95);
+        frac_hist.push_back(frac);
+    }
+    LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] split prior: CPU %.4f ms, PCIe %.4f ms per expert%s, fit ready%s%s\n",
+            c, g, cal_c > 0.0 ? " (given)" : " (boot timing)", mode == SCHED ? ", PCIe fraction " : "",
+            mode == SCHED ? std::to_string(frac).substr(0, 4).c_str() : "");
 }
 
 void llama_moe_split_policy::on_ids(int32_t il, int64_t n_rows) {
@@ -468,7 +501,7 @@ void llama_moe_split_policy::window_end() {
     const double c = cpu.theta[1], g = gpu.theta[1];
     double f = c/(c + 1.85*g);
     f = std::round(f/0.05)*0.05;
-    frac = std::clamp(f, 0.10, 0.60);
+    frac = cal_seeded ? std::clamp(f, 0.05, 0.95) : std::clamp(f, 0.10, 0.60);
     frac_hist.push_back(frac);
     LLAMA_LOG_WARN("llama_moe_cache: [SPLIT] update %d after %lld windows: c %.4f ms, g %.4f ms per expert -> PCIe fraction %.2f\n",
             n_updates, (long long) n_windows, c, g, frac);

@@ -1707,6 +1707,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
             moe_cache->set_op_offload(cparams.op_offload); // read only by LLAMA_MOE_CACHE_FEWROW_CPU
+            moe_cache->calibrate(cparams.n_threads, cparams.n_threads_batch); // no-op unless SPLITCAL flags are set
         }
         // [PEERX] GGML_PEER_EXPERTS=1 (default off): the target context's host expert layers on a second card
         if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {

@@ -596,6 +596,9 @@ struct llama_moe_cache::impl {
     // sums in another order than the GPU one.
     const int32_t fewrow_r = [] {
         const char * e = getenv("LLAMA_MOE_CACHE_FEWROW_CPU");
+        if (e && strcmp(e, "auto") == 0) {
+            return (int32_t) 64; // SPLITCAL: the zero slots of the tier; the rows come from calibrate()
+        }
         const long v = e && e[0] ? strtol(e, nullptr, 10) : 0;
         return (int32_t) std::clamp(v, 0l, 64l);
     }();
@@ -605,6 +608,13 @@ struct llama_moe_cache::impl {
         return (int64_t) std::clamp(v, 2l, 65536l);
     }();
     bool fewrow_op_offload = true; // the scheduler offloads large host-weight ops (see set_op_offload)
+    // fork (SPLITCAL): LLAMA_MOE_CACHE_FEWROW_CPU=auto: plan() gets the rows calibrate() picks (0 until then)
+    const bool fewrow_auto = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_FEWROW_CPU");
+        return e && strcmp(e, "auto") == 0;
+    }();
+    int32_t fewrow_use = fewrow_auto ? 0 : fewrow_r;
+    bool    cal_alloc  = false; // the banks are allocated (not a dry run)
 
     // fork (INKCACHEUX): GS1 controls, GS4 heat profile, #249/GS9 miss split, GS8 boundary (llama-moe-cache-policy.h)
     llama_moe_cache_controls ux;
@@ -990,8 +1000,9 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %.0f%% of the misses on the CPU\n", __func__,
                 ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, 100.0*cpu_share);
             if (fewrow_r > 0) {
-                LLAMA_LOG_WARN("%s: [FEWROW] misses routed to <= %d rows of a ubatch of >= %lld rows are computed on the CPU "
-                        "(LLAMA_MOE_CACHE_FEWROW_CPU), %d zero slots per group\n", __func__, fewrow_r, (long long) fewrow_min, n_zero);
+                LLAMA_LOG_WARN("%s: [FEWROW] misses routed to <= %d%s rows of a ubatch of >= %lld rows are computed on the CPU "
+                        "(LLAMA_MOE_CACHE_FEWROW_CPU), %d zero slots per group\n", __func__, fewrow_r, fewrow_auto ? " (auto: set by [SPLITCAL])" : "",
+                        (long long) fewrow_min, n_zero);
             }
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
@@ -1486,7 +1497,7 @@ struct llama_moe_cache::impl {
         if (fewrow_r > 0 && cpu_share == 0.0f) {
             // few-row tier only: no CPU part below the prompt-chunk size, and with op offload off the scheduler keeps
             // the CPU part on the CPU whatever the batch size
-            if (n_tokens < fewrow_min) {
+            if (n_tokens < fewrow_min || fewrow_use == 0) { // fewrow_use 0: LLAMA_MOE_CACHE_FEWROW_CPU=auto picked no rows
                 return nullptr;
             }
             if (!fewrow_op_offload) {
@@ -1659,8 +1670,8 @@ struct llama_moe_cache::impl {
             return (size_t) (acc >> 16);
         };
         size_t n_hit = 0;
-        const int32_t few_rows = has_cpu && fewrow_r > 0 && sel->src[0]->ne[1] >= fewrow_min &&
-                g.lru.n_filled == g.lru.n_slots ? fewrow_r : 0;
+        const int32_t few_rows = has_cpu && fewrow_use > 0 && sel->src[0]->ne[1] >= fewrow_min &&
+                g.lru.n_filled == g.lru.n_slots ? fewrow_use : 0;
         if (!g.lru.plan(ci, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit, ci == il, few_rows)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
@@ -2241,6 +2252,7 @@ struct llama_moe_cache::impl {
                     ux.slots, ux.dev_mib.empty() ? "off" : "list", sel.empty() ? "all" : sel.c_str(), ux.req_stats, ux.boundary);
         }
         split.init(cpu_share);
+        cal_alloc = !no_alloc;
         if (!getenv("LLAMA_MOE_CACHE_HEAT") || groups.empty()) {
             return;
         }
@@ -2340,6 +2352,167 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // fork (SPLITCAL): LLAMA_MOE_CACHE_SPLIT_CAL / LLAMA_MOE_CACHE_FEWROW_CPU=auto, nothing runs with both unset.
+    // Times, per group, MUL_MAT_ID of 8 host experts (the real types; GGML_CPU_AI4_AVX2 as set) on a CPU backend at
+    // 1..64 rows per expert, and the upload of 8 experts into a scratch buffer on the cache's device (the copy path of
+    // a miss). Per-expert medians of 5, groups weighted by their layers. Seeds the split fit (1 row, decode threads)
+    // and picks the few-row R (prompt threads): the most rows whose CPU time stays below the upload.
+    void calibrate(int32_t n_threads, int32_t n_threads_batch) {
+        const bool want_split = split.active() && split.cal_want;
+        const bool time_split = want_split && !(split.cal_c > 0.0);
+        if ((!want_split && !fewrow_auto) || !cal_alloc || is_suspended || groups.empty()) {
+            return;
+        }
+        if (want_split && !time_split && !fewrow_auto) {
+            split.seed(split.cal_c, split.cal_g);
+            return;
+        }
+        ggml_backend_dev_t cdev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_ptr cpu_be(cdev ? ggml_backend_dev_init(cdev, nullptr) : nullptr);
+        if (!cpu_be) {
+            LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] no CPU backend, calibration skipped\n");
+            return;
+        }
+        auto set_nt = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cdev), "ggml_backend_set_n_threads");
+        constexpr int n_rows = 7, n_rep = 5;
+        static const int rows_b[n_rows] = { 1, 2, 4, 8, 16, 32, 64 };
+        auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size()/2]; };
+        int64_t ctr = 0; // experts in turn, so the timings read them from memory, not from the CPU caches
+        double wsum = 0.0, c1 = 0.0, up = 0.0, cb[n_rows] = {};
+        for (const group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int64_t n_exp = g.ref[0]->ne[2];
+            const int     K     = (int) std::min<int64_t>(8, n_exp);
+            auto cpu_ms = [&](int rows, int nth) {
+                if (set_nt) {
+                    set_nt(cpu_be.get(), std::max(1, nth));
+                }
+                ggml_init_params ip = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+                ggml_context_ptr ctx(ggml_init(ip));
+                ggml_tensor * tid = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, K, rows);
+                ggml_cgraph * gf = ggml_new_graph(ctx.get());
+                std::vector<ggml_tensor *> xs;
+                for (ggml_tensor * w : g.ref) { // as in the FFN: gate/up read one row per token, down one per expert
+                    xs.push_back(ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, w->ne[0], w == g.ref.back() ? K : 1, rows));
+                    ggml_build_forward_expand(gf, ggml_mul_mat_id(ctx.get(), w, xs.back(), tid));
+                }
+                ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), cpu_be.get()));
+                if (!buf) {
+                    return -1.0;
+                }
+                for (ggml_tensor * x : xs) {
+                    std::vector<float> v(ggml_nelements(x));
+                    for (size_t i = 0; i < v.size(); ++i) {
+                        v[i] = 0.01f*(float) ((i*2654435761u >> 16) % 201) - 1.0f;
+                    }
+                    ggml_backend_tensor_set(x, v.data(), 0, ggml_nbytes(x));
+                }
+                std::vector<int32_t> idv((size_t) K*rows);
+                std::vector<double> t;
+                for (int r = 0; r <= n_rep; ++r) { // the first run warms up
+                    for (int j = 0; j < K; ++j, ++ctr) {
+                        for (int k = 0; k < rows; ++k) {
+                            idv[(size_t) k*K + j] = (int32_t) (ctr % n_exp);
+                        }
+                    }
+                    ggml_backend_tensor_set(tid, idv.data(), 0, ggml_nbytes(tid));
+                    const int64_t t0 = ggml_time_us();
+                    ggml_backend_graph_compute(cpu_be.get(), gf);
+                    if (r > 0) {
+                        t.push_back((ggml_time_us() - t0)/1000.0/K);
+                    }
+                }
+                return median(t);
+            };
+            // upload: K experts as the copy path writes them (one copy per expert tensor), then wait
+            const device & d = devices[g.id];
+            size_t e_bytes = 0;
+            for (const ggml_tensor * w : g.ref) {
+                e_bytes += w->nb[2];
+            }
+            double u = -1.0;
+            {
+                ggml_init_params ip = { ggml_tensor_overhead()*2, nullptr, true };
+                ggml_context_ptr ctx(ggml_init(ip));
+                ggml_tensor * dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) (e_bytes*K));
+                ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), d.buft));
+                if (buf) {
+                    std::vector<double> t;
+                    for (int r = 0; r <= n_rep; ++r) {
+                        const int64_t t0 = ggml_time_us();
+                        size_t off = 0;
+                        for (int j = 0; j < K; ++j, ++ctr) {
+                            for (const ggml_tensor * w : g.ref) {
+                                ggml_backend_tensor_set_async(d.backend, dst, (const uint8_t *) w->data + (ctr % n_exp)*w->nb[2], off, w->nb[2]);
+                                off += w->nb[2];
+                            }
+                        }
+                        ggml_backend_synchronize(d.backend);
+                        if (r > 0) {
+                            t.push_back((ggml_time_us() - t0)/1000.0/K);
+                        }
+                    }
+                    u = median(t);
+                }
+            }
+            double gc1 = -1.0, gcb[n_rows];
+            std::string line;
+            for (int i = 0; i < n_rows; ++i) {
+                gcb[i] = fewrow_auto || (i == 0 && n_threads == n_threads_batch) ? cpu_ms(rows_b[i], n_threads_batch) : -1.0;
+                if (gcb[i] >= 0.0) {
+                    line += " " + std::to_string(rows_b[i]) + ":" + std::to_string(gcb[i]).substr(0, 6);
+                }
+            }
+            if (time_split) {
+                gc1 = n_threads == n_threads_batch && gcb[0] >= 0.0 ? gcb[0] : cpu_ms(1, n_threads);
+            }
+            LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] group %s x%zu layers, %.2f MiB per expert: CPU ms per expert by rows"
+                    "%s (%d threads), 1 row %.4f ms (%d threads), upload %.4f ms\n", ggml_type_name(g.ref.back()->type),
+                    g.layers.size(), e_bytes/1048576.0, line.empty() ? " -" : line.c_str(), n_threads_batch, gc1, n_threads, u);
+            if (u <= 0.0 || (time_split && gc1 <= 0.0)) {
+                LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] timing failed (no scratch buffer on %s?), calibration skipped\n",
+                        ggml_backend_buft_name(d.buft));
+                return;
+            }
+            const double wgt = (double) g.layers.size();
+            wsum += wgt;
+            c1   += wgt*gc1;
+            up   += wgt*u;
+            for (int i = 0; i < n_rows; ++i) {
+                cb[i] += wgt*gcb[i];
+            }
+        }
+        if (wsum <= 0.0) {
+            return;
+        }
+        up /= wsum;
+        if (want_split) {
+            split.seed(time_split ? c1/wsum : split.cal_c, time_split ? up : split.cal_g);
+        }
+        if (fewrow_auto) {
+            // CPU time at r rows, linear between the timed rows
+            int32_t R = 0;
+            for (int32_t r = 1; r <= rows_b[n_rows - 1]; ++r) {
+                int i = 0;
+                while (i + 2 < n_rows && rows_b[i + 1] < r) {
+                    ++i;
+                }
+                const double a = cb[i]/wsum, b = cb[i + 1]/wsum;
+                const double c = a + (b - a)*std::clamp((double) (r - rows_b[i])/(rows_b[i + 1] - rows_b[i]), 0.0, 1.0);
+                if (c >= up) {
+                    break;
+                }
+                R = r;
+            }
+            fewrow_use = std::min(R, fewrow_r);
+            LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] few-row tier: CPU %.4f ms at 1 row, %.4f ms at 64 rows, upload %.4f ms "
+                    "per expert -> LLAMA_MOE_CACHE_FEWROW_CPU=auto is R = %d%s\n", cb[0]/wsum, cb[n_rows - 1]/wsum, up, fewrow_use,
+                    fewrow_use == 0 ? " (every miss uploads)" : "");
+        }
+    }
+
     // fork (INKCACHEUX): a request ended (server). GS1 per-request line, GS4 periodic save.
     void request_end() {
         if (ux.req_stats) {
@@ -2436,6 +2609,10 @@ void llama_moe_cache::og_prepare() {
     if (pimpl->og) {
         pimpl->og->prepare();
     }
+}
+
+void llama_moe_cache::calibrate(int32_t n_threads, int32_t n_threads_batch) {
+    pimpl->calibrate(n_threads, n_threads_batch);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
