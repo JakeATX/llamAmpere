@@ -1512,7 +1512,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             // fork (DFIT): the drafter loads after the target context; leave the fit's measurement of its weights + KV +
             // compute at the fitted ctx (+64 MiB) out of the auto-sized expert cache instead of the fixed 1,400 MiB
             // (measured at ctx 16K-40K; at 240K and -ub 2048 the drafter took 5,551 MiB and its compute buffer OOMed)
-            const size_t mib = (extra_device_bytes + (1u << 20) - 1) / (1u << 20) + 64;
+            // never below the old measured 1,400: the fit's accounting leaves out the drafter context's own CUDA
+            // overhead (streams, cuBLAS workspace, pool rounding), which matters at short ctx with -ubd 64
+            const size_t mib = std::max<size_t>((extra_device_bytes + (1u << 20) - 1) / (1u << 20) + 64, 1400);
             common_moe_cache_auto_reserve_set(std::to_string(mib));
             COM_INF("drafter at ctx %u: %zu MiB of VRAM (fit measurement) stay out of the auto-sized expert cache\n",
                     cparams.n_ctx, mib - 64);
@@ -2335,7 +2337,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_prefetch = params.moe_prefetch;
 
     cparams.moe_cache_size      = params.moe_cache_size;
-    if (params.moe_cache_size == 0 && params.speculative.has_dft() && !getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB")) {
+    // fork (DFIT): a value common wrote itself is reset on every load (a fit's measurement from an earlier load in the
+    // same process must not carry over); a user's value is kept. Unset and "0" are the same to the context.
+    if (params.moe_cache_size == 0 && !params.speculative.has_dft() && getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB") &&
+            common_moe_cache_auto_reserve_is_default()) {
+        common_moe_cache_auto_reserve_set("0");
+    }
+    if (params.moe_cache_size == 0 && params.speculative.has_dft() && common_moe_cache_auto_reserve_is_default()) {
         // (process-wide on purpose: the router/reload paths rebuild the same target + drafter pair)
         // fork (INKSMALL2): the drafter loads after the target context, so its weights + KV + compute (measured
         // 1,307-1,327 MiB for the Inkling DSpark Q8_0 fold drafter at ctx 16K-40K) stay out of the auto-sized cache
