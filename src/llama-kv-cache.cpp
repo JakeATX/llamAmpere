@@ -5522,7 +5522,10 @@ int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_uba
     bool nk_check_pending = false;
     std::vector<int32_t> nk_check_counts;
     int64_t nk_check_far_end = 0;
-    if (llama_nk_dev_mask_enabled() && !packed && kq_mask_defer_ok && dst->buffer != nullptr &&
+    // several streams (dst->ne[3] > 1): every stream's far node reads its own view of this mask, and the input copy
+    // of a view never matches the deferred record of the whole tensor (the mask would reach the card unfilled:
+    // non-finite logits with 2+ sequences in one decode). Those masks are filled on the host below.
+    if (llama_nk_dev_mask_enabled() && !packed && kq_mask_defer_ok && dst->buffer != nullptr && dst->ne[3] == 1 &&
             ggml_backend_buffer_is_host(dst->buffer) && ggml_is_contiguous(dst) && T > 0 && n_kv > 0) {
         std::vector<int32_t> counts((size_t) T, 0);
         int64_t far_end = 0;
