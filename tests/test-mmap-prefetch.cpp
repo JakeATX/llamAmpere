@@ -21,6 +21,17 @@ struct advice_call {
     int kind;
 };
 
+// the linker --wrap targets have no header
+extern "C" {
+size_t  __wrap__ZN15llama_moe_arena16available_memoryEv();
+int     __wrap_mincore(void * addr, size_t bytes, unsigned char * resident);
+ssize_t __wrap_pread(int fd, void * dst, size_t bytes, off_t offset);
+int     __wrap_posix_fadvise(int fd, off_t offset, off_t bytes, int kind);
+void *  __wrap_mmap(void * addr, size_t size, int prot, int flags, int fd, off_t offset);
+int     __wrap_posix_madvise(void * addr, size_t size, int kind);
+int     __wrap_madvise(void * addr, size_t size, int kind);
+}
+
 static std::atomic<size_t> fake_available{16ull << 30};
 extern "C" size_t __wrap__ZN15llama_moe_arena16available_memoryEv() { return fake_available.load(); }
 

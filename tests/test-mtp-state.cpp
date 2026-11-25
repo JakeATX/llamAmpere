@@ -745,7 +745,7 @@ static void run_mtp_pipe() {
             require(expected && actual, what);
             if (std::memcmp(expected, actual, n_vocab * sizeof(float)) != 0) {
                 float worst = 0.0f;
-                for (int v = 0; v < n_vocab; ++v) {
+                for (int v = 0; v < (int) n_vocab; ++v) {
                     worst = std::max(worst, std::fabs(expected[v] - actual[v]));
                 }
                 fprintf(stderr, "pipe mismatch round %d step %d: max |diff| %g (expected[0] %g actual[0] %g)\n",

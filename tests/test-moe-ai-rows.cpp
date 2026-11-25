@@ -216,6 +216,7 @@ int main(int argc, char ** argv) {
             auto tiles_at = [&](int64_t sl, int64_t u) {
                 return v2 ? scale_at(sl, u) + AI4U_SCALE_BYTES + (u % AI4V2_UNITS) * tbu : scale_at(sl, u) + AI4U_SCALE_BYTES;
             };
+            (void) tiles_at;
             for (int64_t sl = 0; sl < M / AI4_TR; ++sl) {
                 for (int64_t u = 0; u < K / AI4U_UK; u += v2 ? AI4V2_UNITS : 1) {
                     uint16_t * dh = (uint16_t *) scale_at(sl, u);
@@ -371,7 +372,7 @@ int main(int argc, char ** argv) {
                     const void * qp[8];
                     for (int t = 0; t < nt; ++t) {
                         qp[t] = qb.data() + t * moe_ai::q8_bytes(K);
-                        moe_ai::quant_q8(yp[t], (void *) qp[t], K);
+                        moe_ai::quant_q8(yp[t], qb.data() + t * moe_ai::q8_bytes(K), K);
                     }
                     std::vector<float> oq((size_t) nt * M), os((size_t) nt * M), ov((size_t) nt * M);
                     auto run_q = [&](std::vector<float> & o, bool scalar, int vbmi = 0, int lv = 0) {
