@@ -910,7 +910,13 @@ bool ggml_cuda_fattn_sj_kvarn_fast_try(ggml_backend_cuda_context & ctx, ggml_ten
         return false;
     }
     const int n_q = (int) dst->src[0]->ne[1];
-    if (n_q < 1 || n_q > 8) {
+    // n_q = 1 stays on the stream kernel by default (INKDEC perf, 3090: fast 200.7 vs stream 189.1 us at ring 4096);
+    // GGML_SJKVARN_FAST_MIN_NQ=1 sends it here too
+    static const int min_nq = [] {
+        const char * e = getenv("GGML_SJKVARN_FAST_MIN_NQ");
+        return e && *e ? std::max(1, atoi(e)) : 2;
+    }();
+    if (n_q < min_nq || n_q > 8) {
         return false;
     }
     // Default NSTAGE: 4 for mode >= 2 (higher HBM demand), 2 for mode 1 (override with GGML_SJKVARN_FAST_NSTAGE).
