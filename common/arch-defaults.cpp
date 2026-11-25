@@ -264,8 +264,12 @@ static void note_env(const std::string & name) {
 
 static const json * spec_row_for_run(const json * row, const common_params & params);
 
-// the spec row's env list when its drafter is the one this run uses and the list's kill switch is not 0; else nullptr
-static const json * spec_env_for_run(const json * row, const common_params & params) {
+// the spec row's env list when its drafter (same type, same file) is the one this run uses; else nullptr.
+// `killed` (optional) is set when the list's kill switch is 0: the caller then sets nothing.
+static const json * spec_env_for_run(const json * row, const common_params & params, bool * killed = nullptr) {
+    if (killed) {
+        *killed = false;
+    }
     const json * s = spec_row_for_run(row, params);
     if (!s || !s->contains("env") || !params.speculative.has_dft()) {
         return nullptr;
@@ -273,18 +277,31 @@ static const json * spec_env_for_run(const json * row, const common_params & par
     if (common_arch_min_gpu_total_mib(params) < s->value("min_gpu_mib", (size_t) 0)) {
         return nullptr;
     }
-    const std::string kill = s->value("env_kill", "");
-    const char * k = kill.empty() ? nullptr : getenv(kill.c_str());
-    if (k && strcmp(k, "0") == 0) {
+    // the running drafter must be the row's own file (another drafter of the same type gets nothing)
+    common_arch_spec_default d;
+    d.model     = s->value("model", "");
+    d.model_alt = s->value("model_alt", std::vector<std::string>());
+    const std::string want = common_arch_spec_default_file(d, params.model.path);
+    std::error_code ec;
+    if (want.empty() || !std::filesystem::equivalent(want, params.speculative.draft.mparams.path, ec) || ec) {
         return nullptr;
     }
     const std::string type = s->value("type", "");
+    bool type_runs = false;
     for (auto t : params.speculative.types) {
-        if (t != COMMON_SPECULATIVE_TYPE_NONE && common_speculative_type_to_str(t) == type) {
-            return &(*s)["env"];
-        }
+        type_runs = type_runs || (t != COMMON_SPECULATIVE_TYPE_NONE && common_speculative_type_to_str(t) == type);
     }
-    return nullptr;
+    if (!type_runs) {
+        return nullptr;
+    }
+    const std::string kill = s->value("env_kill", "");
+    const char * k = kill.empty() ? nullptr : getenv(kill.c_str());
+    if (killed) {
+        *killed = k && strcmp(k, "0") == 0;
+    } else if (k && strcmp(k, "0") == 0) {
+        return nullptr;
+    }
+    return &(*s)["env"];
 }
 
 void common_arch_defaults_apply(const common_params & params) {
@@ -573,10 +590,16 @@ void common_arch_defaults_report(const common_params & params, const llama_model
                 src_env(name) + "; " + (same ? "" : "best " + e.value("value", "") + "; ") + e.value("why", ""));
             if (!same) differ.push_back(name);
         }
-        if (const json * senv = table_on ? spec_env_for_run(row, params) : nullptr) {
+        bool stack_killed = false;
+        if (const json * senv = table_on ? spec_env_for_run(row, params, &stack_killed) : nullptr) {
             for (const auto & e : *senv) {
                 const std::string name = e["env"].get<std::string>();
                 const char * v = getenv(name.c_str());
+                if (stack_killed && !(v && e.value("value", "") == v)) {
+                    add("OFF", name, v ? v : "unset", "kill switch " + (*row)["spec"].value("env_kill", "") + "=0; " + e.value("why", ""));
+                    differ.push_back(name);
+                    continue;
+                }
                 if (v && src_env(name) == "engine") { mismatch(name, "a drafter value"); continue; }
                 const bool same = v && e.value("value", "") == v;
                 add(same ? "ON" : "OVERRIDE", name, v ? v : "unset",
