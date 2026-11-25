@@ -7894,7 +7894,9 @@ static bool moe_cache_device_fallback(moe_cache_session & session,
         return true;
     }
     const size_t bytes = table.desc.expert_size;
-    const size_t floor = 7ull << 30, margin = 2ull << 30;
+    // RAMSAFE: the same headroom as the startup preflight (the loader sets the floor from host RAM); read once.
+    static const size_t floor = moe_env_mib_bytes("GGML_MOE_DEVICE_RAM_FLOOR_MIB", 7ull << 30);
+    static const size_t margin = moe_env_mib_bytes("GGML_MOE_DEVICE_RAM_MARGIN_MIB", 2ull << 30);
     size_t registered = 0;
     for (const auto & range : session.mapped_ranges) {
         if (range.registered) {

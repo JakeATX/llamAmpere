@@ -216,6 +216,7 @@ static bool test_ram_view() {
     };
     // no group path, and a tree with no limit at any level: MemAvailable, as before
     check(llama_moe_arena::read_ram_view(meminfo, root + "/cg", "").available == 40 * GiB, "no group path");
+    check(llama_moe_arena::read_ram_view(meminfo, root + "/cg", "").total == 48000000ull * 1024, "total = MemTotal, no group path");
     ram_write(root + "/cg/a/memory.max", "max\n");
     ram_write(root + "/cg/a/b/memory.max", "max\n");
     ram_write(root + "/cg/a/b/memory.current", "1073741824\n");
@@ -243,6 +244,7 @@ static bool test_ram_view() {
     ram_write(root + "/cg/a/memory.current", std::to_string(12 * GiB) + "\n");
     view = llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b");
     check(view.available == 8 * GiB && view.group == root + "/cg/a", "tighter parent memory.high");
+    check(view.limit == 20 * GiB && view.total == 20 * GiB, "RAMSAFE: the tightest group limit caps total");
     // usage over the limit gives 0 here, not a wrapped number (available_memory() then reports 1, "exhausted")
     ram_write(root + "/cg/a/memory.current", std::to_string(25 * GiB) + "\n");
     check(llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b").available == 0, "over the limit");
