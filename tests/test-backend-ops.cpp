@@ -1496,6 +1496,8 @@ struct test_case {
     // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
     // the graph runs on the tested backend. Backends without the counter are not checked.
     virtual const char * required_fusion() { return nullptr; }
+    // GGML_TEST_DUMP_HASH: also print the raw-byte hash of this case's checked nodes (bit-identity, flag off vs on)
+    virtual bool dump_hash() { return false; }
     // Fork cases whose own CUDA path handles a -1 MUL_MAT_ID id (cold routes); exempts them from the upstream
     // [TAG_MUL_MAT_ID_SKIP] guard below. Upstream cases keep the guard.
     virtual bool handles_skipped_ids() { return false; }
@@ -1754,7 +1756,8 @@ struct test_case {
                 }
             }
 
-            if ((t1->op == GGML_OP_FLASH_ATTN_EXT || t1->op == GGML_OP_CONCAT || t1->op == GGML_OP_MUL_MAT_ID) && getenv("GGML_TEST_DUMP_HASH")) { // CONCAT: multi-stream SJ-KVaRN cases
+            if ((t1->op == GGML_OP_FLASH_ATTN_EXT || t1->op == GGML_OP_CONCAT || t1->op == GGML_OP_MUL_MAT_ID || ud->tc->dump_hash()) &&
+                    getenv("GGML_TEST_DUMP_HASH")) { // CONCAT: multi-stream SJ-KVaRN cases
                 // raw backend1 output bytes (FNV-1a 64) for bit-identity checks between two builds
                 std::vector<uint8_t> raw(ggml_nbytes(t1));
                 ggml_backend_tensor_get(t1, raw.data(), 0, raw.size());
@@ -19260,6 +19263,38 @@ struct test_ink_nvfp4_moe : public test_case {
     }
 };
 
+// GFFN-P9: the same Inkling NVFP4 MoE graph at prefill widths (T >= 512: NVFP4PF gate_up and down). With
+// GGML_CUDA_GFFN_P9=1 the gate_up product, its scale and the SITU run are one GEMM (scaled cases must take it, unscaled
+// ones must not); the SITU output and the expert sum are checked and hashed (flag off vs on byte for byte)
+struct test_gffn_p9 : public test_ink_nvfp4_moe {
+    std::vector<ggml_tensor *> checked;
+    test_gffn_p9(int n_expert, int64_t T, bool scaled, bool strided_ids, int route_mode)
+        : test_ink_nvfp4_moe(n_expert, 8, 2304, 1152, T, scaled, strided_ids, route_mode) {}
+    std::string op_desc(ggml_tensor *) override { return "INKGFFNP9"; }
+    bool dump_hash() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+    const char * required_fusion() override {
+        return scaled && switch_on("GGML_CUDA_GFFN_P9") ? "gffn_p9" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        return scaled && switch_on("GGML_CUDA_GFFN_P9") ? nullptr : "gffn_p9";
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        ggml_tensor * out = test_ink_nvfp4_moe::build_graph(ctx);
+        // the SITU output: src[1] of the down MUL_MAT_ID that feeds the expert sum
+        ggml_tensor * dn = out->src[0]->src[0]->src[0]->src[0];   // RESHAPE <- SUM_ROWS <- CONT <- PERMUTE <- MUL(dn, rw)
+        dn = dn->src[0];
+        if (dn->op == GGML_OP_MUL) {
+            dn = dn->src[0];
+        }
+        GGML_ASSERT(dn->op == GGML_OP_MUL_MAT_ID);
+        checked.push_back(dn->src[1]);
+        checked.push_back(out);
+        return out;
+    }
+};
+
 static void add_ink_nvfp4_moe_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     if (perf) {
         // Full 128-expert Inkling 2 Mini MoE visit: correlated (~24 unique at T=5) and uniform random across T=1..8.
@@ -22780,6 +22815,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     add_inkattn_cases(test_cases, false);
     add_ink_nvfp4_moe_cases(test_cases, false);
+    // GFFN-P9: both NVFP4PF tile widths (bn 64: 128 experts, bn 128: 16 experts), strided ids, all-shared routing, unscaled
+    test_cases.emplace_back(new test_gffn_p9(128, 512,  true,  false, 0));
+    test_cases.emplace_back(new test_gffn_p9(16,  512,  true,  false, 0));
+    test_cases.emplace_back(new test_gffn_p9(16,  1024, true,  true,  1));
+    test_cases.emplace_back(new test_gffn_p9(16,  517,  true,  false, 2));
+    test_cases.emplace_back(new test_gffn_p9(16,  512,  false, false, 0));
     add_ink_q8_0_moe_cases(test_cases, false);
     for (bool packed : {false, true}) {
         for (bool gated : {false, true}) {
