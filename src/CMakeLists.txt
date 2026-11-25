@@ -29,6 +29,7 @@ set(LLAMA_CORE_SOURCES
     llama-io.cpp
     llama-kv-cache.cpp
     llama-kv-elastic.cpp
+    llama-kv-swa-grow.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp
     llama-kv-cache-dsa-iswa.cpp

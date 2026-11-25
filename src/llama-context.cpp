@@ -1806,6 +1806,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                     ink_loan_boot = moe_cache->size();
                     LLAMA_LOG_WARN("%s: [CACHELOAN] on: after a streamed prompt decode reserves %u rows and the MoE cache grows "
                             "from %.0f MiB into the rest (LLAMA_INK_CACHE_LOAN=0 = off)\n", __func__, ink_loan_rows, ink_loan_boot/1048576.0);
+                    ink_swa_init(); // fork (SWA-GROW): no-op unless LLAMA_INK_SWA_GROW=1
                 }
                 LLAMA_LOG_WARN("%s: [INKSTREAM] prompt expert streamer %s (boot scratch %u rows, prompt ceiling %u)\n", __func__,
                         ink_stream ? "on" : "unavailable", sched_reserve_tokens, cparams.n_ubatch);
@@ -6719,13 +6720,24 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         // fork (PLOAN): the kept bank pages count as free, as with the whole cache lent (the same resize as PLOAN off)
         const bool ploan_part = llama_ink_ploan_on() && moe_cache->partial();
         if (ink_loan && sched_reserve_tokens == ink_loan_rows) {
-            const size_t free = gpu_free() + (ploan_part ? moe_cache->kept_bytes() : 0);
             const size_t cap  = llama_moe_cache_host_expert_bytes(model) + (size_t(64) << 20);
+            if (ink_swa_kv && !ink_swa_small) {
+                // fork (SWA-GROW): the cells past n_swa + the loan rows go to the cache, when the loan grows with them
+                const size_t gain  = (size_t) (ink_swa_boot - ink_swa_dec)*ink_swa_kv->swa_cell_bytes();
+                const size_t free0 = gpu_free() + (ploan_part ? moe_cache->kept_bytes() : 0) + gain;
+                if (std::min(cap, free0 > loan_margin ? free0 - loan_margin : 0) > ink_loan_boot) {
+                    ink_swa_set(true, "decode");
+                }
+            }
+            const size_t free = gpu_free() + (ploan_part ? moe_cache->kept_bytes() : 0);
             const size_t want = std::min(cap, free > loan_margin ? free - loan_margin : 0);
             if (want > ink_loan_boot && moe_cache->resize(want)) {
                 grown = moe_cache->size() > ink_loan_boot;
             } else {
                 moe_cache->resize(ink_loan_boot);
+            }
+            if (!grown) {
+                ink_swa_set(false, "loan not grown");
             }
             LLAMA_LOG_WARN("%s: [CACHELOAN] resize %.0f -> %.0f MiB (free %.0f MiB at the %u-row reserve, margin %.0f MiB)\n", __func__,
                     size0/1048576.0, moe_cache->size()/1048576.0, free/1048576.0, ink_loan_rows, loan_margin/1048576.0);
@@ -6767,11 +6779,13 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             // fallback (WDDM can refuse a large allocation right after the frees): the boot size
             moe_cache->resize(ink_loan_boot);
             grown = false;
+            ink_swa_set(false, "loan not grown");
             LLAMA_LOG_WARN("%s: [CACHELOAN] resize back to %.0f MiB: the grown banks did not allocate\n", __func__, moe_cache->size()/1048576.0);
             ok = resume();
         }
         if (!ok) {
             ink_loan_grown = false;
+            ink_swa_set(false, "no refill");
             LLAMA_LOG_ERROR("%s: [INKSTREAM] no VRAM to refill the MoE cache; decode runs its experts on the host until it fits\n", __func__);
             return true;
         }
@@ -6791,6 +6805,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 moe_cache->suspend();
                 moe_cache->resize(ink_loan_boot);
                 grown = false;
+                ink_swa_set(false, "loan not grown");
                 LLAMA_LOG_WARN("%s: [CACHELOAN] resize back to %.0f MiB (free after the reserve %.0f MiB)\n", __func__,
                         moe_cache->size()/1048576.0, free/1048576.0);
                 if (!resume()) {
@@ -6947,6 +6962,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     rows = std::min(rows, cparams.n_ubatch);
     if (ink_rows_cap && !ink_armed) {
         rows = std::min(rows, 512u);
+    }
+    if (ink_swa_small && !ink_armed && !ink_loan_grown && !ink_refill && n_tokens > ink_loan_rows) {
+        // fork (SWA-GROW): the loan went back without the window cache (the elastic KV shrank the cache) and this call
+        // may need more cells than the decode size
+        ink_swa_set(false, "loan returned");
     }
     if (ink_loan && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !ink_armed && (ink_refill || ink_loan_grown)) {
         // fork (CACHELOAN): the refill call and, while the cache holds the loan, decode and short single-sequence prompts
@@ -7530,12 +7550,25 @@ bool llama_context::ink_stream_take(uint32_t n_tokens, llama_seq_id seq) {
         lent = moe_cache ? moe_cache->suspend() : 0;
     }
     sched_need_reserve = true; // any graph built so far reads the banks: rebuild (the resize path drops the old graphs)
+    if (!ink_swa_set(false, "prompt")) { // fork (SWA-GROW): prompt ubatches need the boot window cache
+        // the cache comes back as it was (grown, beside the small window cache); this prompt keeps the normal path
+        if (moe_cache && !moe_cache->resume()) {
+            LLAMA_LOG_ERROR("%s: [INKSTREAM] cannot refill the MoE cache (retried on the next calls)\n", __func__);
+        }
+        LLAMA_LOG_WARN("%s: [SWAGROW] the window cache did not grow back; the streamer is not armed\n", __func__);
+        return false;
+    }
     bool armed = ink_stream->arm();
     if (!armed && llama_ink_ploan_on() && moe_cache && moe_cache->partial()) {
         ink_ploan_give_back("the expert slots did not allocate beside them");
         armed = ink_stream->arm();
     }
     if (!armed) {
+        if (moe_cache && ink_swa_kv && ink_loan_grown) {
+            // fork (SWA-GROW): the loan was measured beside the small window cache, which is at its boot size now
+            moe_cache->resize(ink_loan_boot);
+            ink_loan_grown = false;
+        }
         if (moe_cache && !moe_cache->resume()) {
             LLAMA_LOG_ERROR("%s: [INKSTREAM] cannot refill the MoE cache (retried on the next calls)\n", __func__);
         }
@@ -8059,6 +8092,7 @@ void llama_context::ink_loan_shrink(const char * why) {
     const size_t size0 = moe_cache->size();
     moe_cache->suspend();
     moe_cache->resize(ink_loan_boot);
+    ink_swa_set(false, why); // fork (SWA-GROW): the window cache takes its boot cells back before the cache refills
     const bool ok = moe_cache->resume();
     ink_loan_grown = false;
     sched_need_reserve = true;
@@ -8515,6 +8549,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__,
                                             balloc->get_n_tokens());
 
+                            continue;
+                        }
+                    }
+
+                    if (ink_swa_small) {
+                        // fork (SWA-GROW): a ubatch the decode-sized window cache cannot hold: boot size, retry once
+                        ink_swa_full("memory slot");
+                        if (!ink_swa_small) {
+                            sched_reserve();
                             continue;
                         }
                     }
@@ -12967,6 +13010,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     if (!prompt_warm_join()) { // PP-1: a restore never runs beside the expert refill
         throw std::runtime_error("expert cache refill failed");
     }
+    ink_swa_full("state read"); // fork (SWA-GROW): a saved window may hold more cells than the decode size
     mtp_feedback.valid = false;
     std::fill(mtp_hidden.carry_pos.begin(), mtp_hidden.carry_pos.end(), -2);
     mtp_hidden.captured.clear();
@@ -13008,6 +13052,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     if (!prompt_warm_join()) { // PP-1: a restore never runs beside the expert refill
         throw std::runtime_error("expert cache refill failed");
     }
+    ink_swa_full("state read"); // fork (SWA-GROW): a saved window may hold more cells than the decode size
     mtp_feedback.valid = false;
     if (seq_id >= 0 && (size_t) seq_id < mtp_hidden.carry_pos.size()) {
         mtp_hidden.carry_pos[seq_id] = -2;

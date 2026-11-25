@@ -746,6 +746,16 @@ private:
     uint32_t ink_loan_chunk_n   = 0;
     uint32_t ink_loan_cross(uint32_t ink_min) const;
     void     ink_loan_shrink(const char * why);
+    // fork (SWA-GROW, LLAMA_INK_SWA_GROW=1, off by default; llama-kv-swa-grow.cpp): while the loan is grown the window
+    // cache holds n_swa + the loan rows (padded to 256) instead of n_swa + -ub, and the cells it frees go to the MoE
+    // cache; it is back at its boot size before any call above the loan rows (prompt, shared slots, state read)
+    llama_kv_cache * ink_swa_kv = nullptr;
+    bool     ink_swa_small = false;
+    uint32_t ink_swa_boot  = 0;     // cells at boot (n_swa + n_ubatch, padded)
+    uint32_t ink_swa_dec   = 0;     // cells while the loan is grown
+    void     ink_swa_init();
+    bool     ink_swa_set(bool small, const char * why);
+    void     ink_swa_full(const char * why); // boot size, giving the loan back first if it holds the VRAM
     // fork (SURGE-cache, elastic KV, LLAMA_ELASTIC_KV=1; llama-kv-elastic.cpp): before a decode call, map the KV record
     // pages it may reach (shrinking the grown MoE cache if VRAM is short) and unmap the pages past it (lent to the cache
     // at its next refill). make_room frees `bytes` of VRAM by shrinking the cache, never below its boot size.

@@ -484,6 +484,14 @@ public:
     // (a ubatch past the mapping, a state read) is short of VRAM
     std::function<bool(size_t)> elastic_make_room;
 
+    // fork (SWA-GROW, LLAMA_INK_SWA_GROW=1, off by default; llama-kv-swa-grow.cpp): a single-stream window cache
+    // re-allocates its K/V tensors with n cells and keeps its live cells (indices kept when they fit, else packed in
+    // index order; cells no query can attend again go first). The caller has synchronized and dropped every graph
+    // that holds the old tensors. False (nothing changed) when the cache cannot be resized or the alloc fails.
+    bool   swa_resize_ok() const;
+    bool   swa_resize(uint32_t n);
+    size_t swa_cell_bytes() const; // K + V bytes of one cell over all layers
+
 private:
     void elastic_init(); // after the buffers are allocated
     // the body pages needed for positions up to n_pos are mapped (asks elastic_make_room if short); throws if impossible
