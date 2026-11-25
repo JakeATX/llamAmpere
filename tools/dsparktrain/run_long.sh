@@ -12,6 +12,8 @@
 #   profile : 3 train steps (memory / speed on 100K sequences)
 #   train   : mixed sampler (long with p=FRAC2, else short), select E_d mb on sel (32K + 100K bench samples)
 #   rep     : best vs shipped on rep100 / rep32 / rep3 ; export : Q8_0 fold gguf (453,522,464 B)
+# DRAFT-WORDWT (env WORDWT=<extra weight>, default unset = unchanged): train adds --word-wt WORDWT --word-mask
+#   data/wordmask.npy (built in check from the target gguf by mkwordmask.py); base/rep evals print the WORD/other split.
 # usage: run_long.sh [phase ...]   (default: check selrep dumpsel profile lgen lseq dump base train rep export)
 set -uo pipefail
 R=${R:-/root/dst}; T=$R/wt/tools/dsparktrain; D=$R/data; O=$R/out
@@ -25,7 +27,7 @@ export PYTHONPATH=$R/wt/gguf-py LLAMA_ARG_NO_CACHE_DISK=1 PYTORCH_CUDA_ALLOC_CON
 mkdir -p $D $O $R/run
 log() { echo "$(date -u +%FT%TZ) $*" | tee -a $R/run.log; }
 done_or() { [ -e $R/L.$1.done ] && { log "skip $1"; return 0; }; return 1; }
-TRAINARGS="--w0 $R/w0 --drafter $DF --bf16 $DB"
+TRAINARGS="--w0 $R/w0 --drafter $DF --bf16 $DB${WORDWT:+ --word-mask $D/wordmask.npy}"
 DUMPS="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 12288 -b 2048 -ub 512 $KVF"
 DUMPL="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 110592 $UBF $KVF"
 SPEC="--env LLAMA_DEEPCTX_LADDER=1 --timeout 3600"
@@ -38,6 +40,9 @@ ph_check() {
       || { log 'torch CUDA not usable'; return 1; }
   ( cd $R/w0 && sha256sum -c SHA256SUMS ) >> $R/run.log 2>&1 || { log 'w0 checksum mismatch'; return 1; }
   for f in $M $DQ $DF $DB $D/long_docs.jsonl $D/short_train.seq $D/wiki.test.raw; do [ -s $f ] || { log "missing $f"; return 1; }; done
+  if [ -n "${WORDWT:-}" ] && [ ! -s $D/wordmask.npy ]; then
+    $PY $T/mkwordmask.py $M $D/wordmask.npy >> $R/run.log 2>&1 || { log 'wordmask failed'; return 1; }
+  fi
   df -h $R | tail -1 | tee -a $R/run.log
   local free=$(df -BG --output=avail $R | tail -1 | tr -dc 0-9); (( free >= 110 )) || { log "only ${free} GB free, need >= 110"; return 1; }
   touch $R/L.check.done; log 'check ok'
@@ -138,7 +143,7 @@ PY
 }
 
 TARGS() { echo "$TRAINARGS --train $D/strain:$D/short_train.seq --train2 $D/ltrain:$D/lseq/train.seq --frac2 $FRAC2 --sel $D/sel:$D/sel.seq \
-  --lr $LR --loss $LOSS --kl $KL --seqs-per-step $SPS --anchors-per-seq $APS --chunk-long $CL"; }
+  --lr $LR --loss $LOSS --kl $KL --seqs-per-step $SPS --anchors-per-seq $APS --chunk-long $CL${WORDWT:+ --word-wt $WORDWT}"; }
 
 ph_profile() {
   done_or profile && return

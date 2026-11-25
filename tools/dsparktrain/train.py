@@ -8,6 +8,9 @@ Loss (--loss): e4 = -E_d exact (sum_s prod_{j<s} c_j A_s, teacher-forced on-poli
 (IS weights), plus --kl * KL(p_s || softmax(l_s)) over the full vocab (gradient for tokens outside the drafter's top 20).
 Eval (fp32, no TF32): alpha_s = sum reach_s A_s / sum reach_s, E_1..E_d exact and mb (IS), and the round simulation
 (server-like tok/round: exact; mb approximate) over every anchor (stride 1) or a strided subset.
+WORD weighting (--word-wt W --word-mask M.npy, default off): slot s of an anchor counts 1 + W in the loss when its
+on-policy token t_{a+s} is a whole-word piece (mkwordmask.py): objective sum_s w_s prod_{j<s} c_j A_s, KL_s scaled by w_s.
+Selection and every eval number stay unweighted (E_d); evals also print alpha_mb split into WORD and other slots.
 Checkpoints: best by --select (default E_d mb on the sel split) -> OUT/best.pt; OUT/log.jsonl.
 usage: train.py --w0 W0 --drafter Q8_0-fold.gguf --bf16 BF16.gguf --out OUT [--train P:SEQ] [--sel P:SEQ] [--rep P:SEQ]
                 [--steps N] [--eval-only] [--init ckpt.pt] [--profile N]"""
@@ -64,6 +67,11 @@ def slot_terms(l, S, rows, t, mb):
 
 
 MEMDBG = os.environ.get('DSQ_MEMDBG') == '1'
+WORD_MASK = None   # bool [n_vocab] on the device (--word-mask): True = whole-word token
+
+
+def word_of(t):
+    return WORD_MASK[t.clamp(0, WORD_MASK.shape[0] - 1)]
 
 
 def memlog(tag):
@@ -83,7 +91,7 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
     t0 = time.time()
     W = D.effective({k: v.detach() for k, v in P.items()}, fr, fold_fixed)
     acc = dict(n=0, sumA=np.zeros(walk), sumR=np.zeros(walk), sumAmb=np.zeros(walk), sumRmb=np.zeros(walk),
-               E=np.zeros(walk), Emb=np.zeros(walk), rs=[0.0, 0.0], rsmb=[0.0, 0.0], pt0=0, n_seq=0)
+               E=np.zeros(walk), Emb=np.zeros(walk), rs=[0.0, 0.0], rsmb=[0.0, 0.0], pt0=0, n_seq=0, wA=np.zeros(2), wR=np.zeros(2))
     idx = list(range(len(ds)))
     if max_seq:
         idx = idx[:max_seq]
@@ -109,6 +117,10 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
             acc['sumA'] += (reach * A).sum(0).cpu().numpy(); acc['sumR'] += reach.sum(0).cpu().numpy()
             acc['sumAmb'] += (reachm * Am).sum(0).cpu().numpy(); acc['sumRmb'] += reachm.sum(0).cpu().numpy()
             acc['E'] += E.sum(0).cpu().numpy(); acc['Emb'] += Em.sum(0).cpu().numpy()
+            if WORD_MASK is not None:   # mb acceptance of WORD vs other slots (class of the slot's on-policy token)
+                wd = word_of(tdat)
+                for k, sel_ in ((0, wd), (1, ~wd)):
+                    acc['wA'][k] += float((reachm * Am)[sel_].sum()); acc['wR'][k] += float(reachm[sel_].sum())
             cs.append(C); cms.append(Cmc)
         acc['n_seq'] += 1
         if roundsim and stride == 1:
@@ -127,6 +139,10 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
                tok_round_sim_mb=acc['rsmb'][1] / acc['rsmb'][0] if acc['rsmb'][0] else None,
                p_t_zero_rows=acc['pt0'], secs=round(time.time() - t0, 2))
     out['anchors_per_s'] = round(acc['n'] / max(out['secs'], 1e-9), 1)
+    if WORD_MASK is not None:
+        out['alpha_mb_word'] = round(acc['wA'][0] / max(acc['wR'][0], 1e-30), 4)
+        out['alpha_mb_other'] = round(acc['wA'][1] / max(acc['wR'][1], 1e-30), 4)
+        out['word_reach_share'] = round(acc['wR'][0] / max(acc['wR'].sum(), 1e-30), 4)
     return out
 
 
@@ -153,11 +169,18 @@ def main():
     ap.add_argument('--profile', type=int, default=0, help='run N train steps, print per-step timings, exit')
     ap.add_argument('--seed', type=int, default=1); ap.add_argument('--device', default='cuda')
     ap.add_argument('--no-act-q', action='store_true', help='plain fp32 activations (no engine rounding emulation)')
+    ap.add_argument('--word-wt', type=float, default=0.0, help='extra loss weight of whole-word slots (0 = off, the unweighted loss)')
+    ap.add_argument('--word-mask', help='mkwordmask.py output (bool [n_vocab]); needed by --word-wt, also adds the WORD/other eval split')
     a = ap.parse_args()
+    if a.word_wt and not a.word_mask:
+        ap.error('--word-wt needs --word-mask')
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed); random.seed(a.seed)
     dev = a.device
     D.ACT_Q = not a.no_act_q
+    global WORD_MASK
+    if a.word_mask:
+        WORD_MASK = torch.from_numpy(np.load(a.word_mask)).to(dev)
     fr = D.Frozen(a.w0, dev)
     P = {k: v.to(dev) for k, v in D.load_drafter_masters(a.drafter, a.bf16).items()}
     if a.init:
@@ -271,19 +294,23 @@ def main():
                 sub = an[i:i + ch]
                 (aa, logits, rows, tdat), = list(D.seq_slots(Wl, fr, S, sub, a.walk, bf16_base=a.bf16_base, chunk=ch, ctx=ctx))
                 A, C, KL = [], [], 0.0
+                wt = 1.0 + a.word_wt * word_of(tdat).float() if a.word_wt else None   # [n, walk] slot weights
                 for s, l in enumerate(logits):
                     r, p, pid = slot_terms(l, S, rows[:, s], tdat[:, s], a.loss == 'mb')
                     A.append(r['Amb'] if a.loss == 'mb' else r['A']); C.append(r['cmb_is'] if a.loss == 'mb' else r['c'])
                     if a.kl:
                         ls = torch.log_softmax(l, -1).gather(1, pid)
-                        KL = KL + (p * (torch.log(p.clamp_min(1e-30)) - ls)).sum(-1)
-                E, _ = D.chain_E(torch.stack(A, 1), torch.stack(C, 1))
+                        kls = (p * (torch.log(p.clamp_min(1e-30)) - ls)).sum(-1)
+                        KL = KL + (kls if wt is None else wt[:, s] * kls)
+                A = torch.stack(A, 1); C = torch.stack(C, 1)
+                E, reach = D.chain_E(A, C)
                 Ed = E[:, -1]
-                loss = (-Ed + (a.kl * KL if a.kl else 0)).sum() / n_all
+                obj = Ed if wt is None else (wt * reach * A).sum(1)   # weighted E_d: WORD slots count 1 + word_wt
+                loss = (-obj + (a.kl * KL if a.kl else 0)).sum() / n_all
                 loss.backward()
                 lsum += float(loss.detach()) * n_all; esum += float(Ed.sum()); ksum += float(KL.sum()) if a.kl else 0.0
                 n_tot += sub.shape[0]
-                loss = E = Ed = A = C = KL = logits = l = r = p = pid = ls = None   # drop graph refs (they pin Wl/W + grads)
+                loss = E = Ed = A = C = KL = logits = l = r = p = pid = ls = obj = reach = wt = None   # drop graph refs (they pin Wl/W + grads)
             memlog('chunks')
             for il_i, il in enumerate(FL):
                 gK, gV = ctx_l[2 * il_i].grad, ctx_l[2 * il_i + 1].grad
