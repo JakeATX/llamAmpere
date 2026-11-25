@@ -26,13 +26,15 @@ using json = nlohmann::ordered_json;
 //   kv              the proven trunk KV pair (report only: the engine's own arch default sets it)
 //   spec            drafter beside the model, applied by spec-defaults.cpp when no drafting was chosen
 //                   (model = the published file name, model_alt = older names of the same file, tried in order)
+//                   spec.env: values set when unset, only while this row's drafter is the one that runs
+//                   (spec.env_kill=0 skips them all; each one =0 is its own kill switch)
 //   env_on          engine switches that are ON by default (unset = on, "off" value = the kill switch); report only
 //   apply_env       values the table sets when unset (before the model load)
 //   watch           flags that are OFF by default and still under gate (report only)
 //   best            best config per card class for the gate: preset + extra args/env, the evidence and the file
 static const char * k_arch_defaults_json = R"ARCHJSON(
 {
-  "version": "2026-11-24.3",
+  "version": "2026-11-25.1",
   "protocol": {"chat": true, "temp": 1.0, "npred": 5120, "fill": 100000, "seeds": 6, "order": "ABBA",
                "fail_if_default_slower_pct": 1.0},
   "rows": [
@@ -103,6 +105,15 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
                "preset": "24dense", "kill_env": "LLAMA_DSPINE_DEFAULT", "min_gpu_mib": 23552,
                "type_k": "tq5_0", "type_v": "turbo4", "sampling": "probabilistic",
                "n_max": 7, "n_min": 0, "p_min": 0.0, "mb_mtp": true, "fit": "off",
+               "env_kill": "LLAMA_DSPINE_STACK",
+               "env": [
+                 {"env": "GGML_CUDA_FATTN_D128_TQ5T4", "value": "1",      "why": "D128 tq5_0/turbo4 draft attention kernel"},
+                 {"env": "LLAMA_DSPINE_FAST",          "value": "1",      "why": "DSpine fast draft graph"},
+                 {"env": "GGML_CUDA_DSPINE_FUSE",      "value": "2",      "why": "fused DSpine ops, exact form"},
+                 {"env": "GGML_CUDA_MMQ_FEW",          "value": "draftx", "why": "few-row quantized matmul on the draft graph, exact"},
+                 {"env": "GGML_CUDA_MMQ_EXACT",        "value": "1",      "why": "exact few-row LM head"}
+               ],
+               "env_why": "DSpine decode stack, set only when this row's drafter runs: +3.19% tok/s vs plain DSpine, 6/6 seeds, same tokens and rounds (3090 Ti 350 W, P76, chat temp 1, 98.8K fill, 5,120 tok, ABBA); each value =0 turns that one off, LLAMA_DSPINE_STACK=0 turns all five off",
                "why": "DSpine b16 beside the model, one slot: +8.7% tok/s vs the 0.7.5 MTP default at 98.8K fill (3090 Ti 350 W, P76, chat temp 1, 5,120 tok, 12 seed pairs, 9 faster); LLAMA_DSPINE_DEFAULT=0 keeps the MTP head"},
       "spec_note": "built-in MTP head: spec-defaults.cpp row qwen35 (draft-mtp-adaptive); draft KV left to the resolver on purpose (DSJ + RM24H need unset -ctkd/-ctvd; 11-19 loss came from overriding them); a prompt with images runs that request without the drafter (M-RoPE gap, 0.7.5 server fix)",
       "parallel": 1,
@@ -251,6 +262,31 @@ static void note_env(const std::string & name) {
     }
 }
 
+static const json * spec_row_for_run(const json * row, const common_params & params);
+
+// the spec row's env list when its drafter is the one this run uses and the list's kill switch is not 0; else nullptr
+static const json * spec_env_for_run(const json * row, const common_params & params) {
+    const json * s = spec_row_for_run(row, params);
+    if (!s || !s->contains("env") || !params.speculative.has_dft()) {
+        return nullptr;
+    }
+    if (common_arch_min_gpu_total_mib(params) < s->value("min_gpu_mib", (size_t) 0)) {
+        return nullptr;
+    }
+    const std::string kill = s->value("env_kill", "");
+    const char * k = kill.empty() ? nullptr : getenv(kill.c_str());
+    if (k && strcmp(k, "0") == 0) {
+        return nullptr;
+    }
+    const std::string type = s->value("type", "");
+    for (auto t : params.speculative.types) {
+        if (t != COMMON_SPECULATIVE_TYPE_NONE && common_speculative_type_to_str(t) == type) {
+            return &(*s)["env"];
+        }
+    }
+    return nullptr;
+}
+
 void common_arch_defaults_apply(const common_params & params) {
     static bool done = false;
     if (done) {
@@ -263,6 +299,11 @@ void common_arch_defaults_apply(const common_params & params) {
     if (row) {
         for (const char * list : {"env_on", "apply_env", "watch"}) {
             for (const auto & e : (*row)[list]) {
+                note_env(e["env"].get<std::string>());
+            }
+        }
+        if (row->contains("spec") && (*row)["spec"].is_object() && (*row)["spec"].contains("env")) {
+            for (const auto & e : (*row)["spec"]["env"]) {
                 note_env(e["env"].get<std::string>());
             }
         }
@@ -280,6 +321,15 @@ void common_arch_defaults_apply(const common_params & params) {
         if (!getenv(name.c_str())) {
             common_set_env(name, e["value"].get<std::string>());
             env_by_table().insert(name);
+        }
+    }
+    if (const json * senv = spec_env_for_run(row, params)) {
+        for (const auto & e : *senv) {
+            const std::string name = e["env"].get<std::string>();
+            if (!getenv(name.c_str())) {
+                common_set_env(name, e["value"].get<std::string>());
+                env_by_table().insert(name);
+            }
         }
     }
 }
@@ -522,6 +572,17 @@ void common_arch_defaults_report(const common_params & params, const llama_model
             add(same ? "ON" : "OVERRIDE", name, v ? v : "unset",
                 src_env(name) + "; " + (same ? "" : "best " + e.value("value", "") + "; ") + e.value("why", ""));
             if (!same) differ.push_back(name);
+        }
+        if (const json * senv = table_on ? spec_env_for_run(row, params) : nullptr) {
+            for (const auto & e : *senv) {
+                const std::string name = e["env"].get<std::string>();
+                const char * v = getenv(name.c_str());
+                if (v && src_env(name) == "engine") { mismatch(name, "a drafter value"); continue; }
+                const bool same = v && e.value("value", "") == v;
+                add(same ? "ON" : "OVERRIDE", name, v ? v : "unset",
+                    src_env(name) + "; " + (same ? "" : "best " + e.value("value", "") + "; ") + e.value("why", ""));
+                if (!same) differ.push_back(name);
+            }
         }
         for (const auto & e : (*row)["watch"]) {
             const std::string name = e["env"].get<std::string>();
