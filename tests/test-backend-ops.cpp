@@ -19557,6 +19557,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         add_aifuse_cases(test_cases);
         return test_cases;
     }
+    // [WREAD08] GGML_TEST_AI23_DENSE=1: the rate-2/3 dense types of the 12 GB / 8 GB small-card files at their real 27B shapes
+    // (M x K) and the multi-user widths 9..64 (plus 8 and 65 as controls), CUDA vs CPU. Run with GGML_CUDA_AI23_DENSE=0 and =1.
+    if (getenv("GGML_TEST_AI23_DENSE")) {
+        for (int64_t n : { 8, 9, 12, 16, 17, 24, 32, 33, 48, 64, 65 }) {
+            // 1024: the 8 GB file's small AIT2_U2 tensors; 8704 / 3072 / 2560: per-device rows under -sm tensor on two cards
+            for (int64_t m : { 1024, 2560, 6144, 8704, 10240, 17408 }) {
+                test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT2_U2));
+            }
+            for (int64_t m : { 3072, 6144, 10240, 12288, 17408 }) {
+                test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT3_U2));
+            }
+            test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT2_U2_512));
+            test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT3_U2_512));
+            test_cases.emplace_back(new test_mul_mat_ai4(2560, n, 17408, GGML_TYPE_AIT3_U2_512));
+        }
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
         add_ai_parw_shape_cases(test_cases);
         return test_cases;
@@ -25445,6 +25462,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     ns.push_back(strtoll(p, (char **) &p, 10));
                     while (*p == ',') { ++p; }
                 }
+            }
+            if (mode == "wread12") {
+                // 12 GB L0 file rate-2/3 dense types (GGML_CUDA_AI23_DENSE A/B)
+                for (int64_t n : ns) {
+                    for (int64_t m : { 6144, 10240, 17408 }) {
+                        test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT2_U2));
+                    }
+                    for (int64_t m : { 6144, 10240, 12288, 17408 }) {
+                        test_cases.emplace_back(new test_mul_mat_ai4(m, n, 5120, GGML_TYPE_AIT3_U2));
+                    }
+                    test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT2_U2_512));
+                    test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 17408, GGML_TYPE_AIT3_U2_512));
+                }
+                return test_cases;
             }
             const bool p24 = mode != "wread8", p8 = mode != "wread24";
             for (int64_t n : ns) {

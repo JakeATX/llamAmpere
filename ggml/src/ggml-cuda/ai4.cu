@@ -229,6 +229,18 @@ struct ai23_dense_policy {
     int narrow;
     int splits;
 };
+// [WREAD08] GGML_CUDA_AI23_DENSE: the measured rate-2/3 dense policy below (narrow / tile / split at 9..64 rows, K = 5120
+// or 17408) on its own, without the rest of GGML_CUDA_AI23_TUNED (N <= 8 MMVR config and unroll, MoE routing).
+// Opt-in: =1 turns it on, =0 turns it off (also under GGML_CUDA_AI23_TUNED=1). Unset = follow GGML_CUDA_AI23_TUNED
+// (the base rule, off by default). On a Taichi 3090 AIT2_U2 M = 17408 K = 5120 goes 130 -> 72 us at 9 rows and
+// 139 -> 95 us at 32 rows. Different kernels sum in a different order: rounding-level, not bitwise, against the
+// release launch.
+static bool ai4_ai23_tuned();
+static bool ai23_dense_on() {
+    static const bool v = getenv("GGML_CUDA_AI23_DENSE") ? ai4_env_int("GGML_CUDA_AI23_DENSE", nullptr, 0) != 0
+                                                         : ai4_ai23_tuned();
+    return v;
+}
 static ai23_dense_policy ai23_dense_config(int M, int N, int K, int sms, int rate) {
     static const int tile = ai4_env_int("GGML_CUDA_AI23_DENSE_TILE", nullptr, 0);
     static const int narrow = ai4_env_int("GGML_CUDA_AI23_NARROW", nullptr, 0);
@@ -237,7 +249,7 @@ static ai23_dense_policy ai23_dense_config(int M, int N, int K, int sms, int rat
                                       getenv("GGML_CUDA_AI23_NARROW") ||
                                       getenv("GGML_CUDA_AI23_SPLIT_K");
     ai23_dense_policy p{tile, narrow, splits};
-    if (!ai4_ai23_tuned() || explicit_wide || !sms || (rate != 2 && rate != 3) ||
+    if (!ai23_dense_on() || explicit_wide || !sms || (rate != 2 && rate != 3) ||
             N <= 8 || N > 64 || (K != 5120 && K != 17408)) {
         return p;
     }
