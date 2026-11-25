@@ -19440,6 +19440,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U}) {
         test_cases.emplace_back(new test_mul_mat_ai4(48, 5, 384, type));
     }
+    // Dense AIT4_U at the BN128 GEMM width (N >= 512; GGML_CUDA_AI4_COOP128_DENSE=1 takes these): partial token tiles,
+    // partial 64-row CTAs, H128 (K % 256 != 0) and H256, several CTA rows and columns.
+    for (auto [m, n, k] : std::vector<std::array<int64_t, 3>>{
+             {2304, 600, 2304}, {2304, 1024, 1152}, {80, 513, 384}, {1040, 1000, 5120}, {16, 640, 256}}) {
+        test_cases.emplace_back(new test_mul_mat_ai4(m, n, k, GGML_TYPE_AIT4_U));
+    }
     // Versioned unit formats at expert shapes, H128/H256, and routed offsets.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int n : {1, 4, 5, 8, 9}) {
