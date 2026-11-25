@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include "common.h"
 
 #include <string>
@@ -45,6 +46,10 @@ const common_speculative_family_default * common_speculative_apply_family_defaul
 // the drafter exactly as with explicit flags
 // returns false if the resulting settings are invalid (explicit flags that contradict each other)
 bool common_speculative_apply_model_default(common_params & params);
+
+// a card preset's file drafter from the arch table (24dense: DSpine) in place of the preset's own drafter; `given`
+// tells which flags the user set. Returns true when the drafter was swapped.
+bool common_speculative_apply_preset_file_default(common_params & params, const std::function<bool(const std::string &)> & given);
 
 // Apply after each drafter resolution; an explicit mb-MTP choice is kept.
 void common_speculative_apply_mtp_sampling_default(common_params & params);

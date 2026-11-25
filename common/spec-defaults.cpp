@@ -240,8 +240,8 @@ static ggml_type spec_kv_type_from_name(const std::string & name) {
 static void common_speculative_apply_file_default(common_params & params, const std::string & arch) {
     auto & spec = params.speculative;
     common_arch_spec_default row;
-    if (!common_arch_spec_default_get(arch, row)) {
-        return;
+    if (!common_arch_spec_default_get(arch, row) || !row.preset.empty()) {
+        return; // a preset row is applied by arg.cpp under its card preset only
     }
     const auto type = common_speculative_type_from_name(row.type);
     if (type == COMMON_SPECULATIVE_TYPE_COUNT) {
@@ -290,6 +290,93 @@ static void common_speculative_apply_file_default(common_params & params, const 
             spec.draft.n_gpu_layers, spec.draft.n_ubatch,
             spec.draft.cache_type_k == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_k),
             spec.draft.cache_type_v == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_v), spec.draft.n_max);
+}
+
+// A card preset whose arch row names a file drafter (24dense: DSpine b16 beside the model) swaps the preset's own
+// drafter (the built-in MTP head) for it at one slot. Called by arg.cpp after the preset values are in place; `given`
+// tells which flags the user set (flag or env). Any explicit drafter choice, <kill_env>=0, LLAMA_ARCH_DEFAULTS=0, a
+// missing file or a card below the row's line keeps the preset's drafter. Explicit --fit, -ctkd/-ctvd and
+// --[no-]spec-mb-mtp are kept.
+bool common_speculative_apply_preset_file_default(common_params & params, const std::function<bool(const std::string &)> & given) {
+    auto & spec = params.speculative;
+    if (params.card_preset.empty() || params.n_parallel != 1 || params.model.path.empty()) {
+        return false;
+    }
+    for (const char * key : { "--spec-type", "--spec-draft-model", "--spec-draft-hf", "--spec-draft-n-max", "--spec-draft-n-min",
+                              "--spec-draft-n-min-adaptive", "--spec-draft-p-min", "--spec-draft-sampling", "--spec-chain" }) {
+        if (given(key)) {
+            return false; // the user tuned the drafting: keep it
+        }
+    }
+    if (spec.has_dft() || spec.draft.eagle3 || spec.draft.dflash) {
+        return false;
+    }
+    std::string arch;
+    uint32_t n_nextn = 0;
+    if (!common_speculative_read_arch_nextn(params.model.path, arch, n_nextn)) {
+        return false;
+    }
+    common_arch_spec_default row;
+    if (!common_arch_spec_default_get(arch, row) || row.preset != params.card_preset) {
+        return false;
+    }
+    const auto type = common_speculative_type_from_name(row.type);
+    if (type == COMMON_SPECULATIVE_TYPE_COUNT) {
+        LOG_WRN("speculative: arch table drafter type '%s' for %s is unknown, preset drafter kept\n", row.type.c_str(), arch.c_str());
+        return false;
+    }
+    const std::string file = common_arch_spec_default_file(row, params.model.path);
+    const char * why_not = nullptr;
+    if (common_arch_spec_default_killed(row)) {
+        why_not = "turned off by env";
+    } else if (file.empty()) {
+        why_not = "the drafter file is not beside the model";
+    } else if (common_arch_min_gpu_total_mib(params) < row.min_gpu_mib) {
+        why_not = "the card is below the drafter's card line";
+    }
+    if (why_not) {
+        LOG_INF("card preset %s: drafter %s not applied: %s; the preset's own drafter is used\n",
+                params.card_preset.c_str(), row.model.c_str(), why_not);
+        return false;
+    }
+    spec.types                 = { type };
+    spec.draft.mparams.path    = file;
+    spec.draft.mparams.hf_file = file;
+    if (row.ngl != -1 && !given("--spec-draft-ngl")) {
+        spec.draft.n_gpu_layers = row.ngl;
+    }
+    if (row.n_max >= 0) {
+        spec.draft.n_max = row.n_max;
+    }
+    if (row.n_min >= 0) {
+        spec.draft.n_min = row.n_min;
+    }
+    if (row.p_min >= 0.0f) {
+        spec.draft.p_min = row.p_min;
+    }
+    if (!row.sampling.empty()) {
+        spec.draft.probabilistic = row.sampling == "probabilistic";
+    }
+    if (row.mb_mtp != -1 && !params.sampling.spec_lossy_explicit) {
+        params.sampling.spec_lossy = row.mb_mtp == 1;
+    }
+    if (!row.type_k.empty() && !given("--spec-draft-type-k")) {
+        spec.draft.cache_type_k = spec_kv_type_from_name(row.type_k);
+    }
+    if (!row.type_v.empty() && !given("--spec-draft-type-v")) {
+        spec.draft.cache_type_v = spec_kv_type_from_name(row.type_v);
+    }
+    if (!row.fit.empty() && !given("--fit")) {
+        params.fit_params = row.fit != "off";
+    }
+    LOG_INF("card preset %s: %s on by default (arch table): %s, n-max %d, n-min %d, p-min %g, sampling %s, mb %s, "
+            "draft KV %s/%s, fit %s; %s=0 keeps the MTP head\n", params.card_preset.c_str(), file.c_str(), row.type.c_str(),
+            spec.draft.n_max, spec.draft.n_min, (double) spec.draft.p_min, spec.draft.probabilistic ? "probabilistic" : "greedy",
+            params.sampling.spec_lossy ? "on" : "off",
+            spec.draft.cache_type_k == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_k),
+            spec.draft.cache_type_v == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_v),
+            params.fit_params ? "on" : "off", row.kill_env.c_str());
+    return true;
 }
 
 bool common_speculative_apply_model_default(common_params & params) {

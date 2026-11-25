@@ -55,9 +55,20 @@ struct common_arch_spec_default {
     std::string type_k;     // explicit draft KV types ("" = engine resolver)
     std::string type_v;
     size_t      min_gpu_mib = 0; // only on cards at least this large (small cards: the drafter costs expert cache)
+    // preset rows (applied by arg.cpp for that card preset at one slot, in place of the preset's own drafter):
+    std::string preset;     // "" = arch row for any run; else only under this --preset
+    std::string kill_env;   // <env>=0 keeps the preset's own drafter
+    std::string sampling;   // --spec-draft-sampling ("" = keep)
+    int32_t     n_max = -1; // --spec-draft-n-max (-1 = keep)
+    int32_t     n_min = -1; // --spec-draft-n-min (-1 = keep)
+    float       p_min = -1.0f; // --spec-draft-p-min (< 0 = keep)
+    int32_t     mb_mtp = -1;   // --spec-mb-mtp: 1 on, 0 off, -1 keep
+    std::string fit;        // --fit ("" = keep)
     std::string why;
 };
 bool common_arch_spec_default_get(const std::string & arch, common_arch_spec_default & out);
+// true when the row's kill switch env is set to 0
+bool common_arch_spec_default_killed(const common_arch_spec_default & row);
 // the row's drafter file beside the model: `model` first, then each of `model_alt`; "" = none of them is there
 std::string common_arch_spec_default_file(const common_arch_spec_default & row, const std::string & model_path);
 

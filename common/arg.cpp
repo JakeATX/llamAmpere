@@ -1278,6 +1278,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // (which also makes the SJ-KVaRN draft cache + RM24H list eligible) and rolls back without replay; explicit
         // flags and environment still win. V07/SPEEDREG.
         if (params.card_preset == "24dense" && params.n_parallel == 1) {
+            // DSpine beside the model replaces the MTP head at one slot (arch table "spec" row; LLAMA_DSPINE_DEFAULT=0
+            // keeps the MTP head as in 0.7.5)
+            const bool file_drafter = common_speculative_apply_preset_file_default(params, explicit_or_env);
             if (!explicit_or_env("--spec-draft-window")) {
                 params.speculative.draft.attn_window = 0;
             }
@@ -1286,8 +1289,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             }
             // adaptive depth 3..7 at one user: +5.2% tok/s vs 4..5 (P76, 98,766 and 8K chat, 12 seed pairs, 11 faster);
             // floor 4 / max 5 are multi-user values (W3 split with 2+ users). V07/SPEEDREG, V07/MTPFLOOR_20261119.md.
-            if (adaptive_mtp && !explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive") &&
-                    !explicit_or_env("--spec-chain")) {
+            if (adaptive_mtp && !file_drafter && !explicit_or_env("--spec-draft-n-max") &&
+                    !explicit_or_env("--spec-draft-n-min-adaptive") && !explicit_or_env("--spec-chain")) {
                 params.speculative.draft.n_min_adaptive = 3;
                 params.speculative.draft.n_max = 7;
             }
@@ -1301,9 +1304,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     params.card_preset_flags.replace(pos, preset_ub.size(), " --ubatch-size " + std::to_string(params.n_ubatch));
                 }
             }
-            LOG_INF("card preset 24dense, one slot: draft window %d, gdn-replay %s, adaptive depth %d..%d, ubatch %d "
+            LOG_INF("card preset 24dense, one slot: draft window %d, gdn-replay %s, %s depth %d..%d, ubatch %d "
                     "(multi-user values apply with -np > 1)\n", params.speculative.draft.attn_window,
-                    params.gdn_replay ? "on" : "off", params.speculative.draft.n_min_adaptive, params.speculative.draft.n_max,
+                    params.gdn_replay ? "on" : "off", file_drafter ? "file drafter" : "adaptive",
+                    file_drafter ? params.speculative.draft.n_min : params.speculative.draft.n_min_adaptive,
+                    params.speculative.draft.n_max,
                     params.n_ubatch);
         }
     }

@@ -99,7 +99,11 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
              "why": "UBDEFAULT: 4096 vs 2048 no prefill gain, 16-token replies -26%/-29% -> 2048"},
       "lean_prompt": {"24g": "auto", "small": "auto", "why": "dense: the MoE-only rule never fires"},
       "kv": {"type_k": "sjkvarn4", "type_v": "sjkvarn4", "why": "24dense preset"},
-      "spec": null,
+      "spec": {"type": "draft-dflash", "model": "Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf", "model_alt": [],
+               "preset": "24dense", "kill_env": "LLAMA_DSPINE_DEFAULT", "min_gpu_mib": 23552,
+               "type_k": "tq5_0", "type_v": "turbo4", "sampling": "probabilistic",
+               "n_max": 7, "n_min": 0, "p_min": 0.0, "mb_mtp": true, "fit": "off",
+               "why": "DSpine b16 beside the model, one slot: +8.7% tok/s vs the MTP head at 98.8K fill (3090 Ti 350 W, P76, chat temp 1, 5,120 tok, 12 seed pairs, 9 faster); LLAMA_DSPINE_DEFAULT=0 keeps the MTP head"},
       "spec_note": "built-in MTP head: spec-defaults.cpp row qwen35 (draft-mtp-adaptive); draft KV left to the resolver on purpose (DSJ + RM24H need unset -ctkd/-ctvd; 11-19 loss came from overriding them); a prompt with images runs that request without the drafter (M-RoPE gap, 0.7.5 server fix)",
       "parallel": 1,
       "env_on": [],
@@ -295,7 +299,41 @@ bool common_arch_spec_default_get(const std::string & arch, common_arch_spec_def
     out.type_v      = s.value("type_v", "");
     out.min_gpu_mib = s.value("min_gpu_mib", (size_t) 0);
     out.why         = s.value("why", "");
+    out.preset      = s.value("preset", "");
+    out.kill_env    = s.value("kill_env", "");
+    out.sampling    = s.value("sampling", "");
+    out.n_max       = s.value("n_max", -1);
+    out.n_min       = s.value("n_min", -1);
+    out.p_min       = s.value("p_min", -1.0f);
+    out.mb_mtp      = s.contains("mb_mtp") ? (s["mb_mtp"].get<bool>() ? 1 : 0) : -1;
+    out.fit         = s.value("fit", "");
     return !out.type.empty() && !out.model.empty();
+}
+
+bool common_arch_spec_default_killed(const common_arch_spec_default & row) {
+    const char * v = row.kill_env.empty() ? nullptr : getenv(row.kill_env.c_str());
+    return v && strcmp(v, "0") == 0;
+}
+
+// the spec row that is the table's pick for this run: a preset row counts only under its preset, at one slot, with its
+// kill switch unset and its file beside the model (else the arch's spec_note drafter is the pick)
+static const json * spec_row_for_run(const json * row, const common_params & params) {
+    if (!row || !row->contains("spec") || (*row)["spec"].is_null()) {
+        return nullptr;
+    }
+    const json & s = (*row)["spec"];
+    const std::string preset = s.value("preset", "");
+    if (!preset.empty()) {
+        common_arch_spec_default d;
+        d.model     = s.value("model", "");
+        d.model_alt = s.value("model_alt", std::vector<std::string>());
+        d.kill_env  = s.value("kill_env", "");
+        if (preset != params.card_preset || params.n_parallel != 1 || common_arch_spec_default_killed(d) ||
+                common_arch_spec_default_file(d, params.model.path).empty()) {
+            return nullptr;
+        }
+    }
+    return &s;
 }
 
 std::string common_arch_spec_default_file(const common_arch_spec_default & row, const std::string & model_path) {
@@ -401,15 +439,17 @@ void common_arch_defaults_report(const common_params & params, const llama_model
         const std::string dft = params.speculative.has_dft() ? std::filesystem::path(params.speculative.draft.mparams.path).filename().string() : "";
         const std::string v = types.empty() ? "none" : types + (dft.empty() ? "" : " " + dft);
         std::string best_type;
-        if (row && row->contains("spec") && !(*row)["spec"].is_null()) {
-            const size_t min_mib = (*row)["spec"].value("min_gpu_mib", (size_t) 0);
-            best_type = common_arch_min_gpu_total_mib(params) >= min_mib ? (*row)["spec"].value("type", "") : "none";
+        const json * srow = spec_row_for_run(row, params);
+        if (srow) {
+            const size_t min_mib = srow->value("min_gpu_mib", (size_t) 0);
+            best_type = common_arch_min_gpu_total_mib(params) >= min_mib ? srow->value("type", "") :
+                        srow->value("preset", "").empty() ? "none" : "";
         }
         if (best_type.empty()) {
             add(types.empty() ? "OFF" : "ON", "drafter", v, row ? row->value("spec_note", "no drafter row") : "no table row");
         } else {
             const bool same = best_type == "none" ? types.empty() : types.find(best_type) != std::string::npos;
-            add(same ? (types.empty() ? "OFF" : "ON") : "OVERRIDE", "drafter", v, same ? (*row)["spec"].value("why", "") : "best " + best_type);
+            add(same ? (types.empty() ? "OFF" : "ON") : "OVERRIDE", "drafter", v, same ? srow->value("why", "") : "best " + best_type);
             if (!same) differ.push_back("drafter");
         }
         if (!types.empty()) {
@@ -425,8 +465,8 @@ void common_arch_defaults_report(const common_params & params, const llama_model
             };
             const std::string dk = dname(d.cache_type_k, params.cache_type_k) + "/" + dname(d.cache_type_v, params.cache_type_v);
             std::string best_dk;
-            if (row && row->contains("spec") && !(*row)["spec"].is_null() && !(*row)["spec"].value("type_k", "").empty()) {
-                best_dk = (*row)["spec"].value("type_k", "") + "/" + (*row)["spec"].value("type_v", "");
+            if (srow && !best_type.empty() && !srow->value("type_k", "").empty()) {
+                best_dk = srow->value("type_k", "") + "/" + srow->value("type_v", "");
             }
             if (best_dk.empty()) {
                 add("ON", "draft KV", dk, "resolver: DSJ / tq5_0+turbo4 for MTP, else trunk type");
