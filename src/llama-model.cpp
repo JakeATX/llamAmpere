@@ -3126,6 +3126,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // the CPU runs a matmul from a host buffer (the GPU device rejects a weight in it); with mmap the loader keeps
         // the head in a plain CPU buffer instead of the pinned one
         const buft_list_t host_list = { { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), ggml_backend_dev_host_buffer_type(pimpl->dev_output.dev) } };
+        output_host_loan = true;
         return ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, &host_list, nullptr, tn, ne, flags);
     }
     const buft_list_t * buft_list_layer = nullptr;

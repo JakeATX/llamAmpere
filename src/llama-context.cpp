@@ -47,6 +47,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <functional>
 #include <cstdlib>
 
 #include <cinttypes>
@@ -1886,6 +1887,8 @@ void llama_context::ple_hint_add(const llama_token * window, int32_t n_window) {
 }
 
 llama_context::~llama_context() {
+    if (sched && (ckpt_async[0].pending || ckpt_async[1].pending)) { ggml_backend_sched_synchronize(sched.get()); } // [CKPTASYNC] no copy lands in freed staging
+    for (auto & c : ckpt_async) { if (c.buf) { ggml_backend_buffer_free(c.buf); } if (c.ev) { ggml_backend_event_free(c.ev); } }
     if (ink_headloan) { // [HEADLOAN] the head points at its host copy again; the VRAM copy goes
         ink_headloan.reset();
         model.output_loaned = false;
@@ -3202,6 +3205,7 @@ void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+    ckpt_async_finish(); // [CKPTASYNC]
 
     if (mtp_pipe.pending) {
         // [RTPORT] the newest step waits on the card for its token: wait only for the step before it
@@ -10364,6 +10368,48 @@ public:
     std::vector<write_info> winfos;
 };
 
+// [CKPTASYNC] state bytes go to pinned staging; device tensor slices are async D2H copies on their device's compute
+// backend (stream order snapshots the state before the next ubatch writes it). A host-buffer tensor first waits for the
+// queued compute (sync_all), as the synchronous path does.
+class llama_io_write_async : public llama_io_write_i {
+public:
+    llama_io_write_async(uint8_t * p, size_t len, std::function<ggml_backend_t(ggml_backend_dev_t)> backend_of,
+            std::function<void()> sync_all) : ptr(p), buf_size(len), backend_of(std::move(backend_of)), sync_all(std::move(sync_all)) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) { throw std::runtime_error("unexpectedly reached end of buffer"); }
+        memcpy(ptr, src, size); ptr += size; size_written += size; buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) { throw std::runtime_error("unexpectedly reached end of buffer"); }
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (ggml_backend_buffer_is_host(buf)) {
+            if (!synced) { sync_all(); synced = true; }
+            ggml_backend_tensor_get(tensor, ptr, offset, size);
+        } else {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+            ggml_backend_t be = dev ? backend_of(dev) : nullptr;
+            if (be && ggml_backend_buffer_get_type(buf) == ggml_backend_dev_buffer_type(dev)) {
+                ggml_backend_tensor_get_async(be, tensor, ptr, offset, size);
+            } else { // not a plain device buffer (split, multi-buffer): the synchronous copy
+                if (!synced) { sync_all(); synced = true; }
+                ggml_backend_tensor_get(tensor, ptr, offset, size);
+            }
+        }
+        ptr += size; size_written += size; buf_size -= size;
+    }
+
+    size_t n_bytes() override { return size_written; }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0, size_written = 0;
+    bool synced = false;
+    std::function<ggml_backend_t(ggml_backend_dev_t)> backend_of;
+    std::function<void()> sync_all;
+};
+
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
@@ -10879,6 +10925,90 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
         return state_seq_write_data(io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+bool llama_context::ckpt_async_enabled() {
+    static const bool on = [] { const char * e = getenv("LLAMA_CKPT_ASYNC"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+void llama_context::ckpt_async_finish() {
+    bool any = false;
+    for (auto & c : ckpt_async) { any = any || c.pending; }
+    if (!any) {
+        return;
+    }
+    for (auto & c : ckpt_async) {
+        if (c.pending) {
+            ggml_backend_event_synchronize(c.ev); // its copies only, so a pipelined MTP step keeps running
+            memcpy(c.dst, ggml_backend_buffer_get_base(c.buf), c.size);
+            c.pending = false;
+        }
+    }
+}
+
+size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (!sched || (ckpt_sel >= 0 && seq_id == ckpt_seq) || !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu = nullptr;
+    for (const auto & be : backends) {
+        auto * dev = ggml_backend_get_device(be.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu = dev; break; }
+    }
+    if (!gpu || !ggml_backend_dev_host_buffer_type(gpu)) {
+        return 0;
+    }
+    for (auto & c : ckpt_async) {
+        if (c.pending && c.dst == dst) { ckpt_async_finish(); break; } // the same destination again: land the older copy first
+    }
+    ckpt_async_slot * slot = nullptr;
+    for (auto & c : ckpt_async) { if (!c.pending) { slot = &c; break; } }
+    if (!slot) {
+        ckpt_async_finish();
+        slot = &ckpt_async[0];
+    }
+    if (!slot->buf || ggml_backend_buffer_get_size(slot->buf) < size) {
+        if (slot->buf) { ggml_backend_buffer_free(slot->buf); }
+        slot->buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(gpu), size);
+        if (!slot->buf) {
+            return 0;
+        }
+    }
+    auto backend_of = [this](ggml_backend_dev_t dev) -> ggml_backend_t {
+        for (const auto & be : backends) { if (ggml_backend_get_device(be.get()) == dev) { return be.get(); } }
+        return nullptr;
+    };
+    ggml_backend_t gpu_be = backend_of(gpu);
+    if (!slot->ev) { slot->ev = ggml_backend_event_new(gpu); }
+    if (!slot->ev || !gpu_be) {
+        return 0;
+    }
+    llama_io_write_async io((uint8_t *) ggml_backend_buffer_get_base(slot->buf), size, backend_of,
+            [this]() { ggml_backend_sched_synchronize(sched.get()); });
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        const size_t n = state_seq_write_data(io, seq_id, flags);
+        if (n == 0) {
+            ggml_backend_sched_synchronize(sched.get()); // copies already queued may still read the staging
+            return 0;
+        }
+        for (const auto & be : backends) { // one event after every device's copies (single-GPU: the compute stream)
+            if (ggml_backend_get_device(be.get()) != gpu && ggml_backend_get_device(be.get()) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(be.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_backend_synchronize(be.get());
+            }
+        }
+        ggml_backend_event_record(slot->ev, gpu_be);
+        slot->dst = dst; slot->size = n; slot->pending = true;
+        return n;
+    } catch (const std::exception & err) {
+        ggml_backend_sched_synchronize(sched.get());
+        LLAMA_LOG_WARN("%s: [CKPTASYNC] async checkpoint copy not taken (%s): synchronous copy\n", __func__, err.what());
         return 0;
     }
 }
@@ -11477,6 +11607,13 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : moe_peer->memory_breakdown()) {
             ret[buft].context += size;
         }
+    }
+    // [HEADLOAN] (#247-FIT) the head the loader kept in host memory runs from a VRAM copy of its own: the fit dry run
+    // (no context loan yet) and a live loan count it on the device, so the fit does not hand those bytes to KV or cache
+    if (model.output_host_loan && model.output && model.dev_output() && (ink_headloan || (model.no_alloc() && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) &&
+            !(ink_headloan && ink_headloan->is_lent())) {
+        ggml_backend_buffer_type_t dbuft = ggml_backend_dev_buffer_type(model.dev_output());
+        ret[dbuft].model += ink_headloan ? ink_headloan->bytes() : ggml_backend_buft_get_alloc_size(dbuft, model.output);
     }
     if (mtp_hidden.buf) {
         ret[ggml_backend_buffer_get_type(mtp_hidden.buf.get())].context += ggml_backend_buffer_get_size(mtp_hidden.buf.get());
@@ -12710,7 +12847,12 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 }
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    return ctx->state_seq_get_size(seq_id, flags);
+    ctx->ckpt_async_finish(); // [CKPTASYNC] the caller may resize or swap a destination next
+    return ctx->state_seq_get_size(seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_ASYNC);
+}
+
+void llama_state_seq_flush(llama_context * ctx) {
+    ctx->ckpt_async_finish();
 }
 
 size_t llama_state_seq_get_data_ext(llama_context *       ctx,
@@ -12718,6 +12860,13 @@ size_t llama_state_seq_get_data_ext(llama_context *       ctx,
                                     size_t                size,
                                     llama_seq_id          seq_id,
                                     llama_state_seq_flags flags) {
+    const bool async = (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) != 0;
+    flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+    if (async && llama_context::ckpt_async_enabled()) {
+        if (const size_t n = ctx->state_seq_get_data_async(seq_id, dst, size, flags)) {
+            return n;
+        }
+    }
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);

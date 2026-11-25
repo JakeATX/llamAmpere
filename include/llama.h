@@ -1076,12 +1076,21 @@ extern "C" {
 // the flag saves/loads that section alone. See llama_sj_kvarn_ckpt_sealed_end().
 #define LLAMA_STATE_SEQ_FLAGS_SJ_EXACT 8
 
+// [CKPTASYNC] with LLAMA_CKPT_ASYNC=1 in the environment, llama_state_seq_get_data_ext may return before the bytes are
+// in dst (async device copies into pinned staging); they land at the next llama_synchronize, llama_state_seq_flush
+// or state call. The caller keeps dst alive and unread until then. Without the env (or where it cannot apply) the
+// copy is synchronous as usual.
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 16
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
            llama_state_seq_flags   flags);
+
+    // [CKPTASYNC] land every pending LLAMA_STATE_SEQ_FLAGS_ASYNC copy in its destination
+    LLAMA_API void llama_state_seq_flush(struct llama_context * ctx);
 
     LLAMA_API size_t llama_state_seq_get_data_ext(
             struct llama_context * ctx,
