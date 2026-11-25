@@ -129,6 +129,7 @@
 #include "ggml-cuda/inkmask.cuh"
 #include "ggml-cuda/inkrouter.cuh"
 #include "ggml-cuda/q8a16.cuh"
+#include "ggml-cuda/q8tc.cuh"
 #include "ggml-cuda/head2.cuh"
 #include "ggml-cuda/elastic-buf.cuh"
 #include "ggml-cuda/prefill-glue.cuh"
@@ -4541,6 +4542,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], src1->ne[1]);
     if (!kqrows_claims && (route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) &&
             ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
+        return;
+    }
+    // [Q8TC-MU] Q8_0 multi-slot verify widths (9..32) as <= 8-column f16 tensor-core launches (GGML_CUDA_Q8TC_MU, default off)
+    if ((route == GGML_CUDA_MM_ROUTE_MMQ_FEW || route == GGML_CUDA_MM_ROUTE_MMQ) && ggml_cuda_q8tc_wide(ctx, src0, src1, dst)) {
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMQ_FEW) {

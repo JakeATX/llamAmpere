@@ -4,6 +4,7 @@
 #include "q8tc-kern.cuh"
 #endif
 
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -108,8 +109,58 @@ bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, 
     return true;
 }
 
+// Q8TC-MU: GGML_CUDA_Q8TC_MU=1 (default off) runs a plain Q8_0 x f32 mul_mat of 9..32 columns (multi-slot draft verify)
+// as ceil(T/8) Q8TC launches of near-equal column slices (4..8 columns each), instead of an MMQ tile over q8_1 activations.
+static bool q8tc_mu() {
+    static const bool p = [] { const char * e = getenv("GGML_CUDA_Q8TC_MU"); return e && atoi(e) == 1; }();
+    return p;
+}
+
+bool ggml_cuda_q8tc_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!q8tc_mu() || ggml_cuda_q8tc_mode() == 0 || src0->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    const int64_t T = src1->ne[1];
+    if (T < 9 || T > 32 || !src0->buffer || ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            src0->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) || src0->ne[0] % QK8_0 != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            src0->nb[1] != (size_t) (src0->ne[0]/QK8_0)*sizeof(block_q8_0) || src0->ne[1] > INT_MAX ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[0] != src0->ne[0] ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[0] != src0->ne[1] || dst->ne[1] != T || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || src1->nb[1] % 16 != 0 || dst->nb[1] % sizeof(float) != 0 ||
+            (uintptr_t) src1->data % 16 != 0) {
+        return false;
+    }
+    const int ns = (int) ((T + 7)/8);
+    const int64_t sx = (int64_t) (src1->nb[1]/sizeof(float)), sd = (int64_t) (dst->nb[1]/sizeof(float));
+    const int nb = (int) (src0->ne[0]/QK8_0);
+    // slices differ only in the column offset (sx % 4 == 0 keeps x 16-byte aligned), so the narrowest one is the only
+    // extra condition: when it is below MINT nothing is launched and the MMQ route runs the whole product
+    if ((int) (T/ns) < q8tc_min_t()) {
+        return false;
+    }
+    for (int s = 0, c0 = 0; s < ns; ++s) {
+        const int w = (int) (T/ns) + (s < T % ns ? 1 : 0);
+        q8a16_args a{};
+        a.n = 1;
+        a.vx[0] = (const char *) src0->data;
+        a.x[0] = (const float *) src1->data + c0*sx;
+        a.dst[0] = (float *) dst->data + c0*sd;
+        a.srow[0] = (int64_t) src0->nb[1];
+        a.nrows[0] = (int) src0->ne[1];
+        a.sx[0] = sx;
+        a.sd[0] = sd;
+        if (!ggml_cuda_q8tc_try(ctx, a, w, nb, src0, false)) {
+            GGML_ASSERT(s == 0 && "q8tc wide: a later slice was refused after the first was taken");
+            return false;
+        }
+        c0 += w;
+    }
+    return true;
+}
+
 #else
 
 bool ggml_cuda_q8tc_try(ggml_backend_cuda_context &, q8a16_args &, int, int, const ggml_tensor *, bool) { return false; }
+bool ggml_cuda_q8tc_wide(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
 
 #endif

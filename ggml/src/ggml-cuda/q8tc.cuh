@@ -11,3 +11,6 @@ int ggml_cuda_q8tc_mode();
 // a: filled q8a16_args (members, no ids); w: first member weight (name picks the per-tensor mode), group: grouped launch.
 // Launches and returns true when taken; false = nothing launched.
 bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb, const ggml_tensor * w, bool group);
+
+// Q8TC-MU (GGML_CUDA_Q8TC_MU=1): plain Q8_0 mul_mat with 9..32 columns as <= 8-column Q8TC launches; false = not taken.
+bool ggml_cuda_q8tc_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
