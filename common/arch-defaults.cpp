@@ -75,6 +75,7 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
         {"env": "LLAMA_NK_DEV_MASK",    "value": "1",    "why": "device-side DSpark / SJ-KVaRN far masks (0.7.5 Inkling default)"},
         {"env": "LLAMA_NK_KV_PAD",      "value": "4096", "why": "coarser deep-context n_kv padding step (0.7.5 Inkling default)"},
         {"env": "GGML_CUDA_Q8TC",       "value": "2",    "why": "tensor-core dense Q8_0 matvec T=4..8, hi/lo activations; REL075 E21 ub5 dKLD -4.4e-5 (mode 1 +1.05e-4 fails: opt-in)"},
+        {"env": "GGML_CUDA_Q8TC_M1",    "value": "g",    "why": "Q8TC-PT: grouped launches run mode 1 under mode 2; HOME 3090 Ti 350 W NQ 100K ABBA x6 -1.07% ms/round (6/6 seeds), kld4x paired dKLD -0.04e-4 +/- 0.50e-4; off: GGML_CUDA_Q8TC_M1=0"},
         {"env": "GGML_CUDA_INKGQA_FAR", "value": "1",    "why": "GQA far-attention prefill kernel (SURGE-FA, 0.7.5 default)"},
         {"env": "GGML_CUDA_INKGQA_SWA", "value": "1",    "why": "same kernel family on the SWA layers (with FAR+RELF +34.5% 100K prefill; E21 = FAR+RELF)"},
         {"env": "LLAMA_INKFA_RELF",     "value": "1",    "why": "relative-bias factor form, no [n_head, extent, T] table (0.7.5 default)"}

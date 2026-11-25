@@ -24,6 +24,7 @@ static int q8tc_min_t() {
 
 // Q8TC-PT: GGML_CUDA_Q8TC_M1 = comma list of "<kind><first>-<last>" (kind g = grouped launch, o = plain launch, e.g.
 // attn_output; layer from the weight name blk.N.) that run mode 1 while GGML_CUDA_Q8TC=2; "g" / "o" alone = all layers.
+// The Inkling defaults table sets "g"; GGML_CUDA_Q8TC_M1=0 (any value with no g / o entry) keeps every tensor on mode 2.
 struct q8tc_sel { char kind; int lo, hi; };
 static const std::vector<q8tc_sel> & q8tc_m1_sel() {
     static const std::vector<q8tc_sel> v = [] {
