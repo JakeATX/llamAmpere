@@ -6779,11 +6779,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                     size0/1048576.0, moe_cache->size()/1048576.0, sched_reserve_tokens);
         }
         // fork (REFILLPIPE): the refill goes through the streamer's pinned staging workers and copy stream (one synchronous
-        // pageable copy per run of experts reached about half of PCIe). Same bytes. Opt-in (port, default off):
-        // LLAMA_INK_REFILL_PIPE=1; unset or 0 = the plain copies (cand base).
+        // pageable copy per run of experts reached about half of PCIe). Same bytes. Default ON;
+        // LLAMA_INK_REFILL_PIPE=0 = the plain copies (kill switch).
         static const bool refill_pipe = [] {
             const char * e = getenv("LLAMA_INK_REFILL_PIPE");
-            return e && e[0] && atoi(e) != 0;
+            return !(e && e[0]) || atoi(e) != 0;
         }();
         llama_moe_cache::uploader up;
         bool piped = false;
