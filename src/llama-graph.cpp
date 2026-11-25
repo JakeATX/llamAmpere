@@ -9959,14 +9959,27 @@ static int64_t llama_inkkv_bias_rows(int64_t n_kv, int64_t n_head, int64_t n_str
         const char * e = getenv("LLAMA_INKKV_BIAS_MIB");
         return e && *e ? (int64_t) atoll(e) : (int64_t) -1;
     }();
+    // [PBUF-2048] LLAMA_INKLING2_PBUF_CHUNK=<rows> (a multiple of 64, >= 64; unset/0 = off): at most that many rows per
+    // stream per chunk as well. The near-window bias mask of the far/near split ([n_kv_swa, T, n_head] F32, 576 MiB at
+    // ub 2048 with the 3,072-cell window copy, ~1.15 GiB live with its permuted copy) stays under the byte threshold above,
+    // so without this the whole prompt ubatch builds it at once: the peak of the 24ink prompt compute buffer at ub 2048.
+    // Same per-row ops (the chunked path below); the FA kernels see fewer rows per launch.
+    static const int64_t pbuf_rows = [] {
+        const char * e = getenv("LLAMA_INKLING2_PBUF_CHUNK");
+        const long long v = e && *e ? atoll(e) : 0;
+        return v >= 64 && v % 64 == 0 ? (int64_t) v : (int64_t) 0;
+    }();
     const int64_t mib = mib_env >= 0 ? mib_env : (n_seq_max > 1 ? 512 : 1024);
     if (mib <= 0) {
-        return T_stream;
+        return pbuf_rows > 0 ? std::min(pbuf_rows, T_stream) : T_stream;
     }
     const int64_t row = std::max<int64_t>(1, n_kv*n_head*n_stream*(int64_t) sizeof(float));
     int64_t tc = (mib << 20)/row;
     if (tc >= 64) {
         tc -= tc % 64;
+    }
+    if (pbuf_rows > 0) {
+        tc = std::min(tc, pbuf_rows);
     }
     // >= 16 rows: bounds the chunk count (graph nodes) of the dense fallback at a deep n_kv
     return std::max<int64_t>(16, tc);
