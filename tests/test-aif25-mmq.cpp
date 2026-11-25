@@ -7,6 +7,8 @@
 // default 1); the minimum width is set to 9 unless given.
 // [KAIMULTI] With GGML_CUDA_AIF25_MMQ_MIN above 32 (ctest variant "narrow"), widths 9..32 take the decode-once narrow
 // kernel (GGML_CUDA_AIF_NARROW, default on, range GGML_CUDA_AIF_NARROW_MIN/_MAX); it is checked against mmv the same way.
+// [OPT10] With GGML_CUDA_AIF_ASYNC=1 (ctest variants "async", "async-nb1"), widths 9..32 / 33..63 take the cp.async
+// kernel (aif-async-mmv.cu), checked against mmv the same way.
 // Exit 0 = pass, 1 = fail, 77 = no CUDA device.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -44,6 +46,8 @@ int main() {
     const int min_n = std::max(9, std::atoi(std::getenv("GGML_CUDA_AIF25_MMQ_MIN")));
     const auto env_or = [](const char * name, int def) { const char * e = std::getenv(name); return e ? std::atoi(e) : def; };
     const bool narrow = env_or("GGML_CUDA_AIF_NARROW", 1) != 0;
+    // [OPT10] GGML_CUDA_AIF_ASYNC=1: every width above 8 not taken by mmq / narrow takes the cp.async kernel, also checked
+    const bool async = env_or("GGML_CUDA_AIF_ASYNC", 0) != 0;
     const int narrow_lo = std::min(32, std::max(9, env_or("GGML_CUDA_AIF_NARROW_MIN", 9)));
     const int narrow_hi = std::min(32, std::max(9, env_or("GGML_CUDA_AIF_NARROW_MAX", 32)));
     ggml_log_set(log_cb, nullptr);
@@ -136,7 +140,7 @@ int main() {
         const int before = g_checked;
         ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS && ok;
         ggml_backend_synchronize(backend);
-        const int want = s.n >= min_n || (narrow && s.n >= narrow_lo && s.n <= narrow_hi) ? 1 : 0;
+        const int want = s.n >= min_n || (narrow && s.n >= narrow_lo && s.n <= narrow_hi) || (async && s.n > 8 && s.n < min_n) ? 1 : 0;
         expected += want;
         std::vector<float> yb(ggml_nelements(y));
         ggml_backend_tensor_get(y, yb.data(), 0, ggml_nbytes(y));

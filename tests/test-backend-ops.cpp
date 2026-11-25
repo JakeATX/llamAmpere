@@ -25073,6 +25073,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // [OPT10] GGML_TEST_AIV2_PERF=aifasync: the four fractional AI+ types at the dense 27B shapes, decode / verify widths
+        // 1..63 (1..8 = decode-fast control, 9..32 narrow tile, 33..63 mmv tiling), for the GGML_CUDA_AIF_ASYNC A/B
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "aifasync") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 1, 8, 9, 12, 16, 24, 32, 33, 40, 48, 63 }) {
+                    for (ggml_type t : { GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF25_U2_512, GGML_TYPE_AIF25_U }) {
+                        if (mk.second % (t == GGML_TYPE_AIF25_U2 ? 640 : t == GGML_TYPE_AIF25_U ? 128 : 512) != 0) { continue; }
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, t));
+                    }
+                }
+            }
+            return test_cases;
+        }
         // GGML_TEST_AIV2_PERF=aitmid: AIT3/AIT4 at the multi-user verify widths (GGML_CUDA_AIT_MIDT_SPLIT A/B), 8 and 33 as controls
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "aitmid") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {

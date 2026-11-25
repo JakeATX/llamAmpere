@@ -14,6 +14,7 @@
 #include "ai5-coop128.cuh"
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
+#include "aif-async-mmv.cuh"
 #include "../ggml-aif25.h"
 #include "../ggml-aif175.h"
 #include "rpb-knobs.h"
@@ -3900,8 +3901,16 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // [KAIMULTI] the narrow kernel obeys the same kill switches (GGML_CUDA_AIF25_MMQ=0, GGML_CUDA_AIF_RS_MMQ=0) plus its own
     const bool mmq_ok = (!row_scale || aif_rs_mmq()) && tile > 0;
     const bool wide = mmq_ok && N >= aif25_mmq_min();
+    // [OPT10] GGML_CUDA_AIF_ASYNC=1 (default off): the verify-width tile and the mmv tiling of the widths between 8 and
+    // the prompt threshold take the cp.async kernel of aif-async-mmv.cu (bit-identical to mmv; also covered by
+    // GGML_CUDA_AIF25_MMQ_CHECK). The mmq kill switches (GGML_CUDA_AIF25_MMQ=0, GGML_CUDA_AIF_RS_MMQ=0) still give mmv.
+    const bool aif_async = ggml_cuda_aif_async_enabled();
     if ((wide && ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, qp, sp, y, M, K, N, stream)) ||
-            (mmq_ok && aif_narrow(N) && ggml_cuda_aif25_mmq_narrow(w->type, xsh, wd, qp, sp, y, M, K, N, stream))) {
+            (mmq_ok && aif_narrow(N) && (aif_async
+                ? ggml_cuda_aif_async_mm(w->type, xsh, (int) ((N + 7)/8), wd, qp, sp, y, M, K, N, stream)
+                : ggml_cuda_aif25_mmq_narrow(w->type, xsh, wd, qp, sp, y, M, K, N, stream))) ||
+            (aif_async && mmq_ok && N > 8 && N < aif25_mmq_min() &&
+                ggml_cuda_aif_async_mm(w->type, xsh, 1, wd, qp, sp, y, M, K, N, stream))) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
             CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));

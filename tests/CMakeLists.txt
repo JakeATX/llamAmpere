@@ -591,11 +591,21 @@ if (GGML_CUDA)
     add_test(NAME test-aif25-mmq-narrow COMMAND $<TARGET_FILE:test-aif25-mmq>)
     set_tests_properties(test-aif25-mmq-narrow PROPERTIES
         ENVIRONMENT "GGML_CUDA_AIF25_MMQ_MIN=64" SKIP_RETURN_CODE 77 LABELS cuda)
+    # [OPT10] cp.async fractional AI+ matvec (GGML_CUDA_AIF_ASYNC=1): verify widths 9..32 on the async narrow tile and
+    # 33..63 on the async mmv tiling; with the narrow kernel off, 9..63 all take the async mmv tiling
+    add_test(NAME test-aif25-mmq-async COMMAND $<TARGET_FILE:test-aif25-mmq>)
+    set_tests_properties(test-aif25-mmq-async PROPERTIES
+        ENVIRONMENT "GGML_CUDA_AIF25_MMQ_MIN=64;GGML_CUDA_AIF_ASYNC=1" SKIP_RETURN_CODE 77 LABELS cuda)
+    add_test(NAME test-aif25-mmq-async-nb1 COMMAND $<TARGET_FILE:test-aif25-mmq>)
+    set_tests_properties(test-aif25-mmq-async-nb1 PROPERTIES
+        ENVIRONMENT "GGML_CUDA_AIF25_MMQ_MIN=64;GGML_CUDA_AIF_NARROW=0;GGML_CUDA_AIF_ASYNC=1" SKIP_RETURN_CODE 77 LABELS cuda)
     # [KAIFUSE] shared AI+ prep (R1) and the AIF draft shortlist rows (R2), bit for bit (exits 77 without a CUDA device)
     llama_build_and_test(test-kaifuse.cpp LABEL cuda)
     set_tests_properties(test-kaifuse PROPERTIES SKIP_RETURN_CODE 77)
     llama_build(test-kaifuse-logits.cpp) # [KAIFUSE] real-model logit hashes for the R1 identity check (needs a model)
 endif()
+# [OPT10] CPU reference of the cp.async fractional AI+ matvec addressing and int -> float conversion (no GPU needed)
+llama_build_and_test(test-aif-async-addr.cpp)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
