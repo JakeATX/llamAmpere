@@ -10,7 +10,22 @@
 // small ridge on t = a + b * rows + c * rows * ctx / 1024, so the cost of a depth that has not been run lately is extrapolated
 // from the ones that were, and the optimum moves down at deep context where every verify row reads more KV.
 // Depth: argmax over d of (1 + sum_{L <= d} prod_{k < L} p_k) / t(d + 1), within [floor, n_max]. A neighbouring
-// depth is tried every EXPLORE rounds so the slope stays identifiable. Past rounds only: the output law is unchanged.
+// depth is tried every EXPLORE rounds so the slope stays identifiable. Past rounds only: with exact verification the
+// output law is unchanged.
+//
+// Per-request mode (LLAMA_RTB_REQDEPTH=1, default off; 24DENSE-RAG): the depth window of the MTP streak controller
+// ([n_min_adaptive, n_max], 3..7 under --preset 24dense at one slot) gets a ceiling chosen per request from that
+// request's own measured acceptance. begin_request() keeps the cost fit (hardware and context, not content) and
+// scales the acceptance counts by LLAMA_RTB_REQDEPTH_CARRY (0.25), so a new request starts from a weak prior and its
+// own rounds take over; a depth the request has not reached yet is assumed as good as the deepest one it has (an
+// optimistic prior, so the ceiling probes upward and measures instead of staying low); inside a request the counts decay slowly (LLAMA_RTB_REQDEPTH_DECAY, 0.995, ~200 rounds) so
+// the rarely reached deep positions keep enough samples. A pick only moves when it beats the current ceiling by
+// LLAMA_RTB_REQDEPTH_HYST (2%). The ceiling never goes under the window floor (n_min_adaptive, LLAMA_RTB_REQDEPTH_FLOOR
+// overrides). It caps the streak depth (the streak controller still climbs and drops under it), so it can only make a
+// round shallower than the drafter's own choice. Known: while capped, full accepts at the cap still count toward the
+// streak climb, so the streak depth can sit above the cap and the first rounds after the ceiling rises draft deeper.
+// Output: with exact verification the output law is unchanged; under mb-MTP the drafted depth decides which positions
+// mode bias may keep, so the text differs as with any depth change (a shallower draft is closer to exact sampling).
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +54,10 @@ struct cost_depth {
     int    cur     = 0;
     int    explore_dir = 1;
     int    n_max   = 0;
+    double hyst    = 0.0;            // relative rate gain a new depth needs over the current one (0 = plain argmax)
+    bool   prior_flat = false;       // prior_k = p_{k-1} (optimistic: an unreached depth looks as good as the last one)
+    int    n_req   = 0;              // requests begun (begin_request)
+    std::vector<int> req_picks;      // [n_max + 1] depths picked in this request
 
     bool active() const { return n_max > 0; }
 
@@ -57,12 +76,29 @@ struct cost_depth {
         rounds = 0;
         cur = n_max;
         explore_dir = 1;
+        n_req = 0;
+        req_picks.assign(n_max + 1, 0);
+    }
+
+    // a new request: keep the cost fit, keep `carry` of the acceptance evidence (0 = this request only)
+    void begin_request(double carry) {
+        if (!active()) {
+            return;
+        }
+        carry = std::max(0.0, std::min(1.0, carry));
+        for (int k = 0; k < n_max; ++k) {
+            acc[k]   *= carry;
+            reach[k] *= carry;
+        }
+        req_picks.assign(n_max + 1, 0);
+        n_req++;
     }
 
     double p_acc(int k) const {
         double prior = P0;
         for (int j = 1; j <= k; ++j) {
-            prior = std::min(P0, 0.9 * ((acc[j - 1] + PRIOR_W * prior) / (reach[j - 1] + PRIOR_W)));
+            const double prev = (acc[j - 1] + PRIOR_W * prior) / (reach[j - 1] + PRIOR_W);
+            prior = prior_flat ? prev : std::min(P0, 0.9 * prev);
         }
         return (acc[k] + PRIOR_W * prior) / (reach[k] + PRIOR_W);
     }
@@ -199,8 +235,21 @@ struct cost_depth {
                 best = d;
             }
         }
+        if (hyst > 0.0 && best != cur) {
+            const double t_cur = cost_us(cur, ctx);
+            if (t_cur > 0.0 && best_rate <= (1.0 + hyst) * expected_tokens(cur) / t_cur) {
+                best = cur;
+            }
+        }
         cur = best;
         return cur;
+    }
+
+    // count a pick toward this request's depth histogram (summary only)
+    void note_pick(int d) {
+        if (d >= 0 && d < (int) req_picks.size()) {
+            req_picks[d]++;
+        }
     }
 
     std::string summary() const {
@@ -212,6 +261,17 @@ struct cost_depth {
         }
         snprintf(buf, sizeof(buf), ") t_us=%.0f+%.1f*r+%.3f*r*ctxK", theta[0], theta[1], theta[2]);
         out += buf;
+        bool any = false;
+        for (int d = 0; d < (int) req_picks.size(); ++d) {
+            if (req_picks[d] > 0) {
+                snprintf(buf, sizeof(buf), "%sd%d:%d", any ? " " : " request picks=(", d, req_picks[d]);
+                out += buf;
+                any = true;
+            }
+        }
+        if (any) {
+            out += ")";
+        }
         return out;
     }
 };

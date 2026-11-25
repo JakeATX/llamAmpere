@@ -860,9 +860,17 @@ struct spec_adapt_ctrl {
     }
 };
 
-// LLAMA_RTB_COSTDEPTH=1: cost-model draft depth (speculative-cost-depth.h); default off
+// LLAMA_RTB_REQDEPTH=1 (default off, 24DENSE-RAG): the cost-model depth in per-request mode: the ceiling of the MTP
+// streak window is picked per request from that request's measured acceptance (speculative-cost-depth.h)
+static bool server_rtb_reqdepth() {
+    static const bool v = rtb::env_on("LLAMA_RTB_REQDEPTH") && !spec_adapt_ctrl::enabled();
+    return v;
+}
+
+// LLAMA_RTB_COSTDEPTH=1: cost-model draft depth (speculative-cost-depth.h); default off. LLAMA_RTB_REQDEPTH=1 runs the
+// same controller per request.
 static bool server_rtb_costdepth() {
-    static const bool v = rtb::env_on("LLAMA_RTB_COSTDEPTH") && !spec_adapt_ctrl::enabled();
+    static const bool v = (rtb::env_on("LLAMA_RTB_COSTDEPTH") || server_rtb_reqdepth()) && !spec_adapt_ctrl::enabled();
     return v;
 }
 
@@ -1296,6 +1304,9 @@ struct server_slot {
         spec_kb_rounds = 0;
         spec_replay_prefix_n = 0;
         spec_adapt = {};
+        if (server_rtb_reqdepth()) {
+            rtb_depth.begin_request(rtb::env_num("LLAMA_RTB_REQDEPTH_CARRY", 0.25, 0.0, 1.0));
+        }
         verify_budget_accept.clear();
 
         n_predict_max = -1;
@@ -6740,10 +6751,22 @@ private:
                         else if (draft_budget[slot.id] < 0 && server_rtb_costdepth()) {
                             if (!slot.rtb_depth.active()) {
                                 slot.rtb_depth.reset(common_speculative_n_max(spec.get()));
-                                slot.rtb_depth.decay = rtb::env_num("LLAMA_RTB_COSTDEPTH_DECAY", 0.97, 0.5, 1.0);
-                                slot.rtb_depth.floor_d = (int) rtb::env_num("LLAMA_RTB_COSTDEPTH_FLOOR", 1, 1, 64);
+                                slot.rtb_depth.decay = server_rtb_reqdepth()
+                                        ? rtb::env_num("LLAMA_RTB_REQDEPTH_DECAY", 0.995, 0.5, 1.0)
+                                        : rtb::env_num("LLAMA_RTB_COSTDEPTH_DECAY", 0.97, 0.5, 1.0);
+                                // REQDEPTH caps the streak window [n_min_adaptive, n_max] from above, so its floor is
+                                // the window floor (LLAMA_RTB_REQDEPTH_FLOOR overrides); COSTDEPTH keeps floor 1
+                                slot.rtb_depth.floor_d = server_rtb_reqdepth()
+                                        ? (int) rtb::env_num("LLAMA_RTB_REQDEPTH_FLOOR",
+                                                std::max(1, params_base.speculative.draft.n_min_adaptive), 1, 64)
+                                        : (int) rtb::env_num("LLAMA_RTB_COSTDEPTH_FLOOR", 1, 1, 64);
+                                slot.rtb_depth.hyst = server_rtb_reqdepth() ? rtb::env_num("LLAMA_RTB_REQDEPTH_HYST", 0.02, 0.0, 1.0) : 0.0;
+                                slot.rtb_depth.prior_flat = server_rtb_reqdepth();
                             }
                             const int d = slot.rtb_depth.pick((double) slot.prompt.tokens.pos_next());
+                            if (server_rtb_reqdepth()) {
+                                slot.rtb_depth.note_pick(d);
+                            }
                             if (d > 0) {
                                 n_draft_req = std::min(n_draft_req, d);
                             }

@@ -360,6 +360,85 @@ static void test_cost_depth() {
 }
 
 
+// per-request mode (LLAMA_RTB_REQDEPTH): a request with high acceptance, then one with low acceptance at the same deep
+// context; begin_request keeps the cost fit, and the second request's ceiling follows its own optimum within ~150
+// rounds and does not flap
+static void test_req_depth() {
+    std::mt19937 rng(7);
+    const double a = 10000, b = 900, c = 25, ctx = 100000.0;
+    rtb::cost_depth cd;
+    cd.reset(7);
+    cd.decay = 0.995;
+    cd.hyst  = 0.02;
+    cd.prior_flat = true;
+    auto run = [&](double p, int R, std::vector<int> * tail, int * switches) {
+        int prev = -1;
+        for (int r = 0; r < R; ++r) {
+            const int d = cd.pick(ctx);
+            cd.note_pick(d);
+            if (switches && prev >= 0 && d != prev) {
+                (*switches)++;
+            }
+            prev = d;
+            int acc = 0;
+            while (acc < d && (rng() % 1000) < p * 1000) {
+                ++acc;
+            }
+            const double t = a + b * (d + 1) + c * (d + 1) * ctx / 1024.0;
+            const double noise = 1.0 + 0.05 * ((double) (rng() % 1000) / 1000.0 - 0.5);
+            cd.observe(d, acc, (int64_t) (t * noise), ctx);
+            if (tail && r >= R - 300) {
+                tail->push_back(d);
+            }
+        }
+    };
+    cd.begin_request(0.25);
+    std::vector<int> t1;
+    run(0.9, 1200, &t1, nullptr);
+    std::sort(t1.begin(), t1.end());
+    const double theta2 = cd.theta[2];
+    cd.begin_request(0.25);
+    assert(cd.theta[2] == theta2);              // the cost fit survives a request boundary
+    std::vector<int> t2;
+    int sw = 0;
+    run(0.5, 450, &t2, &sw);
+    std::sort(t2.begin(), t2.end());
+    const int w1 = true_best(0.9, a, b, c, ctx, 7), w2 = true_best(0.5, a, b, c, ctx, 7);
+    printf("  req depth: request 1 median %d (true %d), request 2 median %d (true %d), %d switches in request 2 (%s)\n",
+            t1[t1.size() / 2], w1, t2[t2.size() / 2], w2, sw, cd.summary().c_str());
+    assert(w1 > w2);
+    assert(std::abs(t1[t1.size() / 2] - w1) <= 1);
+    assert(std::abs(t2[t2.size() / 2] - w2) <= 1);
+    assert(sw < 80);                            // explore probes (every 16 rounds) + a handful of real moves
+    // "within ~150 rounds": in request 2, rounds 150..449 sit at the new optimum or one above it (explore probes aside)
+    {
+        int near = 0;
+        for (int d : t2) near += d <= w2 + 1;
+        printf("  req depth: request 2, last 300 rounds at <= true+1: %d/300\n", near);
+        assert(near >= 270);
+    }
+    // the window floor: a ceiling never goes under floor_d
+    {
+        rtb::cost_depth f;
+        f.reset(7);
+        f.floor_d = 3;
+        f.decay = 0.995;
+        f.prior_flat = true;
+        f.begin_request(0.25);
+        for (int r = 0; r < 400; ++r) {
+            const int d = f.pick(ctx);
+            assert(d >= 3 && d <= 7);
+            const double t = a + b * (d + 1) + c * (d + 1) * ctx / 1024.0;
+            f.observe(d, (rng() % 2) ? 1 : 0, (int64_t) t, ctx);
+        }
+    }
+    // carry 0: the counts of the previous request are gone
+    cd.begin_request(0.0);
+    for (int k = 0; k < 7; ++k) {
+        assert(cd.acc[k] == 0.0 && cd.reach[k] == 0.0);
+    }
+}
+
 // the keyed Gumbel-max samples softmax(logits) and is a pure function of (seed, n, id)
 static void test_hash_gumbel() {
     const double logit[5] = { 1.0, 0.2, -0.5, 2.0, 0.0 };
@@ -395,6 +474,7 @@ int main() {
     test_edit_rules();
     test_ctl_random_text_stays_off();
     test_cost_depth();
+    test_req_depth();
     test_hash_gumbel();
     printf("OK\n");
     return 0;
