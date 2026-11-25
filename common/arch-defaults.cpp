@@ -103,7 +103,7 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
                "preset": "24dense", "kill_env": "LLAMA_DSPINE_DEFAULT", "min_gpu_mib": 23552,
                "type_k": "tq5_0", "type_v": "turbo4", "sampling": "probabilistic",
                "n_max": 7, "n_min": 0, "p_min": 0.0, "mb_mtp": true, "fit": "off",
-               "why": "DSpine b16 beside the model, one slot: +8.7% tok/s vs the MTP head at 98.8K fill (3090 Ti 350 W, P76, chat temp 1, 5,120 tok, 12 seed pairs, 9 faster); LLAMA_DSPINE_DEFAULT=0 keeps the MTP head"},
+               "why": "DSpine b16 beside the model, one slot: +8.7% tok/s vs the 0.7.5 MTP default at 98.8K fill (3090 Ti 350 W, P76, chat temp 1, 5,120 tok, 12 seed pairs, 9 faster); LLAMA_DSPINE_DEFAULT=0 keeps the MTP head"},
       "spec_note": "built-in MTP head: spec-defaults.cpp row qwen35 (draft-mtp-adaptive); draft KV left to the resolver on purpose (DSJ + RM24H need unset -ctkd/-ctvd; 11-19 loss came from overriding them); a prompt with images runs that request without the drafter (M-RoPE gap, 0.7.5 server fix)",
       "parallel": 1,
       "env_on": [],
@@ -113,7 +113,7 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
       ],
       "best": {
         "24g":   {"preset": "24dense", "args": "", "env": "", "file": "P76",
-                  "evidence": "REL07x speed gates, P76 24dense one slot (ub 2048, adaptive 3..7, DSJ + RM24H)"},
+                  "evidence": "REL07x speed gates, P76 24dense one slot (ub 2048, DSJ + RM24H; MTP adaptive 3..7, or DSpine b16 n-max 7 when its file is beside the model)"},
         "small": {"preset": "12dense", "args": "", "env": "", "file": "P76",
                   "evidence": "V07 small-card presets (LSA + MTP)"}
       }
@@ -328,7 +328,7 @@ static const json * spec_row_for_run(const json * row, const common_params & par
         d.model     = s.value("model", "");
         d.model_alt = s.value("model_alt", std::vector<std::string>());
         d.kill_env  = s.value("kill_env", "");
-        if (preset != params.card_preset || params.n_parallel != 1 || common_arch_spec_default_killed(d) ||
+        if (!common_arch_defaults_enabled() || preset != params.card_preset || params.n_parallel != 1 || common_arch_spec_default_killed(d) ||
                 common_arch_spec_default_file(d, params.model.path).empty()) {
             return nullptr;
         }

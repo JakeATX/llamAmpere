@@ -1280,7 +1280,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (params.card_preset == "24dense" && params.n_parallel == 1) {
             // DSpine beside the model replaces the MTP head at one slot (arch table "spec" row; LLAMA_DSPINE_DEFAULT=0
             // keeps the MTP head as in 0.7.5)
-            const bool file_drafter = common_speculative_apply_preset_file_default(params, explicit_or_env);
+            // (server and cli only: the other tools do not draft and keep the preset's fit)
+            const bool file_drafter = (ctx_arg.ex == LLAMA_EXAMPLE_SERVER || ctx_arg.ex == LLAMA_EXAMPLE_CLI) &&
+                    common_speculative_apply_preset_file_default(params, explicit_or_env);
             if (!explicit_or_env("--spec-draft-window")) {
                 params.speculative.draft.attn_window = 0;
             }
