@@ -164,7 +164,7 @@ static int32_t server_json_keepalive_s() {
 static int32_t server_think_loop_close() {
     static const int32_t v = [] {
         const char * e = getenv("LLAMA_SERVER_THINK_LOOP_CLOSE");
-        return e ? std::max(0, atoi(e)) : 0;
+        return e ? std::max(0, atoi(e)) : 256; // default ON at 256 (THINKGUARD 11-24), LLAMA_SERVER_THINK_LOOP_CLOSE=0 turns it off
     }();
     return v;
 }
@@ -4303,7 +4303,7 @@ private:
         const auto & tp = slot.task->params;
         bool looped = tp.loop_guard && slot.loop_guard.accept(result.tok, tp.loop_guard_reps, params_base.loop_guard_span);
 
-        // thinking-loop guard, opt-in (LLAMA_SERVER_THINK_LOOP_CLOSE=N, unset or 0 = off): N repeats of one token
+        // thinking-loop guard (LLAMA_SERVER_THINK_LOOP_CLOSE=N, default 256, 0 = off): N repeats of one token
         // inside an open think block close the block (the end tag is forced) so the answer still gets written,
         // instead of the loop burning the budget or the repeat stop ending the reply with no answer. While it is
         // on, the repeat stop above ignores a one-token run inside the think block and leaves it to this guard.
