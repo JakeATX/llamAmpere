@@ -16,6 +16,7 @@
 
 #include "common.cuh"
 #include "q8a16-kern.cuh"
+#include "q8tc.cuh"
 
 #define Q8TC_CHUNK_BYTES 272
 static __device__ __forceinline__ void q8tc_cp16(void * smem, const void * gmem) {
@@ -61,8 +62,16 @@ static __device__ __forceinline__ uint32_t q8tc_h2(const float a, const float b)
     return *(uint32_t *) &h;
 }
 
-template <int NW, bool HILO, int MINB>
-static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a, const int nb, const int T) {
+// IA (SURGE3 Q8TC-HLF): independent accumulators per (k step, hi/lo) so the 2 (HILO 4) mmas of a block do not form one
+// dependent chain; summed in fixed order (st0 hi + st0 lo) + (st1 hi + st1 lo) before the block scale. IA=false keeps v3 order.
+// (PIPE, a second chunk buffer per warp, was measured slower: mbh2 +5..+22% vs this; the extra smem costs occupancy.)
+//
+// FUSE-WO (EPI): the attn_out launch also runs the Inkling short-conv ring epilogue of its 16 output channels (the
+// expressions of ssm_conv_ring_f32<false, 4, n_t, epi = true>: windows, 4-tap conv, SCALE(ADD(x, conv)), residual ADD),
+// on the T columns the CTA just reduced, so the separate ring launch is gone. x is still stored (other readers).
+
+template <int NW, bool HILO, bool IA, bool EPI>
+static __device__ __forceinline__ void q8tc3_dev(const q8a16_args & a, const int nb, const int T, const q8tc_epi * ep) {
 #ifdef AMPERE_MMA_AVAILABLE
     extern __shared__ __align__(16) uint32_t sw3[];
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, gid = lane >> 2, tig = lane & 3;
@@ -123,6 +132,7 @@ static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
                 float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float ci[2][2][4] = {};   // IA: [k step][hi/lo]
 #pragma unroll
                 for (int st = 0; st < 2; ++st) {
                     uint32_t a0, a2, a1, a3;
@@ -130,12 +140,18 @@ static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a
                     q8tc_i8_f16(q1[e][st], a1, a3);
                     const float4 v = xv[j & 1][e][st];
                     const uint32_t b0 = q8tc_h2(v.x, v.y), b1 = q8tc_h2(v.z, v.w);
-                    q8tc_mma16(c, a0, a1, a2, a3, b0, b1);
+                    q8tc_mma16(IA ? ci[st][0] : c, a0, a1, a2, a3, b0, b1);
                     if constexpr (HILO) {
                         const half2 h0 = *(const half2 *) &b0, h1 = *(const half2 *) &b1;
                         const uint32_t l0 = q8tc_h2(v.x - __low2float(h0), v.y - __high2float(h0));
                         const uint32_t l1 = q8tc_h2(v.z - __low2float(h1), v.w - __high2float(h1));
-                        q8tc_mma16(c, a0, a1, a2, a3, l0, l1);
+                        q8tc_mma16(IA ? ci[st][1] : c, a0, a1, a2, a3, l0, l1);
+                    }
+                }
+                if constexpr (IA) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        c[i] = HILO ? (ci[0][0][i] + ci[0][1][i]) + (ci[1][0][i] + ci[1][1][i]) : ci[0][0][i] + ci[1][0][i];
                     }
                 }
                 acc[0] += c[0]*dw0[e];
@@ -176,8 +192,87 @@ static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a
         if (c0 < T) { dst[c0*sd + r1] = acc[2]; }
         if (c1 < T) { dst[c1*sd + r1] = acc[3]; }
     }
+    if constexpr (EPI) {
+        constexpr int n_keep = 3;
+        float * yt = (float *) sw3 + (NW > 1 ? NW*128 : 0);   // [16 channels][8 columns], past the reduction buffer
+        if (c0 < T) { yt[gid*8 + c0] = acc[0]; yt[(gid + 8)*8 + c0] = acc[2]; }
+        if (c1 < T) { yt[gid*8 + c1] = acc[1]; yt[(gid + 8)*8 + c1] = acc[3]; }
+        __syncwarp();
+        const int64_t c = (int64_t) tile*16 + lane;
+        if (lane < 16 && c < nr) {
+            const ggml_cuda_conv_ring_args & ra = ep->ring;
+            float x[n_keep + 8];
+            const float * xs = (const float *) ((const char *) ra.state + c*ra.state_nb1);
+#pragma unroll
+            for (int j = 0; j < n_keep; ++j) {
+                x[j] = xs[j];
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                x[n_keep + i] = i < T ? yt[lane*8 + i] : 0.0f;
+            }
+            float wc[4];
+            const int stride_w = ep->w_nb1 / sizeof(float);
+            if (stride_w == 4 && (((uintptr_t) ep->w) & 15) == 0) {
+                const float4 wv = *reinterpret_cast<const float4 *>(ep->w + c*4);
+                wc[0] = wv.x; wc[1] = wv.y; wc[2] = wv.z; wc[3] = wv.w;
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    wc[j] = ep->w[c*stride_w + j];
+                }
+            }
+#pragma unroll
+            for (int kw = 0; kw < GGML_CUDA_CONV_RING_MAX_WIN; ++kw) {
+                if (kw < ra.n_win) {
+                    const ggml_cuda_conv_ring_window & win = ra.win[kw];
+                    const int64_t row = win.rows != nullptr ? (int64_t) win.rows[0] : 0;
+                    float * o = win.dst + row*win.row_stride + c*n_keep;
+#pragma unroll
+                    for (int q = 0; q <= 8; ++q) {
+                        if (q <= T && q == win.s_idx) {
+#pragma unroll
+                            for (int j = 0; j < n_keep; ++j) {
+                                o[j] = x[q + j];
+                            }
+                        }
+                    }
+                }
+            }
+            float * y = ep->out + c;
+            const int stride_y = ep->out_nb1 / sizeof(float);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < T) {
+                    float sumf = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        sumf += x[i + j]*wc[j];
+                    }
+                    sumf += 0.0f;   // no conv bias (the ring epilogue call passes none)
+                    float v = x[n_keep + i] + sumf;
+                    v = ep->scale*v + ep->bias;
+                    if (ep->res != nullptr) {
+                        v = ep->res[c + i*stride_y] + v;
+                    }
+                    y[i*stride_y] = v;
+                }
+            }
+        }
+    }
 #else
-    GGML_UNUSED_VARS(a, nb, T);
+    GGML_UNUSED_VARS(a, nb, T, ep);
     NO_DEVICE_CODE;
 #endif
 }
+
+template <int NW, bool HILO, int MINB, bool IA = false>
+static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a, const int nb, const int T) {
+    q8tc3_dev<NW, HILO, IA, false>(a, nb, T, nullptr);
+}
+
+template <int NW, bool HILO, int MINB, bool IA = false>
+static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3e(const q8a16_args a, const int nb, const int T, const q8tc_epi e) {
+    q8tc3_dev<NW, HILO, IA, true>(a, nb, T, &e);
+}
+

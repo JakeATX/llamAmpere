@@ -130,6 +130,7 @@
 #include "ggml-cuda/inkmask.cuh"
 #include "ggml-cuda/inkrouter.cuh"
 #include "ggml-cuda/q8a16.cuh"
+#include "ggml-cuda/q8tc.cuh"
 #include "ggml-cuda/head2.cuh"
 #include "ggml-cuda/elastic-buf.cuh"
 #include "ggml-cuda/prefill-glue.cuh"
@@ -4552,6 +4553,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], src1->ne[1]);
     if (!kqrows_claims && (route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) &&
             ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
+        return;
+    }
+    // [Q8TC-MU] Q8_0 multi-slot verify widths (9..32) as <= 8-column f16 tensor-core launches (GGML_CUDA_Q8TC_MU, default off)
+    if ((route == GGML_CUDA_MM_ROUTE_MMQ_FEW || route == GGML_CUDA_MM_ROUTE_MMQ) && ggml_cuda_q8tc_wide(ctx, src0, src1, dst)) {
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMQ_FEW) {
@@ -13077,6 +13082,185 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
     return 0;
 }
 
+// [FUSE-WO] SURGE3 (GGML_CUDA_Q8TC_FUSEWO=1, default off): the Inkling attention output at verify widths,
+// MUL_MAT(Q8_0 wo, attn) -> CONCAT(state, mm^T) [-> window CPY / SET_ROWS] -> SSM_CONV -> ADD(mm, conv) -> SCALE
+// [-> ADD(res, .)], as one Q8TC launch whose CTAs finish their 16 output channels with the conv ring epilogue
+// (q8tc-fwo.cu; the arithmetic of ssm_conv_ring_f32 epi). Only a ring the plan accepted (CONCAT + windows skipped).
+static int ggml_cuda_try_fuse_q8tc_fwo(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_q8tc_fusewo_on()) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_Q8_0 || mm->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(mm) || mm->ne[1] < 1 || mm->ne[1] > GGML_CUDA_CONV_RING_MAX_T || mm->ne[2] != 1 ||
+            mm->ne[3] != 1 || ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return 0;
+    }
+    const int64_t n_t = mm->ne[1];
+    constexpr int MAX_WIN_NODES = 2 * GGML_CUDA_CONV_RING_MAX_WIN;
+    ggml_tensor * wins[MAX_WIN_NODES];
+    int n_wins = 0;
+    ggml_tensor * cc = nullptr, * conv = nullptr, * add = nullptr, * sc = nullptr, * add2 = nullptr;
+    int j_sc = -1;
+    const int jmax = std::min(cgraph->n_nodes, i + 48);
+    for (int j = i + 1; j < jmax && !add2; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (!cc) {
+            if (t->op == GGML_OP_CONCAT && ink_through_views(t->src[1]) == mm) {
+                cc = t;
+                continue;
+            }
+            return 0;
+        }
+        if (!conv) {
+            if (n_wins < MAX_WIN_NODES) {
+                if ((t->op == GGML_OP_CPY || t->op == GGML_OP_CONT) && ink_through_views(t->src[0]) == cc) {
+                    wins[n_wins++] = t;
+                    continue;
+                }
+                if (t->op == GGML_OP_SET_ROWS) {
+                    const ggml_tensor * sr_src = ink_through_views(t->src[0]);
+                    bool from_win = sr_src == cc;
+                    for (int k = 0; !from_win && k < n_wins; ++k) {
+                        from_win = sr_src == wins[k];
+                    }
+                    if (from_win) {
+                        wins[n_wins++] = t;
+                        continue;
+                    }
+                }
+            }
+            if (t->op == GGML_OP_SSM_CONV && t->src[0] == cc) {
+                conv = t;
+                continue;
+            }
+            return 0;
+        }
+        if (!add) {
+            if (t->op == GGML_OP_ADD) {
+                const ggml_tensor * a0 = ink_through_views(t->src[0]);
+                const ggml_tensor * a1 = ink_through_views(t->src[1]);
+                if ((a0 == mm && a1 == conv) || (a0 == conv && a1 == mm)) {
+                    add = t;
+                    continue;
+                }
+            }
+            return 0;
+        }
+        if (!sc) {
+            if (t->op == GGML_OP_SCALE && t->src[0] == add) {
+                sc = t;
+                j_sc = j;
+                continue;
+            }
+            return 0;
+        }
+        if (t->op == GGML_OP_ADD && (t->src[0] == sc) != (t->src[1] == sc)) {
+            add2 = t; // the residual ADD(res, scaled)
+            continue;
+        }
+        break; // no residual here: the run ends at the SCALE
+    }
+    const int64_t ne_tot = mm->ne[0] * n_t;
+    if (!sc || conv->ne[0] != mm->ne[0] || conv->ne[1] != n_t || conv->ne[2] != 1 || conv->src[1]->ne[0] != 4 ||
+            add->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || ggml_nelements(add) != ne_tot ||
+            !ggml_is_contiguous(sc) || ggml_nelements(sc) != ne_tot || mm->ne[0] % 16 != 0) {
+        return 0;
+    }
+    ggml_tensor * out = add2 ? add2 : sc;
+    const ggml_tensor * res = nullptr;
+    if (add2) {
+        res = add2->src[0] == sc ? add2->src[1] : add2->src[0];
+        if (add2->type != GGML_TYPE_F32 || !ggml_is_contiguous(add2) || ggml_nelements(add2) != ne_tot ||
+                res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) || ggml_nelements(res) != ne_tot) {
+            return 0;
+        }
+    }
+    ggml_tensor * set[7 + MAX_WIN_NODES] = { mm, cc, conv, add, sc };
+    int n_set = 5;
+    if (add2) {
+        set[n_set++] = add2;
+    }
+    for (int k = 0; k < n_wins; ++k) {
+        set[n_set++] = wins[k];
+    }
+    // every pattern node but out is used only inside the run (the kernel still stores mm)
+    const int last = ink_run_check(cgraph, i, set, n_set, out);
+    if (last < 0 || (!add2 && last != j_sc)) {
+        return 0;
+    }
+    if (!ctx) {
+        return last - i;
+    }
+    const int device = ctx->device;
+    const int ccap = ggml_cuda_info().devices[device].cc;
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * y = mm->src[1];
+    if (!w->buffer || w->buffer->buft != ggml_backend_cuda_buffer_type(device) ||
+            ggml_cuda_nk_dense_tc_enabled() ||
+            ggml_cuda_mul_mat_route(w, y, mm, ccap, ggml_cuda_info().devices[device].warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
+        return 0; // only where the node would take the MMVQ -> Q8A16 -> Q8TC path
+    }
+    if (!g_ink_ring_skip || (int) g_ink_ring_skip->size() <= last) {
+        return 0;
+    }
+    for (int j = i; j <= last; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        bool need = t == cc;
+        for (int k = 0; k < n_wins; ++k) {
+            need |= t == wins[k];
+        }
+        if (need && !(*g_ink_ring_skip)[j]) {
+            return 0;
+        }
+    }
+    // writes: mm, out, the windows (per channel, after that channel's state read, as the ring kernel). Other CTAs still read
+    // y, w, the state and the conv weight while one writes
+    const ggml_tensor * reads[4] = { y, w, cc->src[0], conv->src[1] };
+    for (const ggml_tensor * r : reads) {
+        if (ink_overlap(out, r) || ink_overlap(mm, r)) {
+            return 0;
+        }
+    }
+    if (ink_overlap(out, mm) || (res && ((res->data != out->data && ink_overlap(out, res)) || ink_overlap(mm, res)))) {
+        return 0;
+    }
+    for (auto & e : ctx->conv_rings) {
+        if (e.conv != conv) {
+            continue;
+        }
+        if (e.args.x != (const float *) mm->data || e.args.x_nb1 != (int64_t) sizeof(float) ||
+                (n_t > 1 && e.args.x_nb0 != (int64_t) mm->nb[1])) {
+            return 0;
+        }
+        q8tc_epi ep{};
+        ep.ring    = e.args;
+        ep.w       = (const float *) conv->src[1]->data;
+        ep.w_nb1   = (int) conv->src[1]->nb[1];
+        ep.out     = (float *) out->data;
+        ep.out_nb1 = (int) (mm->ne[0] * sizeof(float));
+        ep.scale   = ggml_get_op_params_f32(sc, 0);
+        ep.bias    = ggml_get_op_params_f32(sc, 1);
+        ep.res     = res ? (const float *) res->data : nullptr;
+        if (!ggml_cuda_q8tc_fwo(*ctx, w, y, mm, ep)) {
+            return 0;
+        }
+        e.used = true;
+        ctx->fusion_stats.conv_ring++;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_Q8TC_FUSEWO: %s + %s fused (T = %d, %d windows, residual %s)\n", __func__, w->name,
+                    conv->name, (int) n_t, e.args.n_win, res ? "yes" : "no");
+        }
+        return last - i;
+    }
+    return 0;
+}
+
 // [INKROUTER] decode MoE router: MUL_MAT(BF16 ffn_gate_inp, x) + the sigmoid topk-moe chain behind it (the nodes the
 // "//topk-moe" block of ggml_cuda_try_fuse takes at i + 1) in one launch (inkrouter.cu). The logits replay the MMVF
 // reduction ggml_cuda_mul_mat runs for this product and the selection is topk_moe_cuda's own device code, so logits, ids
@@ -14339,6 +14523,12 @@ static int ggml_cuda_try_fuse_inkglue(ggml_backend_cuda_context * ctx, ggml_cgra
         ggml_cuda_try_fuse_ink_nvfp4moe, ggml_cuda_try_fuse_ink_wconv, ggml_cuda_try_fuse_ink_prep, ggml_cuda_try_fuse_ink_situ, ggml_cuda_try_fuse_ink_moe_wsum, ggml_cuda_try_fuse_ink_clip, ggml_cuda_try_fuse_ink_rel,
         ggml_cuda_try_fuse_ink_conv_epi, ggml_cuda_try_fuse_ink_mix_norm, ggml_cuda_try_fuse_ink_mmgroup,
         ggml_cuda_try_fuse_ink_lgmulti, ggml_cuda_try_fuse_ink_normq, ggml_cuda_try_fuse_ink_router };
+    {
+        const int n = ggml_cuda_try_fuse_q8tc_fwo(ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
     {
         const int n = ggml_cuda_try_fuse_ink_dyn(ctx, cgraph, i);
         if (n > 0) {

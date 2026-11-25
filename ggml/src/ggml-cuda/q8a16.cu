@@ -88,7 +88,7 @@ bool ggml_cuda_q8a16_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     a.nrows[0] = (int) src0->ne[1];
     a.sx[0] = (int64_t) (src1->nb[1] / sizeof(float));
     a.sd[0] = (int64_t) (dst->nb[1] / sizeof(float));
-    if (ggml_cuda_q8tc_try(ctx, a, (int) T, (int) (src0->ne[0] / QK8_0))) { // INKNVFP4K Q8TC opt-in, T = 2..8
+    if (ggml_cuda_q8tc_try(ctx, a, (int) T, (int) (src0->ne[0] / QK8_0), src0, false)) { // INKNVFP4K Q8TC (GGML_CUDA_Q8TC, set by the defaults table), T = MINT..8
         return true;
     }
     q8a16_dispatch(a, (int) T, (int) (src0->ne[0] / QK8_0), ctx.stream());
@@ -159,7 +159,7 @@ bool ggml_cuda_q8a16_group(ggml_backend_cuda_context & ctx, ggml_tensor * const 
         a.sx[k]    = (int64_t) (dsts[k]->src[1]->nb[1] / sizeof(float));
         a.sd[k]    = (int64_t) (dsts[k]->nb[1] / sizeof(float));
     }
-    if (ggml_cuda_q8tc_try(ctx, a, (int) T, (int) (ne10 / QK8_0))) { // INKNVFP4K Q8TC opt-in, T = 2..8
+    if (ggml_cuda_q8tc_try(ctx, a, (int) T, (int) (ne10 / QK8_0), dsts[0]->src[0], true)) { // INKNVFP4K Q8TC (GGML_CUDA_Q8TC, set by the defaults table), T = MINT..8
         return true;
     }
     q8a16_dispatch(a, (int) T, (int) (ne10 / QK8_0), ctx.stream());
