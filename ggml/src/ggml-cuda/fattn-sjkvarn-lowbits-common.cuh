@@ -1878,7 +1878,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 }
 
-template<int D, bool rot = false> // D == head size
+template<int D, bool rot = false, bool bounded = false> // D == head size; bounded: [FA-BMERGE], see fattn-common.cuh
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
@@ -1919,10 +1919,21 @@ static __global__ void flash_attn_combine_results(
     for (int l = 1; l < parallel_blocks; ++l) {
         kqmax = max(kqmax, meta[l].x);
     }
+    if constexpr (bounded) { // [FA-BMERGE] the max over the blocks that saw a key (an empty block's max is a sentinel)
+        kqmax = -INFINITY;
+        for (int l = 0; l < parallel_blocks; ++l) {
+            kqmax = meta[l].y == 0.0f ? kqmax : max(kqmax, meta[l].x);
+        }
+    }
 
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
     for (int l = 0; l < parallel_blocks; ++l) {
+        if constexpr (bounded) {
+            if (meta[l].y == 0.0f) {
+                continue; // [FA-BMERGE] empty block: adds exactly 0, its parts are not read
+            }
+        }
         const float KQ_max_scale = expf(meta[l].x - kqmax);
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
@@ -1931,6 +1942,13 @@ static __global__ void flash_attn_combine_results(
 
     if (lse != nullptr && tid == 0) { // rotation-invariant (orthonormal), as the uniform fixup
         lse[j_dst_unrolled] = VKQ_denominator > 0.0f ? kqmax + logf(VKQ_denominator) : -INFINITY;
+    }
+
+    if constexpr (bounded) {
+        if (!(VKQ_denominator > 0.0f)) {
+            VKQ_numerator   = 0.0f; // [FA-BMERGE] no visible key: output 0 (after the LSE, which stays -inf)
+            VKQ_denominator = 1.0f;
+        }
     }
 
     if constexpr (rot) {
@@ -1946,6 +1964,15 @@ static __global__ void flash_attn_combine_results(
 // KV_max slot; set around the launch by the opt-in tile walk (GGML_SJKVARN_LIVE_TILES=1, fattn-sjkvarn-lowbits.cu).
 // The kernel splits the live tiles evenly, so the launch must give every output tile the same number of blocks.
 inline thread_local const int * ggml_cuda_fattn_sj_live_tiles = nullptr;
+
+#ifndef GGML_CUDA_FA_BMERGE_HELPER
+#define GGML_CUDA_FA_BMERGE_HELPER
+// [FA-BMERGE] GGML_CUDA_FA_BOUNDED_MERGE=1 (default off): the parallel-block combine takes its bounded build
+static inline bool ggml_cuda_fa_bounded_merge() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_FA_BOUNDED_MERGE"); return e && atoi(e) != 0; }();
+    return on;
+}
+#endif
 
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
@@ -2383,10 +2410,11 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
-        auto combine = flash_attn_combine_results<DV>;
+        const bool bmerge = ggml_cuda_fa_bounded_merge();
+        auto combine = bmerge ? flash_attn_combine_results<DV, false, true> : flash_attn_combine_results<DV>;
         if constexpr (DV == 256) {
             if (rot) {
-                combine = flash_attn_combine_results<DV, true>;
+                combine = bmerge ? flash_attn_combine_results<DV, true, true> : flash_attn_combine_results<DV, true>;
             }
         }
         combine
