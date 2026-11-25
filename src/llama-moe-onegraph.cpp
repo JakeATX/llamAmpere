@@ -122,7 +122,7 @@ ggml_tensor * llama_moe_og::slots(ggml_context * ctx, ggml_tensor * ids, int32_t
 }
 
 void llama_moe_og::prepare() {
-    const uint64_t err = __atomic_load_n(&ring->error, __ATOMIC_ACQUIRE);
+    const uint64_t err = ggml_moe_og_load_acq(&ring->error);
     if (err != 0) {
         GGML_ABORT("[ONEGRAPH] lookup %llu was not served in time (or broke the protocol): results of that step are invalid",
                 (unsigned long long) err);
@@ -141,7 +141,7 @@ void llama_moe_og::prepare() {
 void llama_moe_og::quiesce() {
     ggml_backend_synchronize(main_backend);
     const int64_t t0 = og_now_us();
-    while (processed.load(std::memory_order_acquire) < __atomic_load_n(&ring->last, __ATOMIC_ACQUIRE)) {
+    while (processed.load(std::memory_order_acquire) < ggml_moe_og_load_acq(&ring->last)) {
         active_until_us = og_now_us() + 20000;
         cv.notify_one();
         if (og_now_us() - t0 > (int64_t) timeout_ms*1000) {
@@ -181,8 +181,7 @@ void llama_moe_og::run() {
                 bad = bad || copies.size() > GGML_MOE_OG_MAX_COPY || upd.size() > GGML_MOE_OG_MAX_UPD;
             }
             if (bad) {
-                uint64_t zero = 0;
-                __atomic_compare_exchange_n(&ring->error, &zero, s, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                ggml_moe_og_set_if_zero(&ring->error, s);
             }
             if (rec.need) {
                 const size_t nc = std::min(copies.size(), (size_t) GGML_MOE_OG_MAX_COPY);

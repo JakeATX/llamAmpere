@@ -63,9 +63,58 @@ struct ggml_moe_og_ring {
 // [1] sequence number of the current lookup, [2] its state (0 all hits, 1 served miss, 2 timed out)
 #define GGML_MOE_OG_CTRL_BYTES 64
 
+// Host-side atomics on the ring words: release store, acquire load, acquire fence, and set-if-zero (seq_cst).
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC has no __atomic_* builtins. The loads must not write (the GPU owns seq / last), so no _Interlocked* here.
+// x86 / x64 (TSO): an aligned volatile u64 access is a release store / acquire load and the fence is a no-op
+// (what GCC emits for the builtins below; a 64-bit build is assumed for the u64 to be one access).
+// ARM64: __iso_volatile_* with a full barrier on the acquire / release side.
+#include <intrin.h>
+static inline void ggml_moe_og_set_if_zero(volatile uint64_t * p, uint64_t v) {
+    _InterlockedCompareExchange64((volatile __int64 *) p, (__int64) v, 0);
+}
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+static inline void ggml_moe_og_store_rel(volatile uint64_t * p, uint64_t v) {
+    __dmb(_ARM64_BARRIER_ISH);
+    __iso_volatile_store64((volatile __int64 *) p, (__int64) v);
+}
+static inline uint64_t ggml_moe_og_load_acq(const volatile uint64_t * p) {
+    const uint64_t v = (uint64_t) __iso_volatile_load64((const volatile __int64 *) p);
+    __dmb(_ARM64_BARRIER_ISH);
+    return v;
+}
+static inline void ggml_moe_og_fence_acq(void) {
+    __dmb(_ARM64_BARRIER_ISH);
+}
+#else
+static inline void ggml_moe_og_store_rel(volatile uint64_t * p, uint64_t v) {
+    *p = v;
+}
+static inline uint64_t ggml_moe_og_load_acq(const volatile uint64_t * p) {
+    return *p;
+}
+static inline void ggml_moe_og_fence_acq(void) {
+}
+#endif
+#else
+static inline void ggml_moe_og_store_rel(volatile uint64_t * p, uint64_t v) {
+    __atomic_store_n((uint64_t *) p, v, __ATOMIC_RELEASE);
+}
+static inline uint64_t ggml_moe_og_load_acq(const volatile uint64_t * p) {
+    return __atomic_load_n((const uint64_t *) p, __ATOMIC_ACQUIRE);
+}
+static inline void ggml_moe_og_fence_acq(void) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+}
+static inline void ggml_moe_og_set_if_zero(volatile uint64_t * p, uint64_t v) {
+    uint64_t zero = 0;
+    __atomic_compare_exchange_n((uint64_t *) p, &zero, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+#endif
+
 // Host side: answer record `rec` (the response fields must be written first)
 static inline void ggml_moe_og_answer(volatile struct ggml_moe_og_rec * rec, uint64_t seq) {
-    __atomic_store_n((uint64_t *) &rec->done, seq, __ATOMIC_RELEASE);
+    ggml_moe_og_store_rel(&rec->done, seq);
 }
 
 // Host side: copy the record with sequence number `next` (or a newer one if the reader fell behind) into *out.
@@ -74,10 +123,10 @@ static inline void ggml_moe_og_answer(volatile struct ggml_moe_og_rec * rec, uin
 static inline uint64_t ggml_moe_og_poll(const volatile struct ggml_moe_og_ring * ring, uint64_t next, struct ggml_moe_og_rec * out) {
     const volatile struct ggml_moe_og_rec * rec = &ring->rec[next % GGML_MOE_OG_RING];
     for (int tries = 0; tries < 4; ++tries) {
-        const uint64_t s = __atomic_load_n((const uint64_t *) &rec->seq, __ATOMIC_ACQUIRE);
+        const uint64_t s = ggml_moe_og_load_acq(&rec->seq);
         if (s < next) {
             // the reader may have fallen a whole ring behind: the newest record is ring->last
-            const uint64_t last = __atomic_load_n((const uint64_t *) &ring->last, __ATOMIC_ACQUIRE);
+            const uint64_t last = ggml_moe_og_load_acq(&ring->last);
             if (last >= next + GGML_MOE_OG_RING) {
                 next = last;
                 rec  = &ring->rec[next % GGML_MOE_OG_RING];
@@ -93,8 +142,8 @@ static inline uint64_t ggml_moe_og_poll(const volatile struct ggml_moe_og_ring *
         for (int i = 0; i < n; ++i) {
             out->ids[i] = rec->ids[i];
         }
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (__atomic_load_n((const uint64_t *) &rec->seq, __ATOMIC_ACQUIRE) == s) {
+        ggml_moe_og_fence_acq();
+        if (ggml_moe_og_load_acq(&rec->seq) == s) {
             out->seq = s;
             return s;
         }
