@@ -34,6 +34,10 @@ static thread_local size_t bytes = 0;
 static thread_local size_t hits = 0;
 }
 
+// the replaced operator new below allocates with malloc
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void * operator new(size_t n) {
     if (allocation_probe::active && n == allocation_probe::bytes) {
         ++allocation_probe::hits;

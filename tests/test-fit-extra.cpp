@@ -27,6 +27,10 @@ static thread_local size_t largest = 0;
 static thread_local size_t total = 0;
 }
 
+// the replaced operator new below allocates with malloc
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void * operator new(size_t n) {
     if (allocation_probe::active) {
         allocation_probe::largest = std::max(allocation_probe::largest, n);
@@ -304,7 +308,7 @@ static void test_ngram_checkpoint_fit() {
     for (uint32_t explicit_size : {0u, 17u}) {
         params.max_ngrams_dynamic = explicit_size;
         common_fit_ngram_cache_load_limits(16 * GiB, true, params, 4);
-        expect(params.max_ngrams_dynamic == explicit_size && params.load_max_entries_dynamic == UINT64_MAX &&
+        expect(params.max_ngrams_dynamic == (int32_t) explicit_size && params.load_max_entries_dynamic == UINT64_MAX &&
                 params.load_max_continuations_dynamic == UINT64_MAX && params.max_entries_context == context_only,
                 "explicit dynamic sizes preserve their override without charging automatic slots for their copies");
     }

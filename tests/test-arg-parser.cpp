@@ -20,6 +20,12 @@
 #include <sstream>
 #include <unordered_set>
 
+#ifdef _WIN32
+// setenv / unsetenv for the MSVC runtime; an empty value removes the variable there
+static int setenv(const char * name, const char * value, int) { return _putenv_s(name, value); }
+static int unsetenv(const char * name) { return _putenv_s(name, ""); }
+#endif
+
 #undef NDEBUG
 #include <cassert>
 
