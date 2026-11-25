@@ -408,6 +408,8 @@ public:
 
 private:
     llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_vg(int slot);
+    void vgraph_log_vram(const char * what, int slot);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -791,9 +793,16 @@ private:
     uint64_t           gf_res_prev_epoch  = 0; // ggml_backend_sched_get_alloc_epoch when gf_res_prev_active was allocated
     // fork ROUNDPREP (LLAMA_MTP_PLAN_SLOTS=1): the helper keeps its catch-up graph (slot 0) and its guess-step graph
     // (slot 1) allocated in two scheduler plans, so the first guess step of a round reuses last round's graph
-    std::array<llm_graph_result *, 2> plan_res    = {};
-    std::array<uint64_t, 2>           plan_epoch  = {};
-    std::array<uint64_t, 2>           plan_serial = {};
+    // VGRAPH (LLAMA_SPEC_VGRAPH=1) widens this to one slot per speculative verify width (slot = n_tokens - 1)
+    static constexpr int LLAMA_PLAN_SLOTS_MAX = 16; // matches GGML_SCHED_MAX_PLANS
+    std::array<llm_graph_result *, LLAMA_PLAN_SLOTS_MAX> plan_res    = {};
+    std::array<uint64_t, LLAMA_PLAN_SLOTS_MAX>           plan_epoch  = {};
+    std::array<uint64_t, LLAMA_PLAN_SLOTS_MAX>           plan_serial = {};
+    std::array<llm_graph_result_ptr, LLAMA_PLAN_SLOTS_MAX> gf_res_vg; // VGRAPH graph results, slot >= 1
+    int      vg_slot         = -1; // VGRAPH slot of the ubatch being processed (-1 off)
+    uint32_t vg_logged_alloc = 0;
+    uint32_t vg_logged_reuse = 0;
+    size_t   vg_free0        = 0;
     uint64_t           backend_buf_exp_epoch = 0; // ggml_backend_sched_get_alloc_epoch when backend_buf_exp_size was taken
 
     // [B1] layer-major prefill (LLAMA_B1=1, opt-in; see llama-b1.h). Declared after the backends so it is

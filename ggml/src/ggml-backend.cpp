@@ -1548,6 +1548,10 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+#ifndef GGML_SCHED_MAX_PLANS
+#define GGML_SCHED_MAX_PLANS 16
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -1653,11 +1657,13 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 
-    // fork ROUNDPREP plan slots (ggml_backend_sched_plan_select): the per-graph split plan of the slot that is not
-    // current, swapped in and out whole; NULL until a second slot is first selected
+    // fork ROUNDPREP plan slots (ggml_backend_sched_plan_select): the per-graph split plan of every slot that is not
+    // current, swapped in and out whole; plans[plan_cur] is always NULL (its plan lives in the scheduler fields) and
+    // a slot's entry stays NULL until that slot is first selected. VGRAPH widened this from 2 slots to
+    // GGML_SCHED_MAX_PLANS so a target context can keep one verify graph per draft width.
     size_t graph_size_cfg;
     int    plan_cur;
-    struct ggml_backend_sched_plan * plan_spare;
+    struct ggml_backend_sched_plan * plans[GGML_SCHED_MAX_PLANS];
     uint64_t plan_gen; // bumped when the allocator is replaced, so an old plan's epoch can never match again
     uint64_t split_serial; // per plan: changes on every split of a graph into the current plan
 
@@ -3916,9 +3922,15 @@ bool ggml_backend_sched_reset_compute(ggml_backend_sched_t sched) {
     ggml_gallocr_free(sched->galloc);
     sched->galloc = replacement;
     sched->plan_gen++;
-    if (sched->plan_spare) {
-        // the spare plan's tensors point into the freed allocator's buffers
-        sched->plan_spare->is_alloc = false;
+    bool any_plan = false;
+    for (int i = 0; i < GGML_SCHED_MAX_PLANS; i++) {
+        if (sched->plans[i]) {
+            // the spare plans' tensors point into the freed allocator's buffers
+            sched->plans[i]->is_alloc = false;
+            any_plan = true;
+        }
+    }
+    if (any_plan) {
         ggml_gallocr_set_epoch_on_realloc(sched->galloc, true);
     }
     sched->moe_cache_device_graph = false;
@@ -4035,8 +4047,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
-    if (sched->plan_spare) {
-        struct ggml_backend_sched_plan * p = sched->plan_spare;
+    for (int pi = 0; pi < GGML_SCHED_MAX_PLANS; pi++) {
+        struct ggml_backend_sched_plan * p = sched->plans[pi];
+        if (!p) {
+            continue;
+        }
         ggml_free(p->ctx);
         ggml_hash_set_free(&p->hash_set);
         for (int i = 0; i < p->splits_capacity; i++) {
@@ -4278,7 +4293,7 @@ uint64_t ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched) {
     return ggml_gallocr_get_epoch(sched->galloc) + (sched->plan_gen << 40);
 }
 
-// fork ROUNDPREP: create the second plan, empty (the first ggml_backend_sched_reset after it is swapped in clears it)
+// fork ROUNDPREP: create a spare plan, empty (the first ggml_backend_sched_reset after it is swapped in clears it)
 static struct ggml_backend_sched_plan * ggml_backend_sched_plan_new(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_plan * p = (struct ggml_backend_sched_plan *) calloc(1, sizeof(struct ggml_backend_sched_plan));
     if (!p) {
@@ -4311,7 +4326,7 @@ static struct ggml_backend_sched_plan * ggml_backend_sched_plan_new(ggml_backend
 
 bool ggml_backend_sched_plan_select(ggml_backend_sched_t sched, int slot) {
     GGML_ASSERT(sched);
-    if (slot < 0 || slot > 1) {
+    if (slot < 0 || slot >= GGML_SCHED_MAX_PLANS) {
         return false;
     }
     if (slot == sched->plan_cur) {
@@ -4321,14 +4336,14 @@ bool ggml_backend_sched_plan_select(ggml_backend_sched_t sched, int slot) {
     if (sched->n_copies != 1 || (sched->xs && sched->xs->enabled)) {
         return false;
     }
-    if (!sched->plan_spare) {
-        sched->plan_spare = ggml_backend_sched_plan_new(sched);
-        if (!sched->plan_spare) {
+    if (!sched->plans[slot]) {
+        sched->plans[slot] = ggml_backend_sched_plan_new(sched);
+        if (!sched->plans[slot]) {
             return false;
         }
         ggml_gallocr_set_epoch_on_realloc(sched->galloc, true);
     }
-    struct ggml_backend_sched_plan * p = sched->plan_spare;
+    struct ggml_backend_sched_plan * p = sched->plans[slot];
     GGML_SCHED_PLAN_SWAP(is_reset);
     GGML_SCHED_PLAN_SWAP(is_alloc);
     GGML_SCHED_PLAN_SWAP(hash_set);
@@ -4353,6 +4368,9 @@ bool ggml_backend_sched_plan_select(ggml_backend_sched_t sched, int slot) {
     GGML_SCHED_PLAN_SWAP(debug_graph_size);
     GGML_SCHED_PLAN_SWAP(debug_prev_graph_size);
     GGML_SCHED_PLAN_SWAP(split_serial);
+    // p now holds the plan of the slot we left; the selected slot's plan lives in the scheduler fields
+    sched->plans[sched->plan_cur] = p;
+    sched->plans[slot] = NULL;
     sched->plan_cur = slot;
     return true;
 }

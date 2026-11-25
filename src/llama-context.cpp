@@ -5649,16 +5649,33 @@ build_graph:
         const char * v = getenv("LLAMA_DSPARK_PLAN_SLOTS");
         return v == nullptr || strcmp(v, "0") != 0; // default on; =0 turns it off
     }();
+    // VGRAPH (opt-in: LLAMA_SPEC_VGRAPH=1): the target context keeps one allocated verify graph per draft width.
+    // A speculative verify ubatch (2..LLAMA_PLAN_SLOTS_MAX tokens, every token an output) gets plan slot n_tokens-1
+    // and its own graph result; every other ubatch uses slot 0. Without it a round whose draft depth differs from
+    // the previous round's rebuilds, splits and allocates the verify graph (~7-8 ms on a 3090, MTPPUNCT). Graphs
+    // and their allocation are the same as without slots, so outputs are unchanged.
+    static const bool vgraph_env = [] {
+        const char * v = getenv("LLAMA_SPEC_VGRAPH");
+        return v != nullptr && atoi(v) != 0;
+    }();
     int plan_slot = -1;
-    const bool use_plan_slots = plan_slots_env &&
-        (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (dspark_plan_slots_env && model.arch == LLM_ARCH_DFLASH));
+    vg_slot = -1;
+    const bool use_vgraph = vgraph_env && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.arch != LLM_ARCH_DFLASH &&
+        (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER);   // target decode passes DEFAULT
+    const bool use_plan_slots = (plan_slots_env &&
+        (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (dspark_plan_slots_env && model.arch == LLM_ARCH_DFLASH))) || use_vgraph;
     if (use_plan_slots && !graph_reuse_disable && !b1_cur.active &&
             !cparams.pipeline_parallel) {
         if (gf_res_prev_active == nullptr) {
             plan_res.fill(nullptr);
         }
-        const int want = n_outputs > 0 ? 1 : 0;
+        int want = n_outputs > 0 ? 1 : 0;
+        if (use_vgraph) {
+            const bool verify = ubatch.n_tokens >= 2 && ubatch.n_tokens <= LLAMA_PLAN_SLOTS_MAX && n_outputs == (int32_t) ubatch.n_tokens;
+            want = verify ? (int) ubatch.n_tokens - 1 : 0;
+        }
         if (ggml_backend_sched_plan_select(sched.get(), want)) {
+            vg_slot = use_vgraph ? want : -1;
             plan_slot = want;
             const bool valid = plan_res[want] != nullptr &&
                     plan_serial[want] == ggml_backend_sched_get_plan_serial(sched.get());
@@ -5668,7 +5685,7 @@ build_graph:
             plan_res.fill(nullptr);
         }
     }
-    auto * res = get_gf_res_prev();
+    auto * res = vg_slot > 0 ? get_gf_res_vg(vg_slot) : get_gf_res_prev();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -5689,6 +5706,10 @@ build_graph:
         }
 
         n_reused++;
+        if (vg_slot > 0 && !(vg_logged_reuse & (1u << vg_slot))) {
+            vg_logged_reuse |= 1u << vg_slot;
+            vgraph_log_vram("first reuse", vg_slot);
+        }
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -5746,6 +5767,10 @@ build_graph:
             plan_res[plan_slot]    = res;
             plan_epoch[plan_slot]  = gf_res_prev_epoch;
             plan_serial[plan_slot] = ggml_backend_sched_get_plan_serial(sched.get());
+        }
+        if (vg_slot > 0 && !(vg_logged_alloc & (1u << vg_slot))) {
+            vg_logged_alloc |= 1u << vg_slot;
+            vgraph_log_vram("first alloc", vg_slot);
         }
     }
 
@@ -8413,6 +8438,36 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+}
+
+llm_graph_result * llama_context::get_gf_res_vg(int slot) {
+    auto & res = gf_res_vg[slot];
+    // a re-reserve can raise max_nodes; a width result made before it must not be rebuilt into (its reuse is already
+    // blocked: gf_res_prev_active == nullptr clears plan_res)
+    if (!res || res->get_max_nodes() < gf_res_reserve->get_max_nodes()) {
+        res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    return res.get();
+}
+
+// VGRAPH: one line per verify width at its first allocation and its first reuse (after the CUDA graph was captured);
+// the change in device free memory between the two lines of a width, and between widths, is what the slot costs.
+// The compute buffer is shared by all slots, so its size only moves if a slot's graph needs more than the reserve.
+void llama_context::vgraph_log_vram(const char * what, int slot) {
+    size_t buf = 0;
+    for (auto * b : backend_ptrs) {
+        buf += ggml_backend_sched_get_buffer_size(sched.get(), b);
+    }
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_dev_t dev = backend_ptrs.empty() ? nullptr : ggml_backend_get_device(backend_ptrs[0]);
+    if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+    }
+    if (vg_free0 == 0) {
+        vg_free0 = free_b;
+    }
+    LLAMA_LOG_INFO("%s: VGRAPH width %d (slot %d) %s: compute buffers %.1f MiB, device free %.1f MiB (%.1f MiB used since the first VGRAPH line)\n",
+        __func__, slot + 1, slot, what, buf / 1048576.0, free_b / 1048576.0, ((double) vg_free0 - (double) free_b) / 1048576.0);
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
