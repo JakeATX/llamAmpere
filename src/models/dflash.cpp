@@ -1595,7 +1595,7 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = cparams.tok_embd_dev ? cparams.tok_embd_dev : model_other->tok_embd;
     }
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -1932,7 +1932,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = cparams.tok_embd_dev ? cparams.tok_embd_dev : model_other->tok_embd;
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -2104,7 +2104,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llm_graph_params & params) :
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = cparams.tok_embd_dev ? cparams.tok_embd_dev : model_other->tok_embd;
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -2347,7 +2347,7 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = cparams.tok_embd_dev ? cparams.tok_embd_dev : model_other->tok_embd;
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -2716,7 +2716,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     const int64_t block = n_tokens/nb;
     GGML_ASSERT(block*nb == n_tokens);
     auto * ids = ggml_cont_1d(ctx0, ggml_view_2d(ctx0, tokens, 1, nb, block*tokens->nb[0], 0), nb);
-    auto * anchors = ggml_get_rows(ctx0, target->tok_embd, ids);
+    auto * anchors = ggml_get_rows(ctx0, cparams.tok_embd_dev ? cparams.tok_embd_dev : target->tok_embd, ids);
     anchors = ggml_mul(ctx0, ggml_rms_norm(ctx0, anchors, target->hparams.f_norm_rms_eps), target->tok_norm);
     auto * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, nb);
     if (block > 1) {

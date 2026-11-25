@@ -41,6 +41,8 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "../common/host-prof.h"
+#include "llama-host-pipe.h"
 
 #include <algorithm>
 #include <atomic>
@@ -585,6 +587,13 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // never lent then
     if (cparams.ctx_other != nullptr && llama_get_model(cparams.ctx_other) != nullptr) {
         llama_get_model(cparams.ctx_other)->output_borrowed = true;
+    }
+
+    if (model.arch == LLM_ARCH_DFLASH && model.tok_embd == nullptr && cparams.ctx_other != nullptr && llama_dspark_embd_dev_enabled()) {
+        embd_dev_ctx.reset();
+        embd_dev_buf.reset();
+        cparams.tok_embd_dev = llama_dspark_embd_dev_copy(llama_get_model(cparams.ctx_other)->tok_embd, model.dev_output(),
+                embd_dev_ctx, embd_dev_buf);
     }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -3383,6 +3392,7 @@ void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+    LLAMA_HOSTPROF_SCOPE(model.arch == LLM_ARCH_DFLASH ? "dft.sync" : "tgt.sync");
     ckpt_async_finish(); // [CKPTASYNC]
 
     if (mtp_pipe.pending) {
@@ -5870,6 +5880,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
                                                  ggml_status &            ret) {
+    LLAMA_HOSTPROF_SCOPE(model.arch == LLM_ARCH_DFLASH ? "dft.ubatch" : "tgt.ubatch");
     // [B1] the layer-major prefill applied every ubatch up front and seeks between their saved views
     if (mctx && !b1_cur.active && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -5886,13 +5897,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // fork INKPF3: LLAMA_INKPF3_TIMING=1 logs host time of the SJ-KVaRN maintain step and of build+alloc (diagnostic)
     static const bool ipt_on = [] { const char * e = getenv("LLAMA_INKPF3_TIMING"); return e && atoi(e) != 0; }();
     const int64_t ipt0 = ipt_on ? ggml_time_us() : 0;
+    llama_hostprof::push("ctx.maintain_kv");
     // [INKB1] a one-visit graph seals the visit's cache slot (graph positions are not slots in a looped model)
     const int32_t seal_il0 = b1_cur.seal_il >= 0 ? b1_cur.seal_il     : b1_cur.il0;
     const int32_t seal_il1 = b1_cur.seal_il >= 0 ? b1_cur.seal_il + 1 : b1_cur.il1;
     if (b1_cur.active ? (b1_cur.ffn_phase <= 1 && !b1_seal_sj_kvarn(seal_il0, seal_il1)) : !maintain_sj_kvarn()) {
+        llama_hostprof::pop();
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    llama_hostprof::pop();
     if (ipt_on) {
         LLAMA_LOG_INFO("INKPF3 maintain_sj_kvarn: %.1f ms (n_tokens %u)\n", (ggml_time_us() - ipt0)/1000.0, ubatch.n_tokens);
     }
@@ -6018,7 +6032,9 @@ build_graph:
             vg_logged_reuse |= 1u << vg_slot;
             vgraph_log_vram("first reuse", vg_slot);
         }
+        llama_hostprof::mark("ctx.graph_reused");
     } else {
+        LLAMA_HOSTPROF_SCOPE("ctx.graph_build");
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -6089,6 +6105,18 @@ build_graph:
         }
 
         pp_mark(4);
+        if (llama_host_lite1_enabled()) {
+            const bool lite = llama_host_cpu_part_is_lite(sched.get(), backend_cpu, gf, llama_host_lite1_rows());
+            bool found = false;
+            for (auto & e : host_lite_res) {
+                if (e.first == res) { e.second = lite; found = true; break; }
+            }
+            if (!found) {
+                // results are reallocated on reserve / ub changes: keep the table small (a miss means the normal thread count)
+                if (host_lite_res.size() >= 16) { host_lite_res.clear(); }
+                host_lite_res.emplace_back(res, lite);
+            }
+        }
         // [B1] a layer-range graph is never reused: its carry, KV views and expert slots change every call
         gf_res_prev_active = b1_cur.active ? nullptr : res;
         gf_res_prev_epoch  = ggml_backend_sched_get_alloc_epoch(sched.get());
@@ -6128,6 +6156,7 @@ build_graph:
         if (ipt_on) {
             LLAMA_LOG_INFO("INKPF3 pre-inputs (build/alloc incl.): %.1f ms (n_tokens %u)\n", (ggml_time_us() - ipt0)/1000.0, ubatch.n_tokens);
         }
+        LLAMA_HOSTPROF_SCOPE("ctx.set_inputs");
         res->set_inputs(&ubatch);
         if (b1_cur.active && ink_b1.active) {
             ink_b1_capture(res); // [INKB1] keep the inputs this graph made for the ubatch's later graphs
@@ -6174,7 +6203,13 @@ build_graph:
                 decode_window && cparams.moe_skip_mass);
     }
     const int64_t pp_submit_t0 = b1_cur.active ? ggml_time_us() : 0;
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    bool cpu_lite = false;
+    if (llama_host_lite1_enabled()) {
+        for (const auto & e : host_lite_res) {
+            if (e.first == res) { cpu_lite = e.second; break; }
+        }
+    }
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, cpu_lite);
     if (b1_cur.active) {
         b1_pp_submit_us += ggml_time_us() - pp_submit_t0;
     }
@@ -8212,6 +8247,7 @@ void llama_context::ub_loan_end() {
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    LLAMA_HOSTPROF_SCOPE(model.arch == LLM_ARCH_DFLASH ? "dft.decode" : "tgt.decode");
     // Wait for any in-flight async DSpine inject before warm join, memory updates, phase switches, or graph prep.
     if (pipe_inject_pending) {
         synchronize();
@@ -8328,6 +8364,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    llama_hostprof::push(model.arch == LLM_ARCH_DFLASH ? "dft.prep" : "tgt.prep");
+    struct hostprof_prep_pop { bool on = true; void done() { if (on) { llama_hostprof::pop(); on = false; } } ~hostprof_prep_pop() { done(); } } hostprof_prep;
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -8560,6 +8598,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     } ink_b1_unwind_ { this, b1_mode == 4 ? mctx.get() : nullptr };
     pp_dec.mark("b1_prepare");
+    hostprof_prep.done();
     if (ple_pf && ple_pf_late && b1_mode >= 0 && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
         ple_pf_g.p = ple_pf.get();
     }
@@ -8685,6 +8724,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
     ggml_backend_t  inject_backend = nullptr;
     bool            async_dev_inject = false;
+    llama_hostprof::push("ctx.inject_wait");
     if (inject_src) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
         if (inject_backend) {
@@ -8743,6 +8783,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (write_h_nextn && ev_h_nextn_read_recorded) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
+    llama_hostprof::pop();
 
     do {
         if (b1_mode == 1) {
@@ -11335,7 +11376,9 @@ bool llama_context::prompt_plan(const llama_ubatch & ubatch, const llama_memory_
     return true;
 }
 
-ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
+ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched, bool cpu_lite) {
+    // HOSTOVL: a CPU part of a few light rows gains nothing from a thread team and its end barrier can stall for a
+    // scheduler slice (llama-host-pipe.h)
     int               n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp        = batched ? threadpool_batch : threadpool;
 
@@ -11349,8 +11392,9 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
     }
 
     // set the number of threads for all the backends
+    // (cpu_lite: the CPU backend alone runs on one thread; other host backends such as BLAS keep the team)
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
-        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+        set_n_threads_fn.second(set_n_threads_fn.first, cpu_lite && set_n_threads_fn.first == backend_cpu ? 1 : n_threads);
     }
 
     copy_experts.reset();
@@ -11358,9 +11402,18 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
         moe_cache->og_prepare(); // fork (ONEGRAPH): no-op unless LLAMA_MOE_ONEGRAPH=1
     }
 
+    LLAMA_HOSTPROF_SCOPE(model.arch == LLM_ARCH_DFLASH ? "dft.compute_submit" : "tgt.compute_submit");
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+    if (cpu_lite) {
+        // the CPU splits ran inline above; later direct CPU graphs (e.g. SJ-KVaRN maintenance) keep the real count
+        for (const auto & set_n_threads_fn : set_n_threads_fns) {
+            if (set_n_threads_fn.first == backend_cpu) {
+                set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+            }
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

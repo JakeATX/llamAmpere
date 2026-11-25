@@ -391,7 +391,8 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // cpu_lite: the graph's CPU part is only light ops over a few rows (llama-host-pipe.h), run it on one thread
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, bool cpu_lite = false);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -1139,4 +1140,9 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    // HOSTOVL LLAMA_HOST_LITE1: per graph result, whether its CPU part is lite (set when the graph is built)
+    std::vector<std::pair<const void *, bool>> host_lite_res;
+    // HOSTOVL LLAMA_DSPARK_EMBD_DEV: the device copy of the target's token embeddings (cparams.tok_embd_dev)
+    ggml_context_ptr        embd_dev_ctx;
+    ggml_backend_buffer_ptr embd_dev_buf;
 };

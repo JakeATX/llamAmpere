@@ -2,6 +2,7 @@
 #include "spec-lattice.h"
 
 #include "common.h"
+#include "host-prof.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
@@ -1706,7 +1707,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
-        flush_pending_rnn();
+        {
+            LLAMA_HOSTPROF_SCOPE("spec.flush_rnn");
+            flush_pending_rnn();
+        }
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);

@@ -15,6 +15,7 @@ set(LLAMA_CORE_SOURCES
     llama-batch.cpp
     llama-chat.cpp
     llama-context.cpp
+    llama-host-pipe.cpp
     llama-split-overlap.cpp
     llama-peer-experts.cpp
     llama-d1.cpp
@@ -93,6 +94,24 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
+
+# [HOSTOVL] NVTX v3 headers (header only) for the LLAMA_HOSTPROF=1 host phase ranges (common/host-prof.h);
+# a profiling aid, so Windows builds leave it out (no-op ranges)
+if (GGML_CUDA AND NOT WIN32)
+    find_package(CUDAToolkit QUIET)
+    set(LLAMA_HOSTPROF_NVTX_DIR "")
+    foreach(dir ${CUDAToolkit_INCLUDE_DIRS} /usr/include)
+        if (NOT LLAMA_HOSTPROF_NVTX_DIR AND EXISTS "${dir}/nvtx3/nvToolsExt.h")
+            set(LLAMA_HOSTPROF_NVTX_DIR "${dir}")
+        endif()
+    endforeach()
+    if (LLAMA_HOSTPROF_NVTX_DIR)
+        message(STATUS "llama: host phase NVTX ranges from ${LLAMA_HOSTPROF_NVTX_DIR}")
+        target_include_directories(llama PUBLIC $<BUILD_INTERFACE:${LLAMA_HOSTPROF_NVTX_DIR}>)
+        target_compile_definitions(llama PUBLIC LLAMA_HOSTPROF_NVTX)
+        target_link_libraries(llama PUBLIC ${CMAKE_DL_LIBS})
+    endif()
+endif()
 
 target_sources(llama PRIVATE ../vendor/hash/sha256/sha256.c)
 set_property(SOURCE ../vendor/hash/sha256/sha256.c APPEND

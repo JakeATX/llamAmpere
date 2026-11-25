@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "host-prof.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -6794,6 +6795,7 @@ private:
     }
 
     void update_slots() {
+        LLAMA_HOSTPROF_SCOPE("srv.update_slots");
         slot_ctx_share_update();
 
         llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_AUTOMATIC);
@@ -7374,6 +7376,7 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t_draft_start = ggml_time_us();
+            LLAMA_HOSTPROF_SCOPE("srv.draft");
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
@@ -7385,6 +7388,7 @@ private:
 
 
         // make checkpoints if needed
+        llama_hostprof::push("srv.ckpt");
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -7472,10 +7476,14 @@ private:
         });
 
 
+        llama_hostprof::pop();
+
         // update the batch with the sampled/drafted tokens
+        llama_hostprof::push("srv.batch_fill");
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        llama_hostprof::pop();
 
         if (verify_capacity > 0 && batch.size() > verify_capacity && generating.size() > 1) {
             SRV_ERR("concurrent verify row budget exceeded: %d > %d\n", batch.size(), verify_capacity);
@@ -8754,6 +8762,7 @@ private:
         bool spec_early_ok        = true;
         {
             const int64_t t_decode_start = ggml_time_us();
+            LLAMA_HOSTPROF_SCOPE("srv.verify");
             queue_tasks.yield_to_queue([&]() {
                 // #217 trunk keep is lossy, so it may run only when every row is a sampled
                 // token or a speculative verify row. Any prompt row (a one-token tail, cache
@@ -9002,6 +9011,7 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = spec_early_ok;
+            LLAMA_HOSTPROF_SCOPE("srv.spec_process");
             if (!spec_processed_early) {
                 queue_tasks.yield_to_queue([&]() {
                     const int32_t from = std::max(spec_processed, handoff.done);
@@ -9173,6 +9183,7 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        LLAMA_HOSTPROF_SCOPE("srv.post_decode");
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -9397,6 +9408,7 @@ private:
                 const auto is_stop = spec_is_stop(slot);
                 llama_tokens accepted;
                 const int64_t t_sample0 = ggml_time_us();
+                llama_hostprof::push("srv.sample_accept");
                 const bool replayed_verify = bool(slot.spec_smpl_after_verify);
                 if (slot.spec_smpl_after_verify) {
                     accepted = slot.spec_draft;
@@ -9426,6 +9438,7 @@ private:
                 }
                 slot.spec_round_restored = replayed_verify;
 
+                llama_hostprof::pop();
                 slot.spec_sample_end_us = ggml_time_us();
                 slot.spec_sample_us += par_done ? (uint64_t) (slot.par_t1_us - slot.par_t0_us)
                                                 : (uint64_t) (slot.spec_sample_end_us - t_sample0);
@@ -9581,7 +9594,9 @@ private:
                 if (slot.spec_forced) {  // the controller sees what the real rule accepted (n_ctrl only caps it)
                     common_speculative_set_accepted_real(spec.get(), slot.id, (int32_t) slot.spec_n_nat - 1);
                 }
+                llama_hostprof::push("srv.spec_accept");
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, n_ctrl, verify_width);
+                llama_hostprof::pop();
 
                 slot.spec_draft = std::move(accepted);
                 slot.spec_draft_q.clear();

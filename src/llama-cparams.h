@@ -101,6 +101,10 @@ struct llama_cparams {
 
     llama_context * ctx_other;
 
+    // HOSTOVL LLAMA_DSPARK_EMBD_DEV=1: a device copy of ctx_other's token embeddings for a DFlash/DSpark draft graph
+    // (its lookup then runs on the card instead of a CPU split); nullptr = use the target's tensor
+    struct ggml_tensor * tok_embd_dev = nullptr;
+
     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
     llama_context * ctx_state_src;
 };

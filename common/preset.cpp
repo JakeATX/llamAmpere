@@ -223,6 +223,12 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         set_ctx(ink24mu4, "425984");
         set_opt(ink24mu4, "--parallel", "4");
         set_opt(ink24mu4, "--ubatch-size", "512");
+        // HOSTOVL LLAMA_PRESET_DRAFT_TB1=1 (default off): the drafter's batch threads to 1. A DSpark draft decode is an
+        // 8-token batch whose only CPU work is a 1-row token-embedding lookup; an 8-thread team for it stalled 9-14 ms
+        // per round (Taichi 3090, 100K). LLAMA_HOST_LITE1 is the general fix; this is the preset-only variant.
+        if (const char * tb1 = std::getenv("LLAMA_PRESET_DRAFT_TB1"); tb1 && std::string(tb1) == "1") {
+            ink24.options.push_back({"--spec-draft-threads-batch", "1"});
+        }
         std::vector<common_card_preset> cards {large, large16, medium, small, tiny, ink8, ink10, ink12, ink24, ink24mu4};
         for (auto & card : cards) {
             if (string_ends_with(card.name, "ink") || card.name == "24ink-mu4") {

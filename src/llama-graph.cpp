@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "../common/host-prof.h"
 #include "ggml-inkrel.h"
 #include "ggml-inksjd128.h"
 #include "ggml-inksj.h"
@@ -2311,6 +2312,14 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
             }
         }
         LLAMA_LOG_INFO("INKPF3 set_inputs total: %.1f ms (n_tokens %u)\n", (ggml_time_us() - t0)/1000.0, ubatch->n_tokens);
+        return;
+    }
+    if (llama_hostprof::on()) {
+        // [HOSTOVL] LLAMA_HOSTPROF=1: one host range per input type
+        for (auto & input : inputs) {
+            llama_hostprof::scope sc(typeid(*input).name());
+            input->set_input(ubatch);
+        }
         return;
     }
     for (auto & input : inputs) {
