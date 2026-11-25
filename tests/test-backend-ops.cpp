@@ -24908,6 +24908,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_sj_kvarn_seal(256, 128, 4, 32, 4, 4, 16, true, GGML_TYPE_TQ6_0));
         return test_cases;
     }
+    // [INKDEC] Inkling 2 decode attention at 100K, DSpark verify width 5: the SWA / near window nodes over the whole SWA
+    // cache (n_swa 1024 + ubatch: 3072 at -ub 2048, 5120 at -ub 4096; only ~1029 cells visible) and the 4/4 far node
+    // (pair-packed heads = the Qwen3.8-27B shape: 24 heads, 4 KV pairs, D 256, 792 records + ring)
+    if (getenv("GGML_TEST_INKDEC") != nullptr) {
+        for (int64_t kv : {1029, 3072, 5120}) {
+            for (int64_t nb : {1, 5}) {
+                for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                    auto * c = new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0.0f, 0.0f, GGML_PREC_F32, t, t,
+                        {0, 1, 2, 3}, true, false, 0, 0, 24);
+                    test_cases.emplace_back(c);
+                    auto * l = new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t,
+                        {0, 1, 2, 3}, true, false, 0, 0, 24);
+                    l->lse_out = true;
+                    test_cases.emplace_back(l);
+                }
+            }
+        }
+        for (int64_t n_q : {1, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 792, 1024));
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 792, 4096, false, false, GGML_TYPE_TQ6_0, 128, true));
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 792, 4096, false, false, GGML_TYPE_TQ6_0, 128, false));
+        }
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
         add_ai_parw_shape_cases(test_cases);
         return test_cases;
