@@ -428,6 +428,7 @@ json format_response_rerank(
 struct server_slot_stats {
     bool stopped_loop = false;
     bool think_loop_closed = false; // the thinking-loop guard closed the think block (LLAMA_SERVER_THINK_LOOP_CLOSE)
+    int think_loop_period = 0;      // period of the loop it closed (1 = one token, 2..16 = LLAMA_SERVER_THINK_LOOP_PERIOD)
     int loop_period = 0;
     double loop_repeats = 0;
     uint64_t n_prompt_cached    = 0;

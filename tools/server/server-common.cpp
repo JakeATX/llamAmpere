@@ -166,6 +166,7 @@ json server_slot_stats::to_json() const {
 
     if (think_loop_closed) {
         base["think_loop_closed"] = true;
+        base["think_loop_period"] = think_loop_period;
     }
 
     if (n_draft_tokens > 0) {
