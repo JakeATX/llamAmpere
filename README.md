@@ -2,7 +2,47 @@
 
 llamAmpere is based on mainline llama.cpp (v1.0), tuned for NVIDIA RTX 30-series Ampere cards. With 1.0 we prioritize keeping up with mainline. It includes TheTom TurboQuant work, credited below.
 
-It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model writes faster) and Qwen3.8 Flash-Next.
+It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model writes faster) and Qwen3.8 Flash-Next, and Inkling 2 Mini.
+
+## Inkling 2 Mini on one RTX 3090 (v0.7.5)
+
+llamAmpere v0.7.5 against stock llama.cpp on the same card, same chat prompts, same reply length. Decode in tokens per
+second after a prompt of the given length; in parentheses, the previous build v0.7.4.1 measured the same way.
+
+| Engine and file | Size | Decode 3K | Decode 32K | Decode 100K | Prefill 100K | Max context |
+|---|---:|---:|---:|---:|---:|---:|
+| **llamAmpere 0.7.5**, `Inkling-2-Mini-ATX-NVFP4Q8-5.4bpw.gguf` + drafter | 17.6 GB | **185.2** (168.2) | **179.0** (160.0) | **141.8** (128.2) | **2,462** (1,697) | 385,024 |
+| **llamAmpere 0.7.5**, `Inkling-2-Mini-ATX-AI4-4.4bpw.gguf` + drafter | 14.4 GB | **188.7** (181.7) | **186.9** (171.4) | **144.9** (139.1) | **2,692** (1,954) | 614,400 |
+| stock llama.cpp b12627, Unsloth UD-Q4_K_XL | 17.6 GB | 51.3 | 48.4 | 33.3 | 249 | 278,528 |
+
+That is 3.6x stock decode at a 3K prompt and 4.3x at 100K with the same 17.6 GB file size, and the same quality as
+UD-Q4_K_XL (KLD 0.0032, top-1 98.1% vs 97.9%). The 4.4 bpw file scores KLD 0.0060, top-1 97.1%.
+
+**8, 10 and 12 GB cards** (one RTX 3090 limited to that card's memory, experts in system RAM, PCIe 4.0 x16, drafter
+off), decode and prefill at a 100K prompt:
+
+| Card | Preset | File | Decode 100K | Prefill 100K | Context | KLD |
+|---|---|---|---:|---:|---:|---:|
+| 12 GB | `--preset 12ink` | `Inkling-2-Mini-ATX-12GB-4.2bpw.gguf` (13.6 GB) | 60.0 (57.8) | 638 (622) | 262,144 | 0.0080 |
+| 10 GB | `--preset 10ink` | `Inkling-2-Mini-ATX-8GB-10GB-3.7bpw.gguf` (12.2 GB) | 58.0 (56.3) | 403 (404) | 262,144 | 0.011 |
+| 8 GB | `--preset 8ink` | `Inkling-2-Mini-ATX-8GB-10GB-3.7bpw.gguf` (12.2 GB) | 38.8 (38.2) | 404 (405) | 212,992 | 0.011 |
+
+How measured: chat template, temperature 1, 5,120-token replies, 6 seeds per build, both builds in ABBA order on the
+same card. 24 GB rows ran on an RTX 3090 Ti limited to 350 W and are shown 2% lower as RTX 3090 figures; 32K rows use a
+31,985-token prompt. Our rows use the 4-bit SJ-KVaRN KV cache; stock llama.cpp uses its 8-bit KV cache with no drafter.
+Max context = the largest context that starts and finishes a 100K-token prompt plus a reply within 23,552 MiB (stock
+llama.cpp fits that only at 32-token prompt batches; with 16-bit KV it reaches 147,456). KLD and top-1 are against the
+full-precision model on coding, agentic and RAG chats (16,200 scored tokens). Small-card speed depends on your PCIe link
+and RAM. Models: [jakeatx/Inkling-2-Mini-ATX-GGUF](https://huggingface.co/jakeatx/Inkling-2-Mini-ATX-GGUF) (24 GB),
+[jakeatx/Inkling-2-Mini-ATX-SmallCard-GGUF](https://huggingface.co/jakeatx/Inkling-2-Mini-ATX-SmallCard-GGUF) (8, 10
+and 12 GB). Quick start below.
+
+## What's new in v0.7.5
+
+- Inkling 2 Mini is faster on 24 GB cards: prompts are read about 40% faster at 100K tokens and decode is 4 to 12%
+  faster, with the same files and commands; 8, 10 and 12 GB cards are the same speed or up to 4% faster. Long reasoning
+  is no longer cut off at 3/4 of `max_tokens`, `--preset 24ink` finds the published drafter on its own, and images work
+  on every preset, including `--preset 24dense`. [Release notes](https://github.com/JakeATX/llamAmpere/releases/tag/v0.7.5).
 
 ## What's new in v0.7.2
 
@@ -91,6 +131,39 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 **Let your coding agent set it up:** paste this into Claude Code, Codex, Cursor or Copilot: *"Set up llamAmpere on this PC for me: https://github.com/JakeATX/llamAmpere - follow docs/AI_SETUP.md in that repository. Ask me before you install system packages or use sudo."* ([what it does](docs/AI_SETUP.md))
 
+### Quick start: Inkling 2 Mini
+
+Download the release for your system from [Releases](https://github.com/JakeATX/llamAmpere/releases) (Linux tar or
+Windows zip, RTX 30-series, NVIDIA driver R550 or newer) and the model files from Hugging Face.
+
+**24 GB cards** ([jakeatx/Inkling-2-Mini-ATX-GGUF](https://huggingface.co/jakeatx/Inkling-2-Mini-ATX-GGUF)): put the
+model and the drafter `Inkling-2-Mini-ATX-Drafter-Q8_0.gguf` in the same folder. `--preset 24ink` finds the drafter beside
+the model (with `-hf` it fetches it from the same repo); without it decode is much slower, and startup prints a warning
+with the fix. Add `--mmproj mmproj-Inkling-2-Mini-F16.gguf` for images.
+
+```bash
+# Linux
+./llama-server --preset 24ink -m /path/to/Inkling-2-Mini-ATX-NVFP4Q8-5.4bpw.gguf -md /path/to/Inkling-2-Mini-ATX-Drafter-Q8_0.gguf
+```
+
+```bat
+:: Windows
+llama-server.exe --preset 24ink -m C:\models\Inkling-2-Mini-ATX-NVFP4Q8-5.4bpw.gguf -md C:\models\Inkling-2-Mini-ATX-Drafter-Q8_0.gguf
+```
+
+**8, 10 and 12 GB cards**
+([jakeatx/Inkling-2-Mini-ATX-SmallCard-GGUF](https://huggingface.co/jakeatx/Inkling-2-Mini-ATX-SmallCard-GGUF)): the
+experts stay in system RAM with a VRAM cache, so plan for at least the model file size in free RAM and a PCIe 4.0 x16
+slot. These presets run without the drafter (it measured slower on small cards).
+
+```bash
+llama-server --preset 12ink -m /path/to/Inkling-2-Mini-ATX-12GB-4.2bpw.gguf
+llama-server --preset 10ink -m /path/to/Inkling-2-Mini-ATX-8GB-10GB-3.7bpw.gguf
+llama-server --preset 8ink  -m /path/to/Inkling-2-Mini-ATX-8GB-10GB-3.7bpw.gguf
+```
+
+On Windows use `llama-server.exe` with the same flags. Speeds and quality are in the release notes of each release.
+
 ### Quick start: pick your card
 
 Card presets assume a display is attached and reserve 1,024 MiB of GPU memory, except 8dense, which is headless-only and reserves 500 MiB. The reserve comes off the card's total memory (a 10 GB card stays at or under 9,216 MiB headed); memory already in use, such as a desktop, counts toward it. An explicit `--fit-target` keeps its free-memory meaning. `8dense headed` prints a note and uses the same headless settings. Append `headless` (`--preset 12dense headless`) or use `12dense-headless` for a 500 MiB margin on 10dense, 12dense, and 24dense. Headed defaults are 180,224 tokens for 10dense and 196,608 for 12dense, with CUDA graphs off for headed 12dense. Headless defaults remain 212,992 for 10dense, 262,144 for 12dense, and 204,800 for 8dense (with `mtp-dm.gguf` the 0.7.1 file peaks at 7,607 MiB on an RTX 3070, under the 7,692 MiB headless line). Headless 12dense at the full 262,144 tokens is tested on an RTX 3080 Ti 12 GB: a 262,142-token fill completed with 11,642 MiB peak (500 MiB margin line 11,788), 1,009 prompt tokens/s and 70.8 writing tokens/s at a 100K prompt. Fitting is on: the dynamic microbatch ladder remains enabled, and fitting may reduce a preset context to honor the margin. An explicit `-c`, `-fitt`, or `-fit` wins in either order. Startup reports the chosen context. Small cards still support one user only; multi-user support is future work.
@@ -155,6 +228,17 @@ The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-s
 To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp; not re-measured with the v0.7.1 preset) instead,
 replace `-m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf` with
 `--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
+
+## Docker (Linux)
+
+From the next release on, each release also ships a Linux image at `ghcr.io/jakeatx/llamampere` (tags: the release tag, e.g. `v0.7.5`, and `latest`). It is the Linux release tar on a slim Ubuntu 22.04 base: CUDA 12.4 runtime, cuBLAS and the GCC runtime are inside, so the host only needs an NVIDIA driver R550 or newer and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Windows stays the zip.
+
+```bash
+docker run --gpus all -v /path/to/models:/models -p 8080:8080 \
+  ghcr.io/jakeatx/llamampere:latest -m /models/model.gguf --preset 24dense
+```
+
+The entrypoint is `llama-server`, listening on `0.0.0.0:8080` inside the container; everything after the image name is passed to it, so the flags and card presets are the same as in the quick start above. Then open `http://localhost:8080`. To build the image yourself from a release tar, see [.devops/llamampere-server.Dockerfile](.devops/llamampere-server.Dockerfile).
 
 ## Headline results
 

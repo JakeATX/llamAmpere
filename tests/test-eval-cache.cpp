@@ -50,6 +50,10 @@ static size_t stop() {
 }
 
 // Count the real vector/list requests, including requests later freed on failure.
+// the replaced operator new below allocates with malloc
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void * operator new(size_t n) {
     if (allocation_probe::active) {
         allocation_probe::last = n;

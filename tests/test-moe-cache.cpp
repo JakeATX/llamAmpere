@@ -5602,7 +5602,7 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
         require((ggml_backend_sched_moe_cache_device_prepare(scheduler, &descriptor, 1) == 1), __LINE__);
         const std::string borrowed = capture.get().substr(checkpoint);
         require((max_field_value(borrowed, "newly_uncovered_bytes=") > 0), __LINE__);
-        require((max_field_value(borrowed, "newly_uncovered_bytes=") <= 2 * descriptor.expert_size + 8192), __LINE__);
+        require((max_field_value(borrowed, "newly_uncovered_bytes=") <= (long long) (2 * descriptor.expert_size + 8192)), __LINE__);
         require((replay_exact()), __LINE__);
         ggml_backend_sched_reset(scheduler);
         checkpoint = capture.get().size();
@@ -5671,7 +5671,7 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
     const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
     if (shared_mtp && strcmp(shared_mtp, "1") == 0 && arena_log != std::string::npos) {
         const std::string arena_line = log.substr(arena_log, log.find('\n', arena_log) - arena_log);
-        require((max_field_value(arena_line, "entries=") >= 4 * (uint64_t) descriptor.n_expert), __LINE__);
+        require((max_field_value(arena_line, "entries=") >= (long long) (4 * (uint64_t) descriptor.n_expert)), __LINE__);
     }
     require((log.find("failure=none policy=materialized-before-expert-pools") != std::string::npos), __LINE__);
     require((log.find("policy=actual-allocator-padding") != std::string::npos), __LINE__);
@@ -6302,7 +6302,7 @@ static bool run_device_argsort_view(ggml_backend_t gpu, ggml_backend_t cpu,
             const std::string log = capture.get();
             ok &= max_field_value(log, "dispatches=") == 12;
             ok &= max_field_value(log, "hits=") == 12;
-            ok &= max_field_value(log, "misses=") == (uint64_t)(12 * (10*tokens - 1));
+            ok &= max_field_value(log, "misses=") == (long long) (12 * (10*tokens - 1));
             ok &= max_field_value(log, "replays=") >= 8;
             if (!ok) fprintf(stderr, "argsort view tokens=%d channels=%d\n%s", tokens, channels, log.c_str());
             ggml_backend_buffer_free(candidate.buffer); ggml_free(candidate.ctx);
@@ -6824,7 +6824,7 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                     set_env("GGML_MOE_MISSJOIN_MASK", staged && mask_only ? "1" : nullptr);
                     capture.clear();
                     void * session = create_direct_session(gpu, cpu);
-                    bool prepared = session && api.warm(session, descriptors, counts, banks) == (size_t)banks &&
+                    bool prepared = session && api.warm(session, descriptors, counts, banks) == banks &&
                             api.device_prepare(session, descriptors, banks) == 1;
                     ok &= prepared;
                     const int64_t before = fusion_count(gpu, "mul_mat_glu");

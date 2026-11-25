@@ -6848,7 +6848,6 @@ ggml_tensor * llm_graph_context::build_attn_lsa_mask_blk(
     smax = smax ? smax : inp->lsa_smax_cur;
     smin = smin ? smin : inp->lsa_smin_cur;
     const int64_t B   = cfg.block;
-    const int64_t T   = qi->ne[1];
     const int64_t nbs = std::min<int64_t>((n_kv + B - 1)/B, smax->ne[1]);
     const int64_t d   = smax->ne[0];
     if (nbs < 2 || qi->ne[0] != d || inp->lsa_cell_pos->ne[0] != n_kv) {

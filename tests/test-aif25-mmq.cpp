@@ -5,6 +5,8 @@
 // checked, and compares three 16-row slabs of every output with a CPU reference (aif25_dequantize_slab, double sums):
 // NMSE <= 1e-3. Tile and strips come from the environment (GGML_CUDA_AIF25_MMQ, default 64; GGML_CUDA_AIF25_MMQ_STRIPS,
 // default 1); the minimum width is set to 9 unless given.
+// [KAIMULTI] With GGML_CUDA_AIF25_MMQ_MIN above 32 (ctest variant "narrow"), widths 9..32 take the decode-once narrow
+// kernel (GGML_CUDA_AIF_NARROW, default on, range GGML_CUDA_AIF_NARROW_MIN/_MAX); it is checked against mmv the same way.
 // Exit 0 = pass, 1 = fail, 77 = no CUDA device.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -40,6 +42,10 @@ int main() {
     setenv("GGML_CUDA_AIF25_MMQ_MIN", "9", 0);
     setenv("GGML_CUDA_AIF25_MMQ_CHECK", "2", 1);
     const int min_n = std::max(9, std::atoi(std::getenv("GGML_CUDA_AIF25_MMQ_MIN")));
+    const auto env_or = [](const char * name, int def) { const char * e = std::getenv(name); return e ? std::atoi(e) : def; };
+    const bool narrow = env_or("GGML_CUDA_AIF_NARROW", 1) != 0;
+    const int narrow_lo = std::min(32, std::max(9, env_or("GGML_CUDA_AIF_NARROW_MIN", 9)));
+    const int narrow_hi = std::min(32, std::max(9, env_or("GGML_CUDA_AIF_NARROW_MAX", 32)));
     ggml_log_set(log_cb, nullptr);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("CUDA0");
@@ -70,6 +76,13 @@ int main() {
         {17408, 5120, 65, GGML_TYPE_AIF25_U2}, {12288, 5120, 256, GGML_TYPE_AIF25_U2}, {1024, 5120, 1024, GGML_TYPE_AIF25_U2},
         {48, 1920, 130, GGML_TYPE_AIF25_U2}, {2560, 1920, 33, GGML_TYPE_AIF25_U2},
         {17408, 5120, 64, GGML_TYPE_AIF25_U2_512}, {5120, 6144, 300, GGML_TYPE_AIF25_U2_512}, {48, 512, 129, GGML_TYPE_AIF25_U2_512},
+        // [KAIMULTI] verify widths 9..32 (NB 2, 3 and 4, partial and full 8-token blocks) at the 27B shapes, every type
+        {17408, 5120, 12, GGML_TYPE_AIF175_U2}, {5120, 17408, 20, GGML_TYPE_AIF175_U2}, {10240, 5120, 32, GGML_TYPE_AIF175_U2},
+        {6144, 5120, 17, GGML_TYPE_AIF175_U2}, {5120, 6144, 25, GGML_TYPE_AIF175_U2}, {48, 512, 31, GGML_TYPE_AIF175_U2},
+        {17408, 5120, 9, GGML_TYPE_AIF25_U2}, {1024, 5120, 16, GGML_TYPE_AIF25_U2}, {12288, 5120, 24, GGML_TYPE_AIF25_U2},
+        {2560, 1920, 32, GGML_TYPE_AIF25_U2}, {48, 1920, 30, GGML_TYPE_AIF25_U2},
+        {5120, 6144, 23, GGML_TYPE_AIF25_U2_512}, {48, 512, 10, GGML_TYPE_AIF25_U2_512},
+        {2560, 640, 10}, {640, 2560, 31}, {48, 384, 23}, {17408, 5120, 28}, {2560, 640, 33},
     };
     std::mt19937 rng(20261111);
     std::uniform_real_distribution<float> scale(0.002f, 0.02f), act(-1.0f, 1.0f);
@@ -123,7 +136,7 @@ int main() {
         const int before = g_checked;
         ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS && ok;
         ggml_backend_synchronize(backend);
-        const int want = s.n >= min_n ? 1 : 0;
+        const int want = s.n >= min_n || (narrow && s.n >= narrow_lo && s.n <= narrow_hi) ? 1 : 0;
         expected += want;
         std::vector<float> yb(ggml_nelements(y));
         ggml_backend_tensor_get(y, yb.data(), 0, ggml_nbytes(y));

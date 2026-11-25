@@ -857,7 +857,7 @@ int main() {
             require(ggml_ait_rate(t) == 0, "unit is not tiled");
             require(ggml_ai4_trellis_mul(t) == multipliers[k-2], "unit own multiplier");
             require(AIT_MUL_FOR_TYPE(type) == multipliers[k-2], "unit metadata multiplier");
-            require(ggml_blck_size(t) == 128 && ggml_row_size(t, 640) == 5*(2+16*k), "unit H128 row bytes");
+            require(ggml_blck_size(t) == 128 && ggml_row_size(t, 640) == (size_t) (5*(2+16*k)), "unit H128 row bytes");
             require(std::fabs(ggml_ai4_scale_mul(t) - (k == 2 ? 1.00f : k == 3 ? 1.05f : 1.09f)) < 1e-6f, "unit scale seed");
             char key[32];
             std::snprintf(key, sizeof(key), "ait.multiplier.%d", type);

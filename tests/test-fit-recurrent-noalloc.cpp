@@ -18,7 +18,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+
+#if defined(__linux__)
 #include <unistd.h>
+#endif
 
 static int64_t resident_bytes() {
 #if defined(__linux__)

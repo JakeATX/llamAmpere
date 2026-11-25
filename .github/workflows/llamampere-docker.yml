@@ -1,0 +1,89 @@
+name: llamAmpere Docker image
+
+# Wraps the Linux release tar of a published release in a slim Ubuntu 22.04 image and pushes it to
+# ghcr.io/jakeatx/llamampere. Runs only when a v* release is published (the tar is a release asset,
+# so it exists by then), or by hand for an existing v* release tag. Linux only; Windows stays the zip.
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing release tag, e.g. v0.7.5"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
+  IMAGE: ghcr.io/jakeatx/llamampere
+
+jobs:
+  docker:
+    if: ${{ startsWith(inputs.tag || github.event.release.tag_name, 'v') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Download the Linux release tar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tar="llamampere-${TAG}-linux-x86_64-cuda12-server.tar"
+          mkdir ctx
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$tar" -p "$tar.sha256" -D ctx
+          (cd ctx && sha256sum -c "$tar.sha256")
+          echo "RELEASE_TAR=$tar" >> "$GITHUB_ENV"
+          echo "REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ github.event.release.prerelease || false }}
+        run: |
+          set -euo pipefail
+          tags="${IMAGE}:${TAG}"
+          latest="$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          if [ "$PRERELEASE" != "true" ] && [ "$latest" = "$TAG" ]; then tags="$tags,${IMAGE}:latest"; fi
+          echo "IMAGE_TAGS=$tags" >> "$GITHUB_ENV"
+          echo "$tags"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: ctx
+          file: .devops/llamampere-server.Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE_TAGS }}
+          build-args: |
+            RELEASE_TAR=${{ env.RELEASE_TAR }}
+            APP_VERSION=${{ env.TAG }}
+            APP_REVISION=${{ env.REVISION }}
+
+      - name: Smoke test (no GPU on the runner)
+        run: |
+          set -euo pipefail
+          # libcuda.so.1 and libnvidia-* come from the host driver through the NVIDIA Container Toolkit
+          docker run --rm --entrypoint /bin/sh "${IMAGE}:${TAG}" -c \
+            'ldd /app/llama-server | grep "not found" | grep -v -E "libcuda\.so|libnvidia" && exit 1; cat /app/COMMIT'
