@@ -13107,7 +13107,6 @@ static int ggml_cuda_try_fuse_q8tc_fwo(ggml_backend_cuda_context * ctx, ggml_cgr
     ggml_tensor * wins[MAX_WIN_NODES];
     int n_wins = 0;
     ggml_tensor * cc = nullptr, * conv = nullptr, * add = nullptr, * sc = nullptr, * add2 = nullptr;
-    int j_sc = -1;
     const int jmax = std::min(cgraph->n_nodes, i + 48);
     for (int j = i + 1; j < jmax && !add2; ++j) {
         ggml_tensor * t = cgraph->nodes[j];
@@ -13159,7 +13158,6 @@ static int ggml_cuda_try_fuse_q8tc_fwo(ggml_backend_cuda_context * ctx, ggml_cgr
         if (!sc) {
             if (t->op == GGML_OP_SCALE && t->src[0] == add) {
                 sc = t;
-                j_sc = j;
                 continue;
             }
             return 0;
@@ -13172,6 +13170,7 @@ static int ggml_cuda_try_fuse_q8tc_fwo(ggml_backend_cuda_context * ctx, ggml_cgr
     }
     const int64_t ne_tot = mm->ne[0] * n_t;
     if (!sc || conv->ne[0] != mm->ne[0] || conv->ne[1] != n_t || conv->ne[2] != 1 || conv->src[1]->ne[0] != 4 ||
+            conv->src[1]->type != GGML_TYPE_F32 || conv->src[1]->nb[0] != sizeof(float) ||
             add->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || ggml_nelements(add) != ne_tot ||
             !ggml_is_contiguous(sc) || ggml_nelements(sc) != ne_tot || mm->ne[0] % 16 != 0) {
         return 0;
@@ -13195,7 +13194,7 @@ static int ggml_cuda_try_fuse_q8tc_fwo(ggml_backend_cuda_context * ctx, ggml_cgr
     }
     // every pattern node but out is used only inside the run (the kernel still stores mm)
     const int last = ink_run_check(cgraph, i, set, n_set, out);
-    if (last < 0 || (!add2 && last != j_sc)) {
+    if (last < 0) {
         return 0;
     }
     if (!ctx) {
@@ -13231,7 +13230,8 @@ static int ggml_cuda_try_fuse_q8tc_fwo(ggml_backend_cuda_context * ctx, ggml_cgr
             return 0;
         }
     }
-    if (ink_overlap(out, mm) || (res && ((res->data != out->data && ink_overlap(out, res)) || ink_overlap(mm, res)))) {
+    // out may be mm exactly (ggml-alloc runs ADD / SCALE in place on mm): each address is then written by its own lane after warp 0's mm store
+    if ((out->data != mm->data && ink_overlap(out, mm)) || (out->data == mm->data && ggml_nbytes(out) != ggml_nbytes(mm)) || (res && ((res->data != out->data && ink_overlap(out, res)) || ink_overlap(mm, res)))) {
         return 0;
     }
     for (auto & e : ctx->conv_rings) {
