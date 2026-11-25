@@ -191,37 +191,58 @@ class FrozenNVFP4Experts(nn.Module):
         out = torch.zeros_like(x)
         beta = self.situ_beta
         lbeta = self.situ_linear_beta
+        use_chunk_ckpt = torch.is_grad_enabled()
 
         for e0 in range(0, n_exp, self.chunk_experts):
             e1 = min(e0 + self.chunk_experts, n_exp)
             active = [e for e in range(e0, e1) if counts_cpu[e] > 0]
             if not active:
                 continue
+            s_start = offsets[active[0]]
+            s_end = offsets[active[-1] + 1]
+            chunk_toks = sorted_tok[s_start:s_end]
+            chunk_w = sorted_w[s_start:s_end]
+            chunk_x = x.index_select(0, chunk_toks)
+            local_lens = [offsets[e + 1] - offsets[e] for e in active]
             idx_t = torch.tensor(active, device=x.device, dtype=torch.long)
-            w13_c = self._dequant_chunk(
-                self.w13_w[idx_t],
-                self.w13_scale[idx_t],
-                self.w13_outer[idx_t] if self.w13_outer is not None else None,
-                lut,
-                x.dtype,
-            )
-            w2_c = self._dequant_chunk(
-                self.w2_w[idx_t],
-                self.w2_scale[idx_t],
-                self.w2_outer[idx_t] if self.w2_outer is not None else None,
-                lut,
-                x.dtype,
-            )
-            for local_i, e in enumerate(active):
-                s0, s1 = offsets[e], offsets[e + 1]
-                tok_ids = sorted_tok[s0:s1]
-                xe = x.index_select(0, tok_ids)
-                gu = F.linear(xe, w13_c[local_i])
-                g = gu[:, 0::2]
-                u = gu[:, 1::2]
-                act = (beta * torch.tanh(g / beta) * torch.sigmoid(g)) * (lbeta * torch.tanh(u / lbeta))
-                ye = F.linear(act, w2_c[local_i]) * sorted_w[s0:s1].unsqueeze(-1)
-                out.index_add_(0, tok_ids, ye)
+
+            def _run_chunk(cx: torch.Tensor, cw: torch.Tensor, _idx=idx_t, _lens=local_lens) -> torch.Tensor:
+                w13_c = self._dequant_chunk(
+                    self.w13_w[_idx],
+                    self.w13_scale[_idx],
+                    self.w13_outer[_idx] if self.w13_outer is not None else None,
+                    lut,
+                    cx.dtype,
+                )
+                w2_c = self._dequant_chunk(
+                    self.w2_w[_idx],
+                    self.w2_scale[_idx],
+                    self.w2_outer[_idx] if self.w2_outer is not None else None,
+                    lut,
+                    cx.dtype,
+                )
+                # Project w13 per active expert, fuse SITU across entire chunk, then project w2
+                gu_parts = []
+                pos = 0
+                for li, n_e in enumerate(_lens):
+                    gu_parts.append(F.linear(cx[pos : pos + n_e], w13_c[li]))
+                    pos += n_e
+                gu_all = torch.cat(gu_parts, dim=0)
+                g = gu_all[:, 0::2]
+                u = gu_all[:, 1::2]
+                act_all = (beta * torch.tanh(g / beta) * torch.sigmoid(g)) * (lbeta * torch.tanh(u / lbeta))
+                y_parts = []
+                pos = 0
+                for li, n_e in enumerate(_lens):
+                    y_parts.append(F.linear(act_all[pos : pos + n_e], w2_c[li]))
+                    pos += n_e
+                return torch.cat(y_parts, dim=0) * cw.unsqueeze(-1)
+
+            if use_chunk_ckpt:
+                cy = checkpoint(_run_chunk, chunk_x, chunk_w, use_reentrant=False)
+            else:
+                cy = _run_chunk(chunk_x, chunk_w)
+            out.index_add_(0, chunk_toks, cy)
         return out
 
 
@@ -743,6 +764,13 @@ class Inkling2MiniSurgeryModel(nn.Module):
             layer = self.layers[ip]
             mode = layer_modes[ip]
 
+            # Visits 0..1 precede the first modified layer (blk.2) and are strictly frozen
+            if use_checkpoint and vid < 2 and not any(p.requires_grad for p in layer.attn.parameters()):
+                with torch.no_grad():
+                    c_out, pushed = layer.forward_visit(c_in, blks, mode, tau, self.e2m1_lut, msgs, q_blk, None)
+                new_blks = list(blks) + ([pushed] if pushed is not None else [])
+                return c_out, new_blks
+
             if use_checkpoint:
                 n_b = len(blks)
                 has_m = msgs is not None
@@ -889,11 +917,20 @@ def train_surgery(args: argparse.Namespace) -> None:
     mod_layers = [i for i in range(model.n_phys) if pat_a_modes[i] in (MODE_SWA_MID, MODE_LSA)]
     print(f"[surgery] modified physical layers: {mod_layers}", flush=True)
 
-    # 1. Snapshot ONLY the original 8 attention blocks (~432 MB on CPU) for exact online self-teacher
-    teacher_snaps: Dict[int, Dict[str, torch.Tensor]] = {}
-    for il in mod_layers:
-        teacher_snaps[il] = model.layers[il].attn.snapshot_cpu()
-    print(f"[teacher] snapshotted {len(teacher_snaps)} original attention blocks to CPU RAM", flush=True)
+    # 1. Precompute exact self-teacher targets on CPU RAM (~3.5 GiB for 48 seqs x 4K) BEFORE modifying weights!
+    #    Eliminates per-step teacher forward + weight swaps (~35% faster, zero extra VRAM).
+    n_kl_use = min(len(kl_seqs), args.cache_teacher_seqs)
+    teacher_cache: List[Tuple[torch.Tensor, Dict[int, torch.Tensor]]] = []
+    t_cache0 = time.time()
+    print(f"[teacher] precomputing exact stock 5:1 hidden & DSpark taps for {n_kl_use} KL seqs (len={args.kl_len})...", flush=True)
+    with torch.no_grad():
+        for i in range(n_kl_use):
+            seq_i = kl_seqs[i][: args.kl_len].to(device=device, dtype=torch.long)
+            th, tt = model.forward_sequence(seq_i, stock_modes, use_checkpoint=False, q_blk=args.q_blk)
+            teacher_cache.append((th.detach().to("cpu", dtype=torch.bfloat16), {k: v.detach().to("cpu", dtype=torch.bfloat16) for k, v in tt.items()}))
+            del th, tt, seq_i
+    torch.cuda.empty_cache()
+    print(f"[teacher] cached {len(teacher_cache)} seqs to CPU RAM in {time.time() - t_cache0:.1f}s", flush=True)
 
     # 2. Extend r=2 SWA_MID relative bias to (16, 4096) and enable learnable lsa_far_bias on r=4 LSA
     for il in mod_layers:
@@ -949,52 +986,18 @@ def train_surgery(args: argparse.Namespace) -> None:
     metrics_log = []
     t_start = time.time()
 
-    def swap_to_teacher() -> Tuple[Dict[int, Dict[str, torch.Tensor]], Dict[int, nn.Parameter]]:
-        student_cur: Dict[int, Dict[str, torch.Tensor]] = {}
-        saved_rel_params: Dict[int, nn.Parameter] = {}
-        for il in mod_layers:
-            attn = model.layers[il].attn
-            student_cur[il] = {k: v.detach().to("cpu", copy=True) for k, v in attn.named_parameters()}
-            # Temporarily swap in teacher weights (1024 rel_bias, lsa_far_bias=0)
-            for k, v in teacher_snaps[il].items():
-                p = getattr(attn, k)
-                if k == "rel_bias" and p.shape != v.shape:
-                    saved_rel_params[il] = p
-                    attn._parameters["rel_bias"] = nn.Parameter(v.to(device=device, dtype=torch.bfloat16), requires_grad=False)
-                    attn.rel_extent = v.shape[1]
-                else:
-                    p.data.copy_(v.to(device=device, dtype=p.dtype))
-        return student_cur, saved_rel_params
-
-    def restore_student(student_cur: Dict[int, Dict[str, torch.Tensor]], saved_rel_params: Dict[int, nn.Parameter]) -> None:
-        for il in mod_layers:
-            attn = model.layers[il].attn
-            if il in saved_rel_params:
-                saved = saved_rel_params[il]
-                attn._parameters["rel_bias"] = saved
-                attn.rel_extent = saved.shape[1]
-            for k, v in student_cur[il].items():
-                p = getattr(attn, k)
-                p.data.copy_(v.to(device=device, dtype=p.dtype))
-
     for step in range(1, args.steps + 1):
         t_step = time.time()
         optimizer.zero_grad(set_to_none=True)
         collect_stats = (step == 1) or (step % args.log_every == 0) or (step == args.steps)
         step_stats: Optional[Dict[str, float]] = {} if collect_stats else None
 
-        # --- Sub-batch 1: KL + DSpark tap MSE on coding/general (4K..8K) ---
-        kl_seq = kl_seqs[(step - 1) % len(kl_seqs)][: args.kl_len].to(device=device, dtype=torch.long)
-        student_backup, saved_rel = swap_to_teacher()
-        try:
-            with torch.no_grad():
-                t_hidden, t_taps = model.forward_sequence(kl_seq, stock_modes, use_checkpoint=False, q_blk=args.q_blk)
-                t_hidden = t_hidden.detach()
-                t_taps_det = {k: v.detach().float() for k, v in t_taps.items()}
-                del t_taps
-        finally:
-            restore_student(student_backup, saved_rel)
-            del student_backup, saved_rel
+        # --- Sub-batch 1: KL + DSpark tap MSE on coding/general (4K) ---
+        kl_idx = (step - 1) % len(teacher_cache)
+        kl_seq = kl_seqs[kl_idx][: args.kl_len].to(device=device, dtype=torch.long)
+        t_hidden_cpu, t_taps_cpu = teacher_cache[kl_idx]
+        t_hidden = t_hidden_cpu.to(device=device)
+        t_taps_det = {k: v.to(device=device, dtype=torch.float32) for k, v in t_taps_cpu.items()}
 
         s_hidden, s_taps = model.forward_sequence(
             kl_seq, pat_a_modes, use_checkpoint=True, q_blk=args.q_blk, stats_out=None
@@ -1030,6 +1033,7 @@ def train_surgery(args: argparse.Namespace) -> None:
         kl_val = kl_val_sum
         hid_val = float(loss_hid.item())
         del s_hidden, grad_s_hidden, s_taps, t_hidden, t_taps_det, loss_hid, surrogate_1
+        torch.cuda.empty_cache()
 
         # --- Sub-batch 2: Long-context multi-needle / cross-file retrieval CE (8K..12K) ---
         ce_item = ce_items[(step - 1) % len(ce_items)]
@@ -1182,7 +1186,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lambda-hid", type=float, default=0.25)
     ap.add_argument("--kl-len", type=int, default=4096)
     ap.add_argument("--ce-len", type=int, default=8192)
-    ap.add_argument("--q-blk", type=int, default=256)
+    ap.add_argument("--cache-teacher-seqs", type=int, default=64)
+    ap.add_argument("--q-blk", type=int, default=512)
     ap.add_argument("--chunk-experts", type=int, default=16)
     ap.add_argument("--mid-slot", type=int, default=2)
     ap.add_argument("--lsa-slot", type=int, default=4)
