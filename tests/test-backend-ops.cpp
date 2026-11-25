@@ -18593,6 +18593,7 @@ static void add_ai_parw_shape_cases(std::vector<std::unique_ptr<test_case>> & ca
 }
 
 static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc);
+static void add_aifuse_cases(std::vector<std::unique_ptr<test_case>> & tc);
 // [INKATTN] Inkling 2 decode attention shapes: D 128, 8 KV heads x 3 q heads, F16 K/V, per-head (rel bias) or broadcast
 // mask, optional LSE output, T 1..6 (g*T > 16 at T 6 = old routes); GGML_CUDA_INKATTN=0/1/2 selects the route
 // INKATTN: FLASH_ATTN_EXT with the Inkling relative bias table + rel_pos (+ output gate) inside the node
@@ -19309,6 +19310,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     if (getenv("GGML_TEST_INKGROUP") != nullptr) {
         add_inkgroup_cases(test_cases);
+        return test_cases;
+    }
+    if (getenv("GGML_TEST_AIFUSE") != nullptr) {
+        add_aifuse_cases(test_cases);
         return test_cases;
     }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
@@ -24700,6 +24705,76 @@ static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc) {
             tc.emplace_back(new test_inkgroup(t, { 3072, 1024, 1024, 384, 3072 }, 2304, n)); // q, k, v, rel, gate
             tc.emplace_back(new test_inkgroup(t, { 2304, 256 }, 3072, n));
             tc.emplace_back(new test_inkgroup(t, { 512, 640, 144, 160, 176, 192, 208, 224 }, 1152, n)); // 8 members, K % 256 != 0
+        }
+    }
+}
+
+// [OPT9] AI+ drop-in fusions (CUDA switches GGML_CUDA_AI_FUSE_ACT / _FUSE_GLU / _MMV_GROUP_SPEC, all default off):
+// whole graphs vs the CPU f32 reference, so the same cases check the unfused path (switches unset) and each fused one.
+//   AIFUSE_FFN: x -> RMS_NORM * gamma -> MUL_MAT(gate), MUL_MAT(up) -> GLU -> MUL_MAT(down)
+//               (norm prep, dense gate + up + GLU, GLU prep / the down bridge)
+//   AIFUSE_QKV: x -> RMS_NORM * gamma -> q, k, v MUL_MATs (norm prep + grouped mmv, 9..32 tokens with MMV_GROUP_SPEC)
+// A pass alone does not show a fused route ran: with a switch on, the CUDA context logs "AI+ fuse: ..." counters at exit.
+struct test_aifuse : public test_case {
+    const bool ffn; const ggml_type type; const int64_t k, m, n; const ggml_glu_op glu;
+    test_aifuse(bool ffn, ggml_type type, int64_t k, int64_t m, int64_t n, ggml_glu_op glu = GGML_GLU_OP_SWIGLU)
+        : ffn(ffn), type(type), k(k), m(m), n(n), glu(glu) {}
+    std::string op_desc(ggml_tensor *) override { return ffn ? "AIFUSE_FFN" : "AIFUSE_QKV"; }
+    double max_nmse_err() override { return 2e-3; }   // int8 activations (W4A8), two products deep, vs the CPU f32 reference
+    size_t max_tensors() override { return 32; }
+    std::string vars() override { return VARS_TO_STR5(type, k, m, n, glu); }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * h = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), g);
+        if (ffn) {
+            ggml_tensor * wg = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, m, k);
+            ggml_tensor * a  = ggml_glu_split(ctx, ggml_mul_mat(ctx, wg, h), ggml_mul_mat(ctx, wu, h), glu);
+            return ggml_mul_mat(ctx, wd, a);
+        }
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, type, k, m/4);
+        ggml_tensor * wv = ggml_new_tensor_2d(ctx, type, k, m/4);
+        ggml_tensor * q  = ggml_mul_mat(ctx, wq, h);
+        ggml_tensor * kk = ggml_mul_mat(ctx, wk, h);
+        ggml_tensor * v  = ggml_mul_mat(ctx, wv, h);
+        return ggml_concat(ctx, q, ggml_concat(ctx, kk, v, 0), 0);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+static void add_aifuse_cases(std::vector<std::unique_ptr<test_case>> & tc) {
+    const ggml_type all[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U,
+                              GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2,
+                              GGML_TYPE_AIT2_U2_512, GGML_TYPE_AIT3_U2_512, GGML_TYPE_AIT4_U2_512 };
+    for (ggml_type t : all) {
+        const bool unit = ggml_ai4v2_chunks(t) == 0;
+        for (int64_t n : { 1, 4, 8, 9, 16, 32 }) {
+            // K 2560 (H256, every layout); FFN 5120 (H256 down bridge); unit layouts also K 1152 / FFN 2176 (H128)
+            tc.emplace_back(new test_aifuse(true,  t, 2560, 5120, n));
+            tc.emplace_back(new test_aifuse(false, t, 2560, 2048, n));
+            if (unit) {
+                tc.emplace_back(new test_aifuse(true,  t, 1152, 2176, n));
+                tc.emplace_back(new test_aifuse(false, t, 1152, 1024, n));
+            }
+        }
+        for (int64_t n : { 1, 8, 32 }) {
+            tc.emplace_back(new test_aifuse(true, t, 2560, 5120, n, GGML_GLU_OP_GEGLU));
+            tc.emplace_back(new test_aifuse(true, t, 2560, 5120, n, GGML_GLU_OP_REGLU));
         }
     }
 }

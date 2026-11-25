@@ -549,6 +549,244 @@ static void test_model_state(const char * path, bool mode_biased) {
     llama_batch_free(batch); llama_free(ctx); llama_model_free(model);
 }
 
+static void test_mb_weighted() {
+    // 1. p_d == 0 with total == 0 (e.g. unpopulated .p from a greedy chain) never rescues
+    {
+        std::vector<llama_token_data> p = {{0, 0.0f, 0.0f}, {1, 0.0f, 0.0f}};
+        std::vector<llama_token_data> q = {{0, 0.0f, 1.0f}};
+        llama_token_data_array arr{p.data(), p.size(), 1, false};
+        std::mt19937 rng(42);
+        common_sampler_pq_stats stats;
+        auto res = common_sampler_verify_pq(arr, q, 0, 1, rng, true, stats);
+        assert(!res.rescued && !res.accepted && res.id == 1);
+    }
+
+    // 2. weighted rule: closed-form law vs 400K verifier draws (q(y) == 0 support and a stop token)
+    {
+        auto p = probs({0.50f, 0.25f, 0.15f, 0.10f});
+        // tokens 2 and 3 have q == 0 (truncated draft): the classic rule wipes them to 0
+        std::vector<llama_token_data> q = {{0, 0.0f, 0.85f}, {1, 0.0f, 0.15f}};
+        llama_token_data_array arr{p.data(), p.size(), 0, false};
+
+        auto hard_law = common_sampler_pq_mode_distribution(arr, q);
+        assert(hard_law[2] < 1e-9 && hard_law[3] < 1e-9);
+
+        for (double kappa : {0.0, 2.0, 4.0}) {
+            for (double alpha : {1.0, 0.5}) {
+                if (kappa <= 1.0 && alpha == 1.0) { continue; } // classic rule, covered above
+                common_sampler_mb_params mb;
+                mb.kappa = kappa;
+                mb.alpha = alpha;
+                const auto stop = [](llama_token id) { return id == 3; };
+                auto law = common_sampler_pq_mode_distribution(arr, q, stop, mb);
+
+                double sum = 0.0;
+                for (size_t k = 0; k < p.size(); ++k) {
+                    sum += law[k];
+                    // pointwise likelihood-ratio bound: p(x) / kappa <= law(x) <= kappa * p(x)
+                    if (kappa > 1.0) {
+                        assert(law[k] >= p[k].p / kappa - 1e-9);
+                        assert(law[k] <= p[k].p * kappa + 1e-9);
+                    }
+                }
+                assert(std::abs(sum - 1.0) < 1e-6);
+                // token 3 is a stop token, so its probability is untouched
+                assert(std::abs(law[3] - p[3].p) < 1e-9);
+                // token 2 has q(2) == 0, yet the capped rule keeps at least p(2) / kappa
+                if (kappa > 1.0) {
+                    assert(law[2] >= p[2].p / kappa - 1e-9 && law[2] > 0.0);
+                }
+
+                std::mt19937 draws(9001), rng(1337);
+                std::discrete_distribution<int> pd({0.50, 0.25, 0.15, 0.10});
+                std::discrete_distribution<int> qd({0.85, 0.15});
+                int counts[4] = {};
+                common_sampler_pq_stats stats;
+                constexpr int N = 400000;
+                for (int i = 0; i < N; ++i) {
+                    const int d = qd(draws), x = pd(draws);
+                    auto res = common_sampler_verify_pq(arr, q, d, x, rng, true, stats, nullptr, stop, mb);
+                    counts[res.id]++;
+                }
+                for (size_t k = 0; k < p.size(); ++k) {
+                    assert(std::abs((double) counts[k] / N - law[k]) < 0.004);
+                }
+            }
+        }
+    }
+
+    // 2b. same law vs draws check on the cached-q verifier (p.size > 4), with the stack (V = 24) and heap (V = 80) q buffers
+    for (int V : {24, 80}) {
+        std::mt19937 gen(777 + V);
+        std::uniform_real_distribution<float> U(0.0f, 1.0f);
+        std::vector<llama_token_data> p(V), q;
+        std::vector<double> pw(V), qw;
+        double ps = 0.0, qs = 0.0;
+        for (int k = 0; k < V; ++k) {
+            const float m = std::exp(-1.1f * std::log((float) (k + 1)) + U(gen));
+            p[k] = {k, 0.0f, m};
+            ps += m;
+            if (k < 6 || U(gen) < 0.35f) {   // 8-32 q entries, the rest are q == 0
+                const float mq = std::exp(-1.1f * std::log((float) (k + 1)) + 1.5f * U(gen));
+                q.push_back({k, 0.0f, mq});
+                qs += mq;
+            }
+        }
+        for (int k = 0; k < V; ++k) { p[k].p = (float) (p[k].p / ps); pw[k] = p[k].p; }
+        for (auto & c : q) { c.p = (float) (c.p / qs); qw.push_back(c.p); }
+        llama_token_data_array arr{p.data(), p.size(), 0, false};
+        common_sampler_mb_params mb;
+        mb.kappa = 3.0;
+        mb.alpha = 0.7;
+        const auto stop = [](llama_token id) { return id == 5; };
+        const auto law = common_sampler_pq_mode_distribution(arr, q, stop, mb);
+        std::mt19937 draws(4242), rng(31337);
+        std::discrete_distribution<int> pd(pw.begin(), pw.end()), qd(qw.begin(), qw.end());
+        std::vector<int> counts(V, 0);
+        common_sampler_pq_stats stats;
+        constexpr int N = 400000;
+        for (int i = 0; i < N; ++i) {
+            const int d = q[qd(draws)].id, x = pd(draws);
+            auto res = common_sampler_verify_pq(arr, q, d, x, rng, true, stats, nullptr, stop, mb);
+            counts[res.id]++;
+        }
+        for (int k = 0; k < V; ++k) {
+            assert(std::abs((double) counts[k] / N - law[k]) < 0.004);
+            assert(law[k] >= p[k].p / mb.kappa - 1e-7 && law[k] <= p[k].p * mb.kappa + 1e-7);
+        }
+    }
+
+    // 3. ratio bound, no support wipeout and KL <= classic over 500 random (p, q) pairs
+    {
+        std::mt19937 rng(20261122);
+        std::uniform_real_distribution<float> U(0.0f, 1.0f);
+        for (int t = 0; t < 500; ++t) {
+            const int V = 20;
+            std::vector<llama_token_data> p(V), q;
+            double ps = 0.0, qs = 0.0;
+            for (int k = 0; k < V; ++k) {
+                const float mp = std::exp(-1.2f * std::log((float)(k + 1)) + U(rng));
+                p[k] = {k, 0.0f, mp};
+                ps += mp;
+                if (k < 8 || U(rng) < 0.3f) {
+                    const float mq = std::exp(-1.2f * std::log((float)(k + 1)) + 1.5f * U(rng));
+                    q.push_back({k, 0.0f, mq});
+                    qs += mq;
+                }
+            }
+            for (auto & c : p) c.p = (float)(c.p / ps);
+            for (auto & c : q) c.p = (float)(c.p / qs);
+            llama_token_data_array arr{p.data(), p.size(), 0, false};
+
+            common_sampler_mb_params mb;
+            mb.kappa = 3.0;
+            mb.alpha = 1.0;
+            auto law_kkt  = common_sampler_pq_mode_distribution(arr, q, {}, mb);
+            auto law_hard = common_sampler_pq_mode_distribution(arr, q);
+            double kl_kkt = 0.0, kl_hard = 0.0;
+            for (int k = 0; k < V; ++k) {
+                const double pk = p[k].p;
+                assert(law_kkt[k] >= pk / mb.kappa - 1e-6);
+                assert(law_kkt[k] <= pk * mb.kappa + 1e-6);
+                assert(law_kkt[k] > 0.0); // no support wipeout
+                kl_kkt += law_kkt[k] * std::log(law_kkt[k] / pk);
+                if (law_hard[k] > 0.0) {
+                    kl_hard += law_hard[k] * std::log(law_hard[k] / pk);
+                }
+            }
+            assert(kl_kkt <= kl_hard + 1e-9);
+        }
+    }
+
+    // 4. classic law (no mb params) on a large support with ties and stops matches the naive O(V^2) reference
+    {
+        std::mt19937 rng(5555);
+        const int V = 128;
+        std::vector<llama_token_data> p(V), q;
+        double ps = 0.0, qs = 0.0;
+        for (int k = 0; k < V; ++k) {
+            // ties every 4 entries
+            const float mp = (float)(1 + (k / 4) % 10);
+            p[k] = {k * 3 + 1, 0.0f, mp};
+            ps += mp;
+            if (k % 2 == 0) {
+                const float mq = (float)(1 + rng() % 20);
+                q.push_back({k * 3 + 1, 0.0f, mq});
+                qs += mq;
+            }
+        }
+        for (auto & c : p) c.p = (float)(c.p / ps);
+        for (auto & c : q) c.p = (float)(c.p / qs);
+        std::shuffle(p.begin(), p.end(), rng);
+        std::shuffle(q.begin(), q.end(), rng);
+        llama_token_data_array arr{p.data(), p.size(), 0, false};
+        const auto stop = [](llama_token id) { return id % 13 == 0; };
+
+        auto fast_law = common_sampler_pq_mode_distribution(arr, q, stop);
+        // naive O(V^2) reference
+        std::vector<double> ref_law(V), res(V), ex(V);
+        double tot = 0.0;
+        for (int k = 0; k < V; ++k) {
+            double qk = 0.0;
+            for (const auto & c : q) if (c.id == p[k].id) { qk = c.p; break; }
+            ref_law[k] = p[k].p;
+            res[k] = std::max(0.0, ref_law[k] - qk);
+            ex[k]  = std::max(0.0, qk - ref_law[k]);
+            tot += res[k];
+        }
+        for (int d = 0; d < V; ++d) {
+            if (ex[d] <= 0.0 || p[d].p <= 0.0 || stop(p[d].id)) continue;
+            for (int y = 0; y < V; ++y) {
+                if (res[y] <= 0.0 || p[d].p < p[y].p || stop(p[y].id)) continue;
+                const double mv = ex[d] * res[y] / tot;
+                ref_law[d] += mv;
+                ref_law[y] -= mv;
+            }
+        }
+        for (int k = 0; k < V; ++k) {
+            assert(std::abs(fast_law[k] - ref_law[k]) < 1e-12);
+        }
+    }
+
+    // 5. position-weighted kappa: strictly decreasing in pos, geometric mean == kappa
+    {
+        common_sampler_mb_params mb;
+        mb.kappa = 4.0;
+        mb.pos_weight = true;
+        const size_t K = 6;
+        double log_sum = 0.0, prev = 1e9;
+        for (size_t pos = 0; pos < K; ++pos) {
+            const double kj = common_sampler_mb_effective_kappa(mb, pos, K);
+            assert(kj > 1.0 && kj < prev);
+            prev = kj;
+            log_sum += std::log(kj);
+        }
+        assert(std::abs(std::exp(log_sum / K) - mb.kappa) < 1e-12);
+    }
+
+    // 6. CLI parsing; the defaults select the classic rule
+    {
+        std::vector<std::string> args = {
+            "test-spec-beat", "--spec-mb-kappa", "4.0", "--spec-mb-alpha", "0.75",
+            "--spec-mb-pos-weight", "--spec-mb-no-consec"
+        };
+        std::vector<char *> argv;
+        for (auto & a : args) argv.push_back(&a[0]);
+        common_params params;
+        assert(common_params_parse(argv.size(), argv.data(), params, LLAMA_EXAMPLE_SERVER));
+        assert(std::abs(params.sampling.spec_mb_kappa - 4.0f) < 1e-6f);
+        assert(std::abs(params.sampling.spec_mb_alpha - 0.75f) < 1e-6f);
+        assert(params.sampling.spec_mb_pos_weight);
+        assert(params.sampling.spec_mb_no_consec);
+        common_params defaults;
+        assert(defaults.sampling.spec_mb_kappa <= 1.0f && defaults.sampling.spec_mb_alpha == 1.0f);
+        assert(!defaults.sampling.spec_mb_pos_weight && !defaults.sampling.spec_mb_no_consec);
+        assert(!common_sampler_mb_params{}.weighted());
+    }
+
+    puts("mb weighted rule: law vs draws, ratio bound, classic law identity, pos-weight, CLI: PASS");
+}
+
 static void bench() {
     for (int support : {3, 20, 40, 65}) {
         std::vector<llama_token_data> p;
@@ -587,6 +825,7 @@ static void bench() {
 int main(int argc, char ** argv) {
     test_model_mtp_default();
     test_verifier_identity(); test_identity_and_ties(); test_laws(); test_mode_distribution();
+    test_mb_weighted();
     if (argc == 2) { test_model_state(argv[1], false); test_model_state(argv[1], true); }
     bench();
     puts("test-spec-beat: PASS");

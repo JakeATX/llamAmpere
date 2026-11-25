@@ -691,6 +691,11 @@ llama_build_and_test(test-decode-phase.cpp)     # one-shot decode tag gates the 
 llama_build_and_test(test-fit-extra.cpp)
 llama_build_and_test(test-moe-bank.cpp)
 llama_build_and_test(test-moe-ai-rows.cpp)   # fork AIPFIX D2: host AI+ slab kernel vs reference
+llama_build_and_test(test-ai4-avx2.cpp test-ai4-avx2-levels.cpp)   # opt-in GGML_CPU_AI4_AVX2=1 AI+ unit CPU path vs the reference path
+if (NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
+    # only this helper TU; the test calls it after a runtime AVX2 + FMA check
+    set_source_files_properties(test-ai4-avx2-levels.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
 llama_build_and_test(test-moe-iq-signs.cpp)   # compile-time IQ sign bytes vs runtime ksigns_iq2xs
 llama_build_and_test(test-moe-cs-plan.cpp)   # fork AIPFIX: CPU-split planner greedy step + per-type probe cost table
 
