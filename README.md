@@ -11,8 +11,8 @@ second after a prompt of the given length; in parentheses, the previous build v0
 
 | Engine and file | Size | Decode 3K | Decode 32K | Decode 100K | Prefill 100K | Max context |
 |---|---:|---:|---:|---:|---:|---:|
-| **llamAmpere 0.7.5**, `Inkling-2-Mini-ATX-NVFP4Q8-5.4bpw.gguf` + drafter | 17.6 GB | **185.2** (168.2) | **179.0** (160.0) | **141.8** (128.2) | **2,462** (1,697) | 327,680 |
-| **llamAmpere 0.7.5**, `Inkling-2-Mini-ATX-AI4-4.4bpw.gguf` + drafter | 14.4 GB | **188.7** (181.7) | **186.9** (171.4) | **144.9** (139.1) | **2,692** (1,954) | 524,288 |
+| **llamAmpere 0.7.5**, `Inkling-2-Mini-ATX-NVFP4Q8-5.4bpw.gguf` + drafter | 17.6 GB | **185.2** (168.2) | **179.0** (160.0) | **141.8** (128.2) | **2,462** (1,697) | 385,024 |
+| **llamAmpere 0.7.5**, `Inkling-2-Mini-ATX-AI4-4.4bpw.gguf` + drafter | 14.4 GB | **188.7** (181.7) | **186.9** (171.4) | **144.9** (139.1) | **2,692** (1,954) | 614,400 |
 | stock llama.cpp b12627, Unsloth UD-Q4_K_XL | 17.6 GB | 51.3 | 48.4 | 33.3 | 249 | 278,528 |
 
 That is 3.6x stock decode at a 3K prompt and 4.3x at 100K with the same 17.6 GB file size, and the same quality as
