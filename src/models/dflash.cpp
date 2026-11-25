@@ -2433,6 +2433,10 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
     attn->self_attn_mask_swa.block_uniform = true;
+    if (cparams.draft_attn_window > 0 && attn->mctx->get_base()->get_kv_size() < cparams.n_ctx_seq) {
+        // DSPARKWIN: a windowed full-attention half uses the anchor's window for the whole block, as the SWA half
+        attn->self_attn_mask.block_uniform = true;
+    }
     for (int il = 0; il < n_layer; ++il) {
         const auto & l = model.layers[il];
         const int64_t hd = hparams.n_embd_head_k(il);

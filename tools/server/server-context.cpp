@@ -2594,6 +2594,11 @@ private:
                 add("dft_n_seq", std::to_string(llama_n_seq_max(ctx_dft)));
             }
             add("dft_window", string_format("%d,%d", params_base.speculative.draft.attn_window, params_base.speculative.draft.attn_sink));
+            if (params_base.speculative.draft.dspark_window > 0) {
+                // fork (DSPARKWIN): a ringed DSpark drafter state is not interchangeable with a full-context one
+                add("dft_dspark_window", string_format("%d,%d", params_base.speculative.draft.dspark_window,
+                        params_base.speculative.draft.dspark_window_sink >= 0 ? params_base.speculative.draft.dspark_window_sink : 128));
+            }
             add("dft_sj", std::to_string(params_base.speculative.draft.sj_kvarn));
             add("dft_depth", string_format("%d,%d", params_base.speculative.draft.n_max, params_base.speculative.draft.n_min_adaptive));
             std::string types;
@@ -5411,9 +5416,26 @@ private:
         return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART || dft_windowed());
     }
 
-    // the MTP drafter KV is a ring (--spec-draft-window)
+    // the MTP drafter KV is a ring (--spec-draft-window), or the DSpark drafter's full-attention KV is (DSPARKWIN,
+    // --spec-dspark-window)
     bool dft_windowed() const {
-        return ctx_dft != nullptr && params_base.speculative.draft.attn_window > 0;
+        return ctx_dft != nullptr && (params_base.speculative.draft.attn_window > 0 || dft_dspark_ring());
+    }
+
+    // DSPARKWIN: the ring exists only where common_speculative_init_result applies the window (draft-dspark without
+    // MTP) and the drafter keeps a plain cache (an SJ-KVaRN drafter ignores the window)
+    bool dft_dspark_ring() const {
+        if (ctx_dft == nullptr || params_base.speculative.draft.dspark_window <= 0) {
+            return false;
+        }
+        static const bool ring = [this] {
+            const auto & t = params_base.speculative.types;
+            const auto has = [&](common_speculative_type x) { return std::find(t.begin(), t.end(), x) != t.end(); };
+            return has(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) && !has(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                   !has(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) &&
+                   !common_base_params_to_speculative(params_base).speculative.draft.sj_kvarn;
+        }();
+        return ring;
     }
 
     // flags of the drafter part of a context checkpoint: a ring keeps its cell layout ([EVALFLAG] KEEP_LAYOUT: masked

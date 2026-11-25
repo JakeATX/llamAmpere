@@ -1456,6 +1456,10 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             if (!has_draft) {
                 common_speculative_mtp_cparams(params_dft, cparams_dft);
             }
+        } else if (has_draft && std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end()) {
+            // fork (DSPARKWIN): the fit measures the drafter with its ring, as common_speculative_init_result builds it
+            common_speculative_dspark_cparams(params_dft, cparams_dft);
         }
         cparams_dft.n_rs_seq = 0;
 
@@ -2348,6 +2352,15 @@ void common_speculative_mtp_cparams(const common_params & params, llama_context_
     if (dp.attn_window > 0) {
         cparams.draft_attn_window = dp.attn_window;
         cparams.draft_attn_sink   = dp.attn_sink >= 0 ? dp.attn_sink : 128;
+    }
+}
+
+void common_speculative_dspark_cparams(const common_params & params, llama_context_params & cparams) {
+    const auto & dp = params.speculative.draft;
+
+    if (dp.dspark_window > 0) {
+        cparams.draft_attn_window = dp.dspark_window;
+        cparams.draft_attn_sink   = dp.dspark_window_sink >= 0 ? dp.dspark_window_sink : 128;
     }
 }
 

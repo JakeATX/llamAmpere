@@ -102,10 +102,12 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
                      size_t kv_stream_maximum_pool_bytes,
-       llama_sj_kvarn_config sj_kvarn) :
+       llama_sj_kvarn_config sj_kvarn,
+                     uint32_t base_window,
+                     uint32_t base_sink) :
     llama_kv_cache_iswa(model, no_alloc, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_ubatch, mem_other, filter, reuse, share,
-            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes, sj_kvarn) {
+            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes, sj_kvarn, base_window, base_sink) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -128,7 +130,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
                      size_t kv_stream_maximum_pool_bytes,
-       llama_sj_kvarn_config sj_kvarn) : unified(unified) {
+       llama_sj_kvarn_config sj_kvarn,
+                     uint32_t base_window,
+                     uint32_t base_sink) : unified(unified) {
 
     // INKKV v2: with SJ-KVaRN the SWA cache also holds an F16 window copy of the full-attention layers (the near part of
     // the far/near relative-bias split, llm_graph_context::build_attn_rel); set below, read by filter_swa
@@ -151,7 +155,30 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return  model.hparams.is_swa(il) || swa_near_copy;
     };
 
-    const uint32_t size_base = kv_size;
+    uint32_t size_base = kv_size;
+
+    // fork (DSPARKWIN): a windowed non-SWA half is a ring of window + sink cells per sequence (+ one ubatch of
+    // headroom, as for the SWA half below); 64-bit math and the context cap keep absurd values from wrapping.
+    // The window never drops below the SWA window, so the base cache still holds every position the SWA cache does.
+    // A ring no smaller than the context is the off path (full cache, no window).
+    bool base_ring = false;
+    uint32_t n_swa_base = 0;
+    if (base_window > 0 && sj_kvarn.enabled()) {
+        LLAMA_LOG_WARN("%s: a windowed full-attention cache needs a plain KV cache; SJ-KVaRN is on, the window is ignored\n", __func__);
+    } else if (base_window > 0) {
+        const uint32_t w = std::max(base_window, hparams.n_swa);
+        const uint64_t n_seq_ring = unified ? n_seq_max : 1;
+        const uint64_t ring = GGML_PAD(((uint64_t) w + base_sink)*n_seq_ring + n_ubatch, 256);
+        if (ring < kv_size) {
+            base_ring  = true;
+            n_swa_base = w;
+            size_base  = (uint32_t) ring;
+            LLAMA_LOG_INFO("%s: windowed non-SWA cache: n_swa = %u, sink = %u, size = %u cells (ctx %u)\n",
+                    __func__, n_swa_base, base_sink, size_base, kv_size);
+        } else {
+            LLAMA_LOG_INFO("%s: non-SWA window %u + sink %u covers the context %u: full cache\n", __func__, w, base_sink, kv_size);
+        }
+    }
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
@@ -250,12 +277,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, no_alloc, *hparams_base, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
-            "", kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes, sj_kvarn);
+            n_swa_base, base_ring ? LLAMA_SWA_TYPE_STANDARD : LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
+            "", base_ring ? 0 : kv_stream_stage_bytes, base_ring ? nullptr : kv_stream_phase_arena,
+            base_ring ? 0 : kv_stream_maximum_pool_bytes, sj_kvarn);
+    if (base_ring) {
+        kv_base->set_swa_sink(base_sink);
+    }
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
-    const bool swa_is_full_length = size_swa == size_base;
+    const bool swa_is_full_length = size_swa == kv_size; // fork (DSPARKWIN): the context, not a windowed base ring
     kv_swa = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k_swa, type_v_swa,
             v_trans, offload, unified, size_swa, n_seq_max,

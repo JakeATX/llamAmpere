@@ -5492,6 +5492,15 @@ common_speculative_init_result::common_speculative_init_result(
         LOG_INF("%s: DFlash draft context: draft vocabulary shortlist '%s' (DSpine only)\n", __func__, cparams.draft_vocab_map);
     }
 
+    if (spec_dspark && !spec_mtp) {
+        // fork (DSPARKWIN): --spec-dspark-window turns the drafter's full-attention KV into a ring (llama-model.cpp)
+        common_speculative_dspark_cparams(params, cparams);
+        if (cparams.draft_attn_window > 0) {
+            LOG_INF("%s: DSpark draft attention window = %d, sink = %d\n",
+                    __func__, cparams.draft_attn_window, cparams.draft_attn_sink);
+        }
+    }
+
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
