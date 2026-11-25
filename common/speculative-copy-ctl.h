@@ -12,8 +12,10 @@
 //                           emitted token for drafter rounds. A span of W tokens is verified only when its expected
 //                           tokens per ms, (1 + q1 * (1 + qn + .. + qn^(W-1))) / t(W + 1), beats margin / (drafter ms
 //                           per token). Knobs: LLAMA_RTB_COPYCTL_MARGIN (1.05), LLAMA_RTB_COPYCTL_ROWK (0.04, the
-//                           per-row cost slope of the prior before a row count is measured), LLAMA_RTB_COPYCTL_SPAN
-//                           (32, the copy-first cap the flag turns on when copy-first is on auto).
+//                           per-row cost slope of the prior before a row count is measured), LLAMA_RTB_COPYCTL_CAP
+//                           (32, the copy-first span cap the flag turns on when copy-first is on auto; on a recurrent
+//                           target n_rs_seq follows it, so 64 costs rollback-state memory; LLAMA_RTB_COPYCTL_SPAN is the
+//                           older name, read when CAP is unset).
 //   LLAMA_RTB_COPYCURSOR=1  copy cursor + re-anchor. While the output keeps following a source, the next proposal
 //                           continues from there with no lookup and no minimum-match gate. After a break, a 4-gram
 //                           index over prompt + reply is asked for the nearest candidate at or after the place where
@@ -61,6 +63,14 @@ inline double env_num(const char * name, double def, double lo, double hi) {
         return def;
     }
     return std::max(lo, std::min(hi, v));
+}
+
+// LLAMA_RTB_COPYCTL_CAP (default 32, 1..hi): the copy-first span cap under the controller; LLAMA_RTB_COPYCTL_SPAN is the
+// older name of the same knob (CAP wins when both are set)
+inline int32_t copyctl_cap(int32_t hi) {
+    const char * c = std::getenv("LLAMA_RTB_COPYCTL_CAP");
+    const char * name = (c != nullptr && c[0] != '\0') ? "LLAMA_RTB_COPYCTL_CAP" : "LLAMA_RTB_COPYCTL_SPAN";
+    return (int32_t) env_num(name, 32, 1, hi);
 }
 
 // The token stream the controller works on: history h[0, n) followed by the last sampled token (index n).

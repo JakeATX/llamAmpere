@@ -273,6 +273,22 @@ static void test_flags_from_env() {
     setenv("LLAMA_RTB_COPYCTL", "0", 1);
     assert(!rtb::copy_flags::from_env().any());
     unsetenv("LLAMA_RTB_COPYCTL");
+    // span cap: CAP, else the older SPAN name, else 32; clamped to [1, hi]
+    unsetenv("LLAMA_RTB_COPYCTL_CAP");
+    unsetenv("LLAMA_RTB_COPYCTL_SPAN");
+    assert(rtb::copyctl_cap(128) == 32);
+    setenv("LLAMA_RTB_COPYCTL_SPAN", "48", 1);
+    assert(rtb::copyctl_cap(128) == 48);
+    setenv("LLAMA_RTB_COPYCTL_CAP", "64", 1);
+    assert(rtb::copyctl_cap(128) == 64);
+    setenv("LLAMA_RTB_COPYCTL_CAP", "", 1);
+    assert(rtb::copyctl_cap(128) == 48);
+    setenv("LLAMA_RTB_COPYCTL_CAP", "500", 1);
+    assert(rtb::copyctl_cap(128) == 128);
+    setenv("LLAMA_RTB_COPYCTL_CAP", "0", 1);
+    assert(rtb::copyctl_cap(128) == 1);
+    unsetenv("LLAMA_RTB_COPYCTL_CAP");
+    unsetenv("LLAMA_RTB_COPYCTL_SPAN");
 }
 
 

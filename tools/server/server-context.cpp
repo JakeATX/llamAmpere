@@ -2561,9 +2561,9 @@ private:
             const bool dspark = params.speculative.has_dft() &&
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
             // LLAMA_RTB_COPYCTL=1: the cost-model copy controller only copies when copying is measured to pay, so it
-            // turns copy-first on by default (span cap LLAMA_RTB_COPYCTL_SPAN, 32) where auto would leave it off
+            // turns copy-first on by default (span cap LLAMA_RTB_COPYCTL_CAP, 32) where auto would leave it off
             const int32_t first_def = server_rtb_copyctl(params)
-                    ? (int32_t) rtb::env_num("LLAMA_RTB_COPYCTL_SPAN", 32, 1, common_speculative_copy_params::FIRST_MAX) : 0;
+                    ? rtb::copyctl_cap(common_speculative_copy_params::FIRST_MAX) : 0;
             params.speculative.copy_first = common_speculative_copy_params::resolve_first(
                     params.speculative.copy_first, dspark && params.n_parallel == 1, first_def);
             // INKCOPY gate (HOME 3090 Ti, 4/4, DSpark d4): edit/quote tasks +33% but normal chat not faster (3K +0.2%,
