@@ -22,9 +22,11 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
-// ai4-coop128.cu (own TU): opt-in BN=128 cooperative AIT4_U expert prefill GEMM, GGML_CUDA_AI4_COOP128=1
+// ai4-coop128.cu (own TU): opt-in BN=128 cooperative AIT4_U prefill GEMM, GGML_CUDA_AI4_COOP128=1 (MoE expert tiles),
+// GGML_CUDA_AI4_COOP128_DENSE=1 (dense MUL_MAT at the gemm<128> width)
 namespace ai4_coop {
 bool env_coop128_enabled();
+bool env_coop128_dense_enabled();
 void dispatch_coop128_ait4(
         const uint8_t * W, const int8_t * Xq, const float * Xs,
         float * Y, int64_t ldy, int M, int N, int K, int xsh, bool is_id,
@@ -838,6 +840,15 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
     } else if (ai4k::lay_v2<LAY>() && ai4_parw(N)) {
         ai23_launch_gemm<32, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
     } else if (N >= ai4_bn128_min()) {
+        if constexpr (LAY == ai4k::LAY_AIT4_U) {
+            // opt-in GGML_CUDA_AI4_COOP128_DENSE=1 (default off): same int sums and accumulation order as gemm<128>.
+            // Rate 4 only ever gets the PLAIN prep here (SWAP8 is rate 2/3, XPERM rate 2), the layout the kernel reads.
+            static_assert(ai4k::lay_rate<LAY>() == 4, "coop128 dense reads the PLAIN activation prep");
+            if (sms && ai4_coop::env_coop128_dense_enabled()) {
+                ai4_coop::dispatch_coop128_ait4(W, q, s, Y, M, M, N, K, XSH, false, ai4k::idmap{}, 0, stream);
+                return;
+            }
+        }
         ai23_launch_gemm<128, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
     } else {
         ai23_launch_gemm<64, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);

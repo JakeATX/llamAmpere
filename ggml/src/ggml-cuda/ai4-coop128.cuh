@@ -11,6 +11,10 @@
 // Opt-in: GGML_CUDA_AI4_COOP128=1 (default 0). Only engages where gemm<128> would run for AIT4_U expert tiles,
 // i.e. bn == 128: n_tok >= GGML_CUDA_AI4_BN128_MIN and the lowreg-ID path not taken (it forces bn 64 up to
 // GGML_CUDA_AI4_LOWREG_ID_MAX_N = 1024 by default), and GGML_CUDA_AI4_ID_SHAPE unset.
+// Dense (ID = false): opt-in GGML_CUDA_AI4_COOP128_DENSE=1 (default 0, independent of GGML_CUDA_AI4_COOP128), only where
+// the dense gemm<128, 3, 4> would run for AIT4_U in ai4_mm_kernels (N >= GGML_CUDA_AI4_BN128_MIN, no prefill_v2 /
+// Ampere-mmv route). It reads the PLAIN activation prep (row-major [N][K] int8, [N][K >> (7 + XSH)] scales), the only
+// prep rate-4 types get (SWAP8 needs rate 2/3, XPERM rate 2), including a PREFILL-GLUE cached one.
 
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
@@ -304,6 +308,7 @@ static void launch_gemm_s8_coop128(
 
 // Public non-templated entrypoints (defined in ai4-coop128.cu)
 bool env_coop128_enabled();
+bool env_coop128_dense_enabled();
 
 void dispatch_coop128_ait4(
         const uint8_t * W, const int8_t * Xq, const float * Xs,
