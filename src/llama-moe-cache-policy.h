@@ -139,6 +139,9 @@ struct llama_moe_split_policy {
     void seed(double c_ms, double g_ms);
     bool active() const { return mode != OFF; }
     bool ready() const { return cpu.n >= 8 && gpu.n >= 8 && n_gpu_pcie >= 4; }
+    // routing by the fit waits for real samples on both branches (the SPLITCAL seed sets n but has no intercepts)
+    int64_t n_real_cpu = 0, n_real_gpu = 0;
+    bool route_ready() const { return ready() && n_real_cpu >= 4 && n_real_gpu >= 4; }
 
     // right after the ids of layer il (n_rows rows) are on the host: closes the previous lookup's interval
     void on_ids(int32_t il, int64_t n_rows);

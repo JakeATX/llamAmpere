@@ -2253,6 +2253,9 @@ struct llama_moe_cache::impl {
         }
         split.init(cpu_share);
         cal_alloc = !no_alloc;
+        if (fewrow_auto && no_alloc) {
+            fewrow_use = fewrow_r; // dry run (fit): reserve the graph with the CPU part, calibrate() runs on the real load
+        }
         if (!getenv("LLAMA_MOE_CACHE_HEAT") || groups.empty()) {
             return;
         }
@@ -2471,7 +2474,11 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] group %s x%zu layers, %.2f MiB per expert: CPU ms per expert by rows"
                     "%s (%d threads), 1 row %.4f ms (%d threads), upload %.4f ms\n", ggml_type_name(g.ref.back()->type),
                     g.layers.size(), e_bytes/1048576.0, line.empty() ? " -" : line.c_str(), n_threads_batch, gc1, n_threads, u);
-            if (u <= 0.0 || (time_split && gc1 <= 0.0)) {
+            bool rows_ok = true;
+            for (int i = 0; i < n_rows; ++i) {
+                rows_ok = rows_ok && (!fewrow_auto || gcb[i] > 0.0);
+            }
+            if (u <= 0.0 || (time_split && gc1 <= 0.0) || !rows_ok) {
                 LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] timing failed (no scratch buffer on %s?), calibration skipped\n",
                         ggml_backend_buft_name(d.buft));
                 return;
@@ -2509,7 +2516,7 @@ struct llama_moe_cache::impl {
             fewrow_use = std::min(R, fewrow_r);
             LLAMA_LOG_WARN("llama_moe_cache: [SPLITCAL] few-row tier: CPU %.4f ms at 1 row, %.4f ms at 64 rows, upload %.4f ms "
                     "per expert -> LLAMA_MOE_CACHE_FEWROW_CPU=auto is R = %d%s\n", cb[0]/wsum, cb[n_rows - 1]/wsum, up, fewrow_use,
-                    fewrow_use == 0 ? " (every miss uploads)" : "");
+                    fewrow_use == 0 ? " (every miss uploads; the zero slots per group stay allocated and idle)" : "");
         }
     }
 

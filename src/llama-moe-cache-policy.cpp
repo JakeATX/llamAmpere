@@ -403,15 +403,17 @@ void llama_moe_split_policy::on_ids(int32_t il, int64_t n_rows) {
                 to_cpu = false;
             } else if (m == 0) {
                 to_cpu = true;
-            } else if (ready()) {
+            } else if (route_ready()) {
                 to_cpu = cpu.predict(xc) >= gpu.predict(xg); // the branch that bounds this layer
             } else {
                 to_cpu = kc >= m;
             }
             if (to_cpu) {
+                n_real_cpu++;
                 cpu.add(xc, dt);
                 cpu.solve(true);
             } else {
+                n_real_gpu++;
                 gpu.add(xg, dt);
                 gpu.solve(false);
                 n_gpu_pcie += m > 0 ? 1 : 0;
