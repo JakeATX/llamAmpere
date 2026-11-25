@@ -149,7 +149,8 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_BACKEND_DL=OFF
+            -DGGML_BACKEND_DL=OFF ^
+            -DCMAKE_CXX_FLAGS=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
 
