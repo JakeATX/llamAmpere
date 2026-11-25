@@ -640,6 +640,14 @@ static void test(void) {
         assert(parse_card({"--preset", "24dense"}, large_env));
         common_card_preset_apply_env(large_env);
         assert(std::string(std::getenv("LLAMA_GDN_REPLAY_LANES")) == "1");
+        // the copy-first controller is a 24ink default only (the server reads it at model load, see server-context.cpp)
+        for (const auto & name : {"24ink", "24ink-headless", "12ink", "10ink", "8ink", "24dense"}) {
+            bool copyctl = false;
+            for (const auto & entry : common_card_preset_get(name).env) {
+                copyctl = copyctl || (entry.first == "LLAMA_RTB_COPYCTL" && entry.second == "1");
+            }
+            assert(copyctl == (std::string(name).rfind("24ink", 0) == 0));
+        }
         for (const auto & key : env_keys) {
             if (saved_env.count(key)) {
                 setenv(key.c_str(), saved_env.at(key).c_str(), 1);

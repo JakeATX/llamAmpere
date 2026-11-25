@@ -30,6 +30,7 @@
 #include "speculative-copy.h"
 #include "speculative-copy-ctl.h"
 #include "speculative-cost-depth.h"
+#include "preset.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "mtmd-internal.h"
@@ -2525,6 +2526,19 @@ private:
         return true;
     }
 
+    // LLAMA_RTB_COPYCTL: a set value wins (0 = kill switch). Unset, the card preset's value is applied here, before
+    // copy-first is resolved; the rest of the profile env lands later in common_init (24ink turns it on).
+    static bool server_rtb_copyctl(const common_params & params) {
+        if (std::getenv("LLAMA_RTB_COPYCTL") == nullptr && !params.card_preset.empty()) {
+            for (const auto & kv : common_card_preset_get(params.card_preset, params.card_preset_headless).env) {
+                if (kv.first == "LLAMA_RTB_COPYCTL") {
+                    common_set_env(kv.first, kv.second);
+                }
+            }
+        }
+        return rtb::env_on("LLAMA_RTB_COPYCTL");
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -2548,7 +2562,7 @@ private:
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
             // LLAMA_RTB_COPYCTL=1: the cost-model copy controller only copies when copying is measured to pay, so it
             // turns copy-first on by default (span cap LLAMA_RTB_COPYCTL_SPAN, 32) where auto would leave it off
-            const int32_t first_def = rtb::env_on("LLAMA_RTB_COPYCTL")
+            const int32_t first_def = server_rtb_copyctl(params)
                     ? (int32_t) rtb::env_num("LLAMA_RTB_COPYCTL_SPAN", 32, 1, common_speculative_copy_params::FIRST_MAX) : 0;
             params.speculative.copy_first = common_speculative_copy_params::resolve_first(
                     params.speculative.copy_first, dspark && params.n_parallel == 1, first_def);
