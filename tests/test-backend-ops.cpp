@@ -16182,6 +16182,70 @@ struct test_loop_gate : public test_case {
     }
 };
 
+// TURBO_WHT(Q, group 256), then the K and V SET_ROWS into SJ-KVaRN TQ6_0 caches (256-point write rotation), the order
+// of an Inkling full-attention visit (GGML_CUDA_FUSE_KVSTORE=1 runs the three in one launch); the rotated Q and both
+// caches are checked
+struct test_ink_kvstore : public test_case {
+    const int64_t nqg, T;
+    const ggml_type type_idx;
+    std::vector<ggml_tensor *> checked;
+    test_ink_kvstore(int64_t nqg, int64_t T, ggml_type type_idx) : nqg(nqg), T(T), type_idx(type_idx) {}
+    std::string op_desc(ggml_tensor *) override { return "INKKVSTORE"; }
+    std::string vars() override { return VARS_TO_STR3(nqg, T, type_idx); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+    bool dump_hash() override { return true; }
+    double max_nmse_err() override { return 0.005; } // as test_set_rows_tq6: the 6-bit round trip vs the CPU reference
+    const char * required_fusion() override {
+        const char * e = getenv("GGML_CUDA_FUSE_KVSTORE");
+        return e && atoi(e) != 0 ? "ink_kvstore" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 1024, rows = 16;
+        ggml_tensor * q  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, nqg*T);
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ6_0, D, rows);
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ6_0, D, rows);
+        ggml_tensor * k  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
+        ggml_tensor * v  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
+        ggml_tensor * ik = ggml_new_tensor_1d(ctx, type_idx, T);
+        ggml_tensor * iv = ggml_new_tensor_1d(ctx, type_idx, T);
+        ggml_set_name(iv, "iv");
+        ggml_set_name(v, "v");
+        ggml_tensor * qr = ggml_turbo_wht(ctx, q, 0, 256, nullptr);
+        ggml_build_forward_expand(gf, qr);
+        ggml_build_forward_expand(gf, ggml_set_rows_sj_kvarn_rot(ctx, kc, k, ik, 256));
+        ggml_build_forward_expand(gf, ggml_set_rows_sj_kvarn_rot(ctx, vc, v, iv, 256));
+        // the readers take the cache tensors, not the SET_ROWS results (as the model's attention does)
+        ggml_tensor * qo = ggml_scale(ctx, qr, 1.0f);
+        ggml_tensor * ko = ggml_cpy(ctx, kc, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, rows));
+        ggml_tensor * vo = ggml_cpy(ctx, vc, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, rows));
+        checked = { qo, ko, vo };
+        return ggml_add(ctx, ggml_add(ctx, ggml_sum(ctx, qo), ggml_sum(ctx, ko)), ggml_sum(ctx, vo));
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+                // fixed distinct rows (reproducible for GGML_TEST_SEED hashes); K and V get different ones
+                const int64_t off = strcmp(t->name, "iv") == 0 ? 7 : 0;
+                std::vector<int64_t> r64(t->ne[0]);
+                std::vector<int32_t> r32(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    r64[i] = (i*5 + off) % 16;
+                    r32[i] = (int32_t) r64[i];
+                }
+                ggml_backend_tensor_set(t, t->type == GGML_TYPE_I64 ? (const void *) r64.data() : (const void *) r32.data(), 0,
+                    ggml_nbytes(t));
+            } else {
+                const float r = strcmp(t->name, "v") == 0 ? 3.0f : 1.0f; // K and V differ under GGML_TEST_SEED
+                init_tensor_uniform(t, -r, r);
+            }
+        }
+    }
+};
+
 // GGML_OP_LSA_UNIT_LSE (LLAMA_LSA_UNIT_OP) vs CPU: random F16/F32 index keys with strided rows (d = 64: 16-byte rows,
 // vector loads; d = 60: scalar loads), causal F16 mask with empty cells (fully masked units give -inf on both).
 struct test_lsa_unit_lse : public test_case {
@@ -22862,6 +22926,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_loop_gate(100, 24, 2, GGML_TYPE_F32));
+    // GGML_CUDA_FUSE_KVSTORE: Q rotation and the K / V SJ-KVaRN stores in one launch (decode and verify widths, I64 / I32
+    // rows, a partial last Q block)
+    for (ggml_type type_idx : {GGML_TYPE_I64, GGML_TYPE_I32}) {
+        for (int64_t T : {1, 3, 8}) {
+            test_cases.emplace_back(new test_ink_kvstore(24, T, type_idx));
+        }
+    }
+    test_cases.emplace_back(new test_ink_kvstore(20, 1, GGML_TYPE_I64));
     // GGML_LSA_ULSE_COOP=1 lane-shared kernel: d 128/256 (16/32 lanes per cell), a partial last CTA, 1..8 rows (n_kv must divide by F)
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 5, 16, 128));
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 3, 1, 256));

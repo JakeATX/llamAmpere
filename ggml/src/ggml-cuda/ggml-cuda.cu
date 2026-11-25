@@ -79,6 +79,7 @@
 #include "ggml-cuda/fuse-relmerge.cuh"
 #include "ggml-cuda/fuse-routert.cuh"
 #include "ggml-cuda/fuse-kvconv.cuh"
+#include "ggml-cuda/fuse-kvstore.cuh"
 #include "ggml-cuda/inksituq.cuh"
 #include "ggml-cuda/nvfp4mt.cuh"
 #include "ggml-cuda/nk-nvfp4-tc.cuh"
@@ -14308,6 +14309,66 @@ static int ggml_cuda_try_fuse_kvconv(ggml_backend_cuda_context * ctx, ggml_cgrap
     return last2 - i;
 }
 
+// fused KVSTORE launches (process-wide; test-backend-ops reads them as "ink_kvstore")
+static std::atomic<int64_t> g_fuse_kvstore_count{0};
+
+// [FUSE KVSTORE] (fuse-kvstore.cuh, GGML_CUDA_FUSE_KVSTORE=1, default off): TURBO_WHT(Q, group 256), then the K and V
+// SET_ROWS into the SJ-KVaRN TQ6_0 cache (256-point write rotation) with only views between, in one launch; the rotated
+// Q stays an output
+static int ggml_cuda_try_fuse_kvstore(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * wht = cgraph->nodes[i];
+    if (!ggml_cuda_fuse_kvstore_on() || wht->op != GGML_OP_TURBO_WHT || !ggml_cuda_kvstore_wht_ok(wht)) {
+        return 0;
+    }
+    ggml_tensor * st[2] = { nullptr, nullptr };
+    int n_st = 0;
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 10 && n_st < 2; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_SET_ROWS) {
+            st[n_st++] = t;
+        } else if (!ggml_cuda_is_view_or_noop(t)) {
+            break;
+        }
+    }
+    if (n_st < 2) {
+        return 0;
+    }
+    for (int k = 0; k < 2; ++k) {
+        // a streamed KV cache: its SET_ROWS also maintain the mirror and the staged rows
+        if (!ggml_cuda_kvstore_store_ok(st[k]) || !(st[k]->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                ggml_cuda_kv_stream_runtime_from_tensor(st[k]) != nullptr) {
+            return 0;
+        }
+    }
+    if (!(wht->flags & GGML_TENSOR_FLAG_COMPUTE) || st[0]->src[1]->type != st[1]->src[1]->type ||
+            ink_base(st[0]) == ink_base(st[1])) {
+        return 0;
+    }
+    ggml_tensor * set[3] = { wht, st[0], st[1] };
+    const int last = ink_run_check(cgraph, i, set, 3, st[1], wht);
+    if (last < 0) {
+        return 0;
+    }
+    for (int k = 0; k < 2; ++k) {
+        if (ink_overlap(st[k], wht->src[0]) || ink_overlap(st[k], wht)) {
+            return 0;
+        }
+        for (int s = 0; s < 2; ++s) {
+            if (ink_overlap(wht, st[k]->src[s]) || ink_overlap(st[k], st[k]->src[s]) || ink_overlap(st[k], st[1 - k]->src[s])) {
+                return 0;
+            }
+        }
+    }
+    if (!ctx) {
+        return last - i;
+    }
+    if (!ggml_cuda_kvstore_launch(*ctx, wht, st[0], st[1])) {
+        return 0;
+    }
+    ++g_fuse_kvstore_count;
+    return last - i;
+}
+
 // [FUSE RELMERGE] (fuse-relmerge.cuh, default on; GGML_CUDA_FUSE_RELMERGE=0 = off): the far / near merge of an Inkling
 // full-attention visit (llama-graph.cpp inkrel_merge: [unpack CONCAT,] ADD(far LSE, table constant), CONCAT, FILL 0,
 // CONCAT, SOFT_MAX, CONT, MUL, CONT, MUL, ADD [, SIGMOID(gate), MUL]) as one launch; same values
@@ -14547,7 +14608,7 @@ static int ggml_cuda_try_fuse_inkglue(ggml_backend_cuda_context * ctx, ggml_cgra
             return n;
         }
     }
-    return 0;
+    return ggml_cuda_try_fuse_kvstore(ctx, cgraph, i);
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -18883,6 +18944,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "nk_pf_mm") == 0) {
         return ggml_cuda_nk_pf_mm_count();
+    }
+    if (strcmp(name, "ink_kvstore") == 0) {
+        return g_fuse_kvstore_count.load();
     }
     return -1;
 }
