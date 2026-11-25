@@ -15,6 +15,13 @@
 // The gate script scripts/defpath/defpath_gate.py reads the same JSON from this file (between the ARCHJSON markers)
 // and compares the default run with the best config row.
 //
+// fork DEFSYNC: this table is the ONE source of per-arch default settings. The 0.7.5 Inkling env defaults that sat in
+// llama_model_load (src/llama.cpp) are its Inkling row's apply_env now; the switches that are default-ON in code are
+// listed in env_on so the report shows them. Frontends that load or fit a model without common_init (llama-bench,
+// batched-bench, llama-fit-params) call common_arch_defaults_apply() themselves, so they get the whole row (on a
+// 24 GB card with Inkling that includes LLAMA_LEAN_PROMPT=0, as in the server). A program that links libllama alone
+// (examples, bindings, tests) gets the engine defaults: every apply_env value unset.
+//
 // Kill switches: LLAMA_ARCH_DEFAULTS=0 (table applies nothing: no env, no auto drafter, no table ub ceiling),
 // LLAMA_ENGAGED_REPORT=0 (no report block). LLAMA_UBDEFAULT=0 is UBDEFAULT's own switch (see llama-context.cpp).
 

@@ -1,5 +1,6 @@
 #include "llama.h"
 
+#include "arch-defaults.h"
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
@@ -25,6 +26,10 @@ int llama_fit_params(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // fork DEFSYNC: the arch defaults table's env values before the fit (they change the graph: LLAMA_INKFA_RELF, ...),
+    // so the fit here matches the fit inside common_init
+    common_arch_defaults_apply(params);
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);

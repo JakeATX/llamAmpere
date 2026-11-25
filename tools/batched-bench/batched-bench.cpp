@@ -1,3 +1,4 @@
+#include "arch-defaults.h"
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -44,6 +45,9 @@ int llama_batched_bench(int argc, char ** argv) {
     // initialize the model
 
     llama_model_params model_params = common_model_params_to_llama(params);
+
+    // fork DEFSYNC: the arch defaults table's env values before the model load (common_init does this elsewhere)
+    common_arch_defaults_apply(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
 

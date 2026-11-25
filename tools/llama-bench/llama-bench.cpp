@@ -20,6 +20,7 @@
 #include <vector>
 #include <unordered_set>
 
+#include "arch-defaults.h"
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
@@ -2648,6 +2649,13 @@ int llama_bench(int argc, char ** argv) {
     auto params_count = params_instances.size();
     for (const auto & inst : params_instances) {
         params_idx++;
+        {
+            // fork DEFSYNC: the arch defaults table (common/arch-defaults.cpp) sets its env values before the first
+            // model load, as common_init does for the server and the CLIs; process-wide, so the first model decides
+            common_params dp;
+            dp.model.path = inst.model;
+            common_arch_defaults_apply(dp);
+        }
         if (params.progress) {
             fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
         }

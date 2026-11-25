@@ -31,7 +31,7 @@ using json = nlohmann::ordered_json;
 //   best            best config per card class for the gate: preset + extra args/env, the evidence and the file
 static const char * k_arch_defaults_json = R"ARCHJSON(
 {
-  "version": "2026-11-24.1",
+  "version": "2026-11-24.2",
   "protocol": {"chat": true, "temp": 1.0, "npred": 5120, "fill": 100000, "seeds": 6, "order": "ABBA",
                "fail_if_default_slower_pct": 1.0},
   "rows": [
@@ -57,13 +57,27 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
         {"env": "LLAMA_DSPARK_MASK_GPU",     "off": "0", "why": "DSpark mask on the GPU"},
         {"env": "LLAMA_INK_KV44",            "off": "0", "why": "4/4 KV default for Inkling"},
         {"env": "LLAMA_INK_CACHE_LOAN",      "off": "0", "why": "small cards: CACHELOAN +30% decode 10ink"},
-        {"env": "LLAMA_DSPARK_MB_DEPTH",     "off": "0", "why": "mb DSpark fixed depth 4 (INKSPEC2)"}
+        {"env": "LLAMA_DSPARK_MB_DEPTH",     "off": "0", "why": "mb DSpark fixed depth 4 (INKSPEC2)"},
+        {"env": "GGML_CUDA_NK_PF_MM",        "off": "0", "why": "NVFP4 MoE prefill GEMM (NEONKERN: HOME 100K ABBA prefill +10.2%, byte-exact)"},
+        {"env": "GGML_CUDA_NK_Q8_0_TC",      "off": "0", "why": "Q8_0 MoE tensor-core path (NEONKERN: 100K ABBA -2.77% ms/round, E21 |dKLD| <= 1e-6)"},
+        {"env": "GGML_CUDA_NK_DSPARK_HEAD",  "off": "0", "why": "DSpark head kernel (NEONKERN: 100K ABBA -1.36% ms/round, identical)"},
+        {"env": "GGML_CUDA_DSPARK_HEAD",     "off": "0", "why": "DSpark head fusion"},
+        {"env": "GGML_CUDA_PREFILL_FUSE_GLU_ACTQ",  "off": "0", "why": "prefill glue: GLU + activation quant fused (0.7.5)"},
+        {"env": "GGML_CUDA_PREFILL_FUSE_NORM_ACTQ", "off": "0", "why": "prefill glue: norm + activation quant fused (0.7.5)"},
+        {"env": "GGML_CUDA_FUSE_RELMERGE",   "off": "0", "why": "FUSE4: HOME 3090 Ti 100K ABBA x6 +0.87% decode (all four), byte-identical"},
+        {"env": "GGML_CUDA_FUSE_KVCONV",     "off": "0", "why": "FUSE4"},
+        {"env": "GGML_CUDA_FUSE_MIXNORMV",   "off": "0", "why": "FUSE4"},
+        {"env": "GGML_CUDA_FUSE_QKVNORM",    "off": "0", "why": "FUSE4"}
       ],
-      "apply_env": [],
+      "apply_env": [
+        {"env": "LLAMA_NK_DEV_MASK",    "value": "1",    "why": "device-side DSpark / SJ-KVaRN far masks (0.7.5 Inkling default)"},
+        {"env": "LLAMA_NK_KV_PAD",      "value": "4096", "why": "coarser deep-context n_kv padding step (0.7.5 Inkling default)"},
+        {"env": "GGML_CUDA_Q8TC",       "value": "2",    "why": "tensor-core dense Q8_0 matvec T=4..8, hi/lo activations; REL075 E21 ub5 dKLD -4.4e-5 (mode 1 +1.05e-4 fails: opt-in)"},
+        {"env": "GGML_CUDA_INKGQA_FAR", "value": "1",    "why": "GQA far-attention prefill kernel (SURGE-FA, 0.7.5 default)"},
+        {"env": "GGML_CUDA_INKGQA_SWA", "value": "1",    "why": "same kernel family on the SWA layers (with FAR+RELF +34.5% 100K prefill; E21 = FAR+RELF)"},
+        {"env": "LLAMA_INKFA_RELF",     "value": "1",    "why": "relative-bias factor form, no [n_head, extent, T] table (0.7.5 default)"}
+      ],
       "watch": [
-        {"env": "GGML_CUDA_INKGQA_FAR",       "why": "SURGE-FA: +24% 100K prefill, ABBA gate pending"},
-        {"env": "GGML_CUDA_INKGQA_SWA",       "why": "SURGE-FA: with FAR+RELF +34.5% 100K prefill, gate pending"},
-        {"env": "LLAMA_INKFA_RELF",           "why": "SURGE-FA: in-kernel rel bias, gate pending"},
         {"env": "LLAMA_DSPARK_DRAFT_SJKVARN", "why": "measured slower (-3.0% at 100K): keep off"},
         {"env": "LLAMA_HEAD2",                "why": "SURGE-HEAD: not a speedup on Inkling: keep off"},
         {"env": "LLAMA_ELASTIC_KV",           "why": "SURGE-cache: elastic KV, gate pending"}
@@ -83,13 +97,13 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
       "lean_prompt": {"24g": "auto", "small": "auto", "why": "dense: the MoE-only rule never fires"},
       "kv": {"type_k": "sjkvarn4", "type_v": "sjkvarn4", "why": "24dense preset"},
       "spec": null,
-      "spec_note": "built-in MTP head: spec-defaults.cpp row qwen35 (draft-mtp-adaptive); draft KV left to the resolver on purpose (DSJ + RM24H need unset -ctkd/-ctvd; 11-19 loss came from overriding them)",
+      "spec_note": "built-in MTP head: spec-defaults.cpp row qwen35 (draft-mtp-adaptive); draft KV left to the resolver on purpose (DSJ + RM24H need unset -ctkd/-ctvd; 11-19 loss came from overriding them); a prompt with images runs that request without the drafter (M-RoPE gap, 0.7.5 server fix)",
       "parallel": 1,
-      "env_on": [
-        {"env": "GGML_SJKVARN_TILE_SKIP", "off": "0", "why": "SJ-KVaRN tile skip"}
-      ],
+      "env_on": [],
       "apply_env": [],
-      "watch": [],
+      "watch": [
+        {"env": "GGML_SJKVARN_TILE_SKIP", "why": "SJ-KVaRN tile skip: off in code; the small-card LSA presets set =1 (common/preset.cpp)"}
+      ],
       "best": {
         "24g":   {"preset": "24dense", "args": "", "env": "", "file": "P76",
                   "evidence": "REL07x speed gates, P76 24dense one slot (ub 2048, adaptive 3..7, DSJ + RM24H)"},
@@ -304,7 +318,7 @@ void common_arch_defaults_report(const common_params & params, const llama_model
     const bool table_on = common_arch_defaults_enabled();
     std::vector<std::string> lines;
     std::vector<std::string> differ;
-    // state: ON / OFF / OVERRIDE / N/A
+    // state: ON / OFF / OVERRIDE / N/A / MISMATCH (a table name set at runtime by code other than the table)
     auto add = [&](const char * state, const std::string & lever, const std::string & value, const std::string & why) {
         lines.push_back(string_format("  [%-8s] %-26s %-28s %s", state, lever.c_str(), value.c_str(), why.c_str()));
     };
@@ -423,9 +437,18 @@ void common_arch_defaults_report(const common_params & params, const llama_model
     }
     // engine switches and gated flags
     if (row) {
+        // fork DEFSYNC: a value that some code other than this table set at runtime ("engine") is a second, hidden
+        // source of defaults (the 11-19 trap, and the 0.7.5 llama_model_load stopgap): the row's status disagrees with
+        // the runtime default, so it prints MISMATCH and counts as a differing lever
+        auto mismatch = [&](const std::string & name, const char * listed) {
+            add("MISMATCH", name, getenv(name.c_str()), string_format("listed as %s here, but set at runtime by other code (a hidden "
+                "default): move the value into this row's apply_env and drop the other setter", listed));
+            differ.push_back("status " + name);
+        };
         for (const auto & e : (*row)["env_on"]) {
             const std::string name = e["env"].get<std::string>();
             const char * v = getenv(name.c_str());
+            if (v && src_env(name) == "engine") { mismatch(name, "default-ON in code"); continue; }
             const bool killed = v && e.value("off", "0") == v;
             add(killed ? "OFF" : "ON", name, v ? v : "unset", (killed ? "kill switch set (" + src_env(name) + "); " : "") + e.value("why", ""));
             if (killed) differ.push_back(name);
@@ -433,13 +456,18 @@ void common_arch_defaults_report(const common_params & params, const llama_model
         for (const auto & e : (*row)["apply_env"]) {
             const std::string name = e["env"].get<std::string>();
             const char * v = getenv(name.c_str());
-            add(v && e.value("value", "") == v ? "ON" : "OVERRIDE", name, v ? v : "unset", src_env(name) + "; " + e.value("why", ""));
+            if (v && src_env(name) == "engine") { mismatch(name, "a table value"); continue; }
+            const bool same = v && e.value("value", "") == v;
+            add(same ? "ON" : "OVERRIDE", name, v ? v : "unset",
+                src_env(name) + "; " + (same ? "" : "best " + e.value("value", "") + "; ") + e.value("why", ""));
+            if (!same) differ.push_back(name);
         }
         for (const auto & e : (*row)["watch"]) {
             const std::string name = e["env"].get<std::string>();
             const char * v = getenv(name.c_str());
             const bool on = v && v[0] && strcmp(v, "0") != 0;
-            add(on ? "ON" : "OFF", name, v ? v : "unset", std::string(on ? "set before boot; " : "gated, default off; ") + e.value("why", ""));
+            if (v && src_env(name) == "engine") { mismatch(name, "gated, default off"); continue; }
+            add(on ? "ON" : "OFF", name, v ? v : "unset", std::string(on ? src_env(name) + "; " : "gated, default off; ") + e.value("why", ""));
         }
     }
 
