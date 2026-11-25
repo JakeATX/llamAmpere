@@ -6235,6 +6235,13 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_F8_E4M3:
+        case GGML_TYPE_EXL3_2:
+        case GGML_TYPE_EXL3_3:
+        case GGML_TYPE_EXL3_4:
+        case GGML_TYPE_EXL3_5:
+        case GGML_TYPE_EXL3_6:
+        case GGML_TYPE_EXL3_7:
+        case GGML_TYPE_EXL3_8:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
