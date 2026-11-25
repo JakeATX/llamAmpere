@@ -4753,6 +4753,45 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() {
 static constexpr int64_t SJ_KVARN_ROWSPLIT_CHUNK = 8;
 static constexpr int64_t SJ_KVARN_ROWSPLIT_MAX   = 16; // 3090 Ti verify ON/OFF: 9 rows 0.85, 12 rows 0.89, 16 rows 0.96; 10, 11, 13..15 untested
 
+// [POSTREV4] GGML_SJKVARN_MU_SPLIT=1 (default off): a 4/4 node with a row-group hint (ggml_flash_attn_ext_set_row_groups,
+// set by the graph for unified-KV multi-user ubatches) of 9..32 rows runs one decode launch per sequence (a sequence
+// longer than 8 rows: chunks of 8), each with the live-record walk, so a user's launch reads only the records its rows
+// can see. Without the hint, or with the flag unset, the plain ROWSPLIT chunks (9..16 rows, chunks of 8) are unchanged.
+static constexpr int64_t SJ_KVARN_MU_SPLIT_MAX = 32;
+
+static bool ggml_cuda_fattn_sj_kvarn_mu_split_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_MU_SPLIT");
+        return e != nullptr && *e != 0 && atoi(e) != 0;
+    }();
+    return v;
+}
+
+// the row chunks of a split node as (r0, nr) pairs: per sequence when the hint is used, else fixed chunks of 8
+static int ggml_cuda_fattn_sj_kvarn_rowsplit_chunks(const ggml_tensor * dst, int64_t n_q, int64_t (*ch)[2], bool & mu) {
+    const uint32_t groups = ggml_cuda_fattn_sj_kvarn_mu_split_enabled() ? ggml_flash_attn_ext_get_row_groups(dst) : 0u;
+    mu = groups != 0 && n_q <= SJ_KVARN_MU_SPLIT_MAX;
+    int n = 0;
+    if (!mu) {
+        for (int64_t r0 = 0; r0 < n_q; r0 += SJ_KVARN_ROWSPLIT_CHUNK) {
+            ch[n][0] = r0;
+            ch[n][1] = std::min(SJ_KVARN_ROWSPLIT_CHUNK, n_q - r0);
+            ++n;
+        }
+        return n;
+    }
+    int64_t r0 = 0;
+    for (int64_t r = 1; r <= n_q; ++r) {
+        if (r == n_q || (groups >> r) & 1u || r - r0 == SJ_KVARN_ROWSPLIT_CHUNK) {
+            ch[n][0] = r0;
+            ch[n][1] = r - r0;
+            ++n;
+            r0 = r;
+        }
+    }
+    return n;
+}
+
 // rows [r0, r0 + nr) of a flash_attn_ext node: d (with d.src[0] = &q, d.src[3] = &m) writes dst rows r0.. in place
 static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, const ggml_tensor * mask, int64_t r0, int64_t nr,
         ggml_tensor & d, ggml_tensor & q, ggml_tensor & m) {
@@ -4788,7 +4827,9 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * mask = dst->src[3];
     const int64_t n_q = Q->ne[1];
-    if (n_q <= SJ_KVARN_ROWSPLIT_CHUNK || n_q > SJ_KVARN_ROWSPLIT_MAX || mask == nullptr || mask->ne[1] < n_q ||
+    const int64_t n_q_max = ggml_cuda_fattn_sj_kvarn_mu_split_enabled() && ggml_flash_attn_ext_get_row_groups(dst) != 0 ?
+        SJ_KVARN_MU_SPLIT_MAX : SJ_KVARN_ROWSPLIT_MAX;
+    if (n_q <= SJ_KVARN_ROWSPLIT_CHUNK || n_q > n_q_max || mask == nullptr || mask->ne[1] < n_q ||
             Q->ne[3] != 1 || dst->ne[3] != 1 || dst->ne[2] != n_q || mask->ne[2] != 1 || mask->ne[3] != 1 ||
             ggml_get_op_params_i32(dst, 6) % FATTN_KQ_STRIDE != 0 || Q->nb[1] % 16 != 0) {
         // the last two: the decode kernel contract that ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2 asserts
@@ -4801,9 +4842,12 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
     } else if (mask->type != GGML_TYPE_F16) {
         return false;
     }
-    for (int64_t r0 = 0; r0 < n_q; r0 += SJ_KVARN_ROWSPLIT_CHUNK) {
+    int64_t ch[SJ_KVARN_MU_SPLIT_MAX][2];
+    bool mu = false;
+    const int n_ch = ggml_cuda_fattn_sj_kvarn_rowsplit_chunks(dst, n_q, ch, mu);
+    for (int c = 0; c < n_ch; ++c) {
         ggml_tensor d, q, m;
-        ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, mask, r0, std::min(SJ_KVARN_ROWSPLIT_CHUNK, n_q - r0), d, q, m);
+        ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, mask, ch[c][0], ch[c][1], d, q, m);
         if (!ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(&d)) {
             return false;
         }
@@ -4820,11 +4864,23 @@ static void ggml_cuda_fattn_sj_kvarn_rowsplit_run(ggml_backend_cuda_context & ct
         GGML_LOG_WARN("%s: GGML_SJKVARN_ROWSPLIT=1: SJ-KVaRN 4/4 row split on (%d query rows in chunks of %d)\n",
                 __func__, (int) n_q, (int) SJ_KVARN_ROWSPLIT_CHUNK);
     }
-    for (int64_t r0 = 0; r0 < n_q; r0 += SJ_KVARN_ROWSPLIT_CHUNK) {
+    int64_t ch[SJ_KVARN_MU_SPLIT_MAX][2];
+    bool mu = false;
+    const int n_ch = ggml_cuda_fattn_sj_kvarn_rowsplit_chunks(dst, n_q, ch, mu);
+    if (mu) {
+        static std::atomic<uint32_t> logged_mu{0};
+        if (!(logged_mu.fetch_or(bit) & bit)) {
+            GGML_LOG_WARN("%s: GGML_SJKVARN_MU_SPLIT=1: SJ-KVaRN 4/4 per-user split (%d query rows in %d launches, live records)\n",
+                    __func__, (int) n_q, n_ch);
+        }
+    }
+    ggml_cuda_fattn_sj_live_force = mu; // [POSTREV4] each user's launch walks only the records its rows see
+    for (int c = 0; c < n_ch; ++c) {
         ggml_tensor d, q, m;
-        ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, dst->src[3], r0, std::min(SJ_KVARN_ROWSPLIT_CHUNK, n_q - r0), d, q, m);
+        ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, dst->src[3], ch[c][0], ch[c][1], d, q, m);
         ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, &d);
     }
+    ggml_cuda_fattn_sj_live_force = false;
 }
 
 // [DSPINE4 VERIFY16] a 9..16-row 4/4 node the row split would take, served instead in one pass by the compact16 tile

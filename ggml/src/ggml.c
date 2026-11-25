@@ -6518,6 +6518,19 @@ struct ggml_tensor * ggml_flash_attn_ext_get_lsa_spec_recall(const struct ggml_t
     return a->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(a, 14) == 1 ? a->src[8] : NULL;
 }
 
+// op_params[12]: free on FA nodes (11 = LSA VK bias, 13 = INK SJ D128, 14/15 = INKREL / INKSJ markers and LSA recall)
+#define GGML_FA_ROW_GROUPS_PARAM 12
+
+void ggml_flash_attn_ext_set_row_groups(struct ggml_tensor * a, uint32_t groups) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(groups == 0 || ((groups & 1u) && a->src[0]->ne[1] <= 32));
+    ggml_set_op_params_i32(a, GGML_FA_ROW_GROUPS_PARAM, (int32_t) groups);
+}
+
+uint32_t ggml_flash_attn_ext_get_row_groups(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT ? (uint32_t) ggml_get_op_params_i32(a, GGML_FA_ROW_GROUPS_PARAM) : 0u;
+}
+
 #define GGML_SJKVARN_ROT_PARAM 8
 
 void ggml_flash_attn_ext_set_sj_kvarn_rot(struct ggml_tensor * a, int32_t group) {

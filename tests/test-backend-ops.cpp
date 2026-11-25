@@ -14774,7 +14774,8 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring - 37*(n_streams() - 1) >= n_q);
         GGML_ASSERT(ns == 0 || rot != 2);
-        GGML_ASSERT(mask_mode >= 0 && mask_mode <= 10);
+        GGML_ASSERT(mask_mode >= 0 && mask_mode <= 11);
+        GGML_ASSERT(mask_mode != 11 || (ns == 0 && n_q > 8 && n_q <= 32)); // [POSTREV4] 4 users in one unified cache
         GGML_ASSERT(mask_mode != 7 || (ns == 0 && compact_bound == 0));
         GGML_ASSERT(mask_mode != 10 || (ns == 0 && compact_bound == 0 && !row_mask));
         GGML_ASSERT(mask_mode != 9 || (ns == 0 && compact_bound == 0 && rot != 2 && !row_mask));
@@ -14855,6 +14856,13 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 ggml_flash_attn_ext_set_sj_kvarn(o, body, desc, bits_k, bits_v, (int32_t) n_kv_pad());
                 ggml_flash_attn_ext_set_n_kv_max(o, compact_bound);
                 ggml_prec_set_acc(o, GGML_PREC_F32);
+                if (mask_mode == 11) {
+                    uint32_t groups = 1u; // [POSTREV4] row-group hint: a new user starts where j*4/n_q changes
+                    for (int64_t j = 1; j < n_q; ++j) {
+                        groups |= (j*4/n_q != (j - 1)*4/n_q) ? 1u << j : 0u;
+                    }
+                    ggml_flash_attn_ext_set_row_groups(o, groups);
+                }
                 if (inksj) {
                     ggml_flash_attn_ext_set_inksj(o);
                 }
@@ -15012,7 +15020,10 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                             if (mask_mode == 10 && value == 0.0f) {
                                 value = -0.03f*float((7*p + 13*hm + j) % 29); // per-q-head relative bias
                             }
-                            if (mask_mode != 0 && mask_mode != 10 && p >= S && p < B()) {
+                            if (mask_mode == 11 && p >= S && p < B() && ((p - S)/G) % 4 != j*4/n_q) {
+                                value = -INFINITY; // [POSTREV4] user j*4/n_q owns every 4th record
+                            }
+                            if (mask_mode != 0 && mask_mode != 10 && mask_mode != 11 && p >= S && p < B()) {
                                 const int64_t body_pos = p - S;
                                 const int64_t within = body_pos % 512;
                                 const bool live = (mask_mode == 2 && (body_pos < 4 ||
@@ -23659,6 +23670,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                                  GGML_TYPE_F32, 4, 4, 2));
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12, 16, 4, 2, 200)); // GQA 4, 12 rows
+    // [POSTREV4] unified-KV 4-user verify widths with the row-group hint (GGML_SJKVARN_MU_SPLIT=1 splits per user)
+    for (int64_t n_q : {10, 12, 16, 20, 24, 32}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 12, 600, false, false, GGML_TYPE_F16, 128, false,
+                                                                 GGML_TYPE_F32, 4, 4, 0, 0, 11));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 12, 600, true, false, GGML_TYPE_F16, 128, false,
+                                                                 GGML_TYPE_F32, 4, 4, 1, 0, 11));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12,  4, 4, 2, 200)); // GQA 1, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 16, 4,  2,  200)); // GQA 4
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(2,  4, 4,  2,  200)); // GQA 1

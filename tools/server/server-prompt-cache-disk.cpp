@@ -546,11 +546,18 @@ std::vector<const common_prompt_checkpoint *> server_prompt_keep_checkpoints(
     std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return all[a]->pos_max > all[b]->pos_max; });
     std::vector<bool> keep(all.size(), false);
     int64_t last_dist = 0;
+    // [CKPTDYN] LLAMA_SERVER_CKPT_BRANCH: message-boundary checkpoints are kept on top of the doubling grid
+    static const bool keep_branch = [] {
+        const char * e = getenv("LLAMA_SERVER_CKPT_BRANCH");
+        return e != nullptr && *e != '\0' && strcmp(e, "0") != 0;
+    }();
     for (size_t r = 0; r < idx.size(); ++r) {
         const int64_t dist = std::max<int64_t>(1, (int64_t) n_tokens - (int64_t) all[idx[r]]->pos_max);
         if (r < ckpt_keep || dist >= 2 * last_dist) {
             keep[idx[r]] = true;
             last_dist    = dist;
+        } else if (keep_branch && all[idx[r]]->branch) {
+            keep[idx[r]] = true;
         }
     }
     std::vector<const common_prompt_checkpoint *> out;

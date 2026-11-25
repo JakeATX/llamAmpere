@@ -1861,6 +1861,8 @@ inline thread_local const int * ggml_cuda_fattn_kv_max_override = nullptr;
 // fork: SJ-KVaRN live-record list ([0] = count, then the live body record ids in order) for the stream decode kernel,
 // passed in its KV_max slot; set around the launch by the opt-in record skip (GGML_SJKVARN_LIVE_RECORDS=1).
 inline thread_local const int * ggml_cuda_fattn_sj_live_records = nullptr;
+// [POSTREV4] set around the per-user launches of GGML_SJKVARN_MU_SPLIT: the 4/4 stream launcher takes the live-record walk
+inline thread_local bool ggml_cuda_fattn_sj_live_force = false;
 
 #ifndef GGML_CUDA_FA_BMERGE_HELPER
 #define GGML_CUDA_FA_BMERGE_HELPER

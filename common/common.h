@@ -1605,6 +1605,9 @@ struct common_prompt_checkpoint {
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
+    // [CKPTDYN] made at a message boundary (LLAMA_SERVER_CKPT_BRANCH): eviction and RAM thinning keep these first
+    bool branch = false;
+
     llama_pos pos_min;
     llama_pos pos_max;
 

@@ -345,7 +345,12 @@ static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
 // 5 -> 4, 6 -> 5, 7 and 8 -> 6. Every column keeps its own Q, mask row, online softmax and output; the KV split partition
 // is the host's choice (mode 1: forced to the rows kernel's), so the result is bit-identical to the rows kernel while the
 // block issues fewer MMA rows per strip. Instances: max_warps 3 (width 4), 4 (width 5), 5 (width 6), 6 (widths 7, 8).
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
+// i8qk ([#237], GGML_SJKVARN_STREAM_I8QK=1, rows tile, 4/4 bodies only): the body strips' QK runs on int8 MMA
+// (m16n8k32 s8, int32 accumulation) instead of f16 MMA with fp32 accumulation. The K codes (0..15) are the A operand
+// as they are (two LOPs per word); Q' = Qs*Kscale is quantized per record to int8 with one scale per head column and
+// 128-channel half (symmetric, round to nearest). c_r, Ktok, mask, softmax, PV and the exact rows are unchanged.
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows,
+          bool i8qk = false>
 __launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 || max_warps == 6 || (max_warps == 3 && tile != sj_kvarn_tile::rows) ? 2 : 1)
 static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char * __restrict__ Q,
@@ -487,7 +492,10 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const uint32_t magic = 0x64006400U;
     const float centroid = turbo4_body ? TURBO_CENTROIDS_4BIT[lane & 15] : 0.0f;
 
+    static_assert(!i8qk || (!turbo4_body && tile == sj_kvarn_tile::rows && NTC % 4 == 0), "i8qk: 4/4 rows tile only");
     T_B   qp[NTC];   // Q' B fragments for the current record
+    int   qi[i8qk ? NTC : 1];         // [#237] int8 Q' B words (channels 2(lane%4), +8, +1, +9 of each tile)
+    float qsc[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}}; // [#237] [channel half][C column e] dequant scales
     float c_r[2] = {0.0f, 0.0f};
     T_C   acc[NTC];  // O, fp32, unnormalized, in units of the current record's Vch*s (zero-initialized by the tile ctor)
     float kq_max[2] = {-FLT_MAX/2, -FLT_MAX/2};
@@ -512,6 +520,56 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         const uint2 * ks2 = (const uint2 *) (rm            + 2*(lane & 3)*(D/4));
         const uint2 * kz2 = (const uint2 *) (rm + RMETA_KZ + 2*(lane & 3)*(D/4));
         float cr = 0.0f;
+        if constexpr (i8qk) {
+            // [#237] pass 1: c_r and the per-half max |Q'| of the lane's column; pass 2: quantize
+            float am[2] = {0.0f, 0.0f};
+#pragma unroll
+            for (int c = 0; c < NTC; ++c) {
+                const uint2 ks = ks2[c];
+                const uint2 kz = kz2[c];
+                float2 q0, q1;
+                load_q(c, q0, q1);
+                const float2 ks0 = __half22float2(fattn_sj_kvarn_u32_as_half2(ks.x));
+                const float2 ks1 = __half22float2(fattn_sj_kvarn_u32_as_half2(ks.y));
+                const float2 kz0 = __half22float2(fattn_sj_kvarn_u32_as_half2(kz.x));
+                const float2 kz1 = __half22float2(fattn_sj_kvarn_u32_as_half2(kz.y));
+                const int h = c < NTC/2 ? 0 : 1;
+                am[h] = fmaxf(am[h], fmaxf(fmaxf(fabsf(q0.x*ks0.x), fabsf(q0.y*ks0.y)), fmaxf(fabsf(q1.x*ks1.x), fabsf(q1.y*ks1.y))));
+                cr += q0.x*kz0.x + q0.y*kz0.y + q1.x*kz1.x + q1.y*kz1.y;
+            }
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                am[h] = fmaxf(am[h], __shfl_xor_sync(0xFFFFFFFF, am[h], 1, WARP_SIZE));
+                am[h] = fmaxf(am[h], __shfl_xor_sync(0xFFFFFFFF, am[h], 2, WARP_SIZE));
+            }
+            const float inv[2] = { am[0] > 0.0f ? 127.0f/am[0] : 0.0f, am[1] > 0.0f ? 127.0f/am[1] : 0.0f };
+#pragma unroll
+            for (int c = 0; c < NTC; ++c) {
+                const uint2 ks = ks2[c];
+                float2 q0, q1;
+                load_q(c, q0, q1);
+                const float2 ks0 = __half22float2(fattn_sj_kvarn_u32_as_half2(ks.x));
+                const float2 ks1 = __half22float2(fattn_sj_kvarn_u32_as_half2(ks.y));
+                const float iv = inv[c < NTC/2 ? 0 : 1];
+                const int v0 = __float2int_rn(q0.x*ks0.x*iv); // channel 2(lane%4)      (A byte 0: nibble 0)
+                const int v1 = __float2int_rn(q1.x*ks1.x*iv); // channel 2(lane%4) + 8  (A byte 1: nibble 2)
+                const int v2 = __float2int_rn(q0.y*ks0.y*iv); // channel 2(lane%4) + 1  (A byte 2: nibble 4)
+                const int v3 = __float2int_rn(q1.y*ks1.y*iv); // channel 2(lane%4) + 9  (A byte 3: nibble 6)
+                qi[c] = (int) ((uint32_t) (v0 & 0xFF) | ((uint32_t) (v1 & 0xFF) << 8) | ((uint32_t) (v2 & 0xFF) << 16) |
+                               ((uint32_t) (v3 & 0xFF) << 24));
+            }
+            cr += __shfl_xor_sync(0xFFFFFFFF, cr, 1, WARP_SIZE);
+            cr += __shfl_xor_sync(0xFFFFFFFF, cr, 2, WARP_SIZE);
+            c_r[0] = __shfl_sync(0xFFFFFFFF, cr, 8*(lane & 3),     WARP_SIZE);
+            c_r[1] = __shfl_sync(0xFFFFFFFF, cr, 8*(lane & 3) + 4, WARP_SIZE);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const float sc = am[h]*(1.0f/127.0f);
+                qsc[h][0] = __shfl_sync(0xFFFFFFFF, sc, 8*(lane & 3),     WARP_SIZE);
+                qsc[h][1] = __shfl_sync(0xFFFFFFFF, sc, 8*(lane & 3) + 4, WARP_SIZE);
+            }
+            return;
+        }
 #pragma unroll
         for (int c = 0; c < NTC; ++c) {
             const uint2 ks = ks2[c];
@@ -868,7 +926,29 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
             const uint32_t * vwp = (const uint32_t *) (st + STRIP_BYTES) + lane;
 
             // KQ = Ktok[t] * (q . Q' + c_r) + mask
-            if constexpr (kqx == 3) {
+            if constexpr (i8qk) {
+                // [#237] K codes straight into the s8 A operand: tile c gives a0 (rows lane/4) and a1 (rows +8), tile c + 1
+                // gives a2, a3 (k 16..31); the B words hold Q' in the same channel order
+                ggml_cuda_mma::tile<16, 8, int> ci[2];
+#pragma unroll
+                for (int c = 0; c < NTC; c += 2) {
+                    const uint32_t w0 = kwp[c*WARP_SIZE];
+                    const uint32_t w1 = kwp[(c + 1)*WARP_SIZE];
+                    ggml_cuda_mma::tile<16, 8, int> a;
+                    a.x[0] = (int) (w0 & 0x0F0F0F0FU);
+                    a.x[1] = (int) ((w0 >> 4) & 0x0F0F0F0FU);
+                    a.x[2] = (int) (w1 & 0x0F0F0F0FU);
+                    a.x[3] = (int) ((w1 >> 4) & 0x0F0F0F0FU);
+                    ggml_cuda_mma::tile<8, 8, int> b;
+                    b.x[0] = qi[c];
+                    b.x[1] = qi[c + 1];
+                    mma(ci[c < NTC/2 ? 0 : 1], a, b);
+                }
+                kq.x[0] = (float) ci[0].x[0]*qsc[0][0] + (float) ci[1].x[0]*qsc[1][0];
+                kq.x[1] = (float) ci[0].x[1]*qsc[0][1] + (float) ci[1].x[1]*qsc[1][1];
+                kq.x[2] = (float) ci[0].x[2]*qsc[0][0] + (float) ci[1].x[2]*qsc[1][0];
+                kq.x[3] = (float) ci[0].x[3]*qsc[0][1] + (float) ci[1].x[3]*qsc[1][1];
+            } else if constexpr (kqx == 3) {
                 T_CH kqh; // [DSPINE4 KQX] fp16-accumulating chain on centred codes
 #pragma unroll
                 for (int c = 0; c < NTC; ++c) {
@@ -1340,10 +1420,11 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 } // namespace fattn_sj_kvarn_stream
 
 // Each query warp shares a packed-data ring with the other query warps in its KV split.
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows,
+          bool i8qk = false>
 static fattn_kernel_t ggml_cuda_fattn_sj_kvarn_stream_kernel() {
     using namespace fattn_sj_kvarn_stream;
-    fattn_kernel_t kernel = flash_attn_ext_sj_kvarn_stream<max_warps, NSTAGE, turbo4_body, rot, lsa, tile>;
+    fattn_kernel_t kernel = flash_attn_ext_sj_kvarn_stream<max_warps, NSTAGE, turbo4_body, rot, lsa, tile, i8qk>;
     const int id = ggml_cuda_get_device();
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {false};
     if (!initialized[id]) {
@@ -1374,6 +1455,18 @@ static int ggml_cuda_fattn_sj_kvarn_stream_occupancy(const int NT, const int KW)
 
 static bool ggml_cuda_fattn_sj_nt6_logged = false; // GGML_SJKVARN_NT6_OCC log, one line per process
 
+// [#237] GGML_SJKVARN_STREAM_I8QK=1 (default off): the rows-tile 4/4 instances with ring depth 4 or 6 take the int8-QK
+// body (instances in template-instances/fattn-sjkvarn-stream-i8qk-instance.cu; nullptr = no such instance)
+fattn_kernel_t ggml_cuda_fattn_sj_kvarn_stream_i8qk_kernel(int max_warps, int nstage, bool rot, bool lsa);
+
+static bool ggml_cuda_fattn_sj_kvarn_stream_i8qk_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_STREAM_I8QK");
+        return e != nullptr && *e != 0 && atoi(e) != 0;
+    }();
+    return v && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= GGML_CUDA_CC_AMPERE;
+}
+
 template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
 static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, const int parallel_blocks) {
     using namespace fattn_sj_kvarn_stream;
@@ -1384,6 +1477,17 @@ static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_co
             // the compact tile has no LSA build: ggml_cuda_fattn_sj_kvarn_q5g6_mode_for / _compact_mode_for refuse it first
             GGML_ASSERT(tile == sj_kvarn_tile::rows);
             kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot, true>();
+        }
+        if (tile == sj_kvarn_tile::rows && ggml_cuda_fattn_sj_kvarn_stream_i8qk_enabled()) {
+            const bool lsa_k = ggml_cuda_fattn_sj_live_records != nullptr || (dst->src[3] && dst->src[3]->ne[2] > 1);
+            fattn_kernel_t k8 = ggml_cuda_fattn_sj_kvarn_stream_i8qk_kernel(max_warps, NSTAGE, rot, lsa_k);
+            if (k8 != nullptr) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true)) {
+                    GGML_LOG_INFO("%s: GGML_SJKVARN_STREAM_I8QK=1: SJ-KVaRN 4/4 stream body QK on int8 MMA\n", __func__);
+                }
+                kernel = k8;
+            }
         }
     }
     if constexpr (tile != sj_kvarn_tile::rows) {
@@ -1853,7 +1957,7 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     if (strip_res) {
         ggml_cuda_qsa_strip_join(ctx, dst->src[5]); // LLAMA_LSA_J3_LEAD: before any read of the slot table (no-op otherwise)
     }
-    if (!turbo4_body && (live_env || lsa_blk > 0 || strip_res) && ggml_cuda_fattn_sj_live_records == nullptr) {
+    if (!turbo4_body && (live_env || lsa_blk > 0 || strip_res || ggml_cuda_fattn_sj_live_force) && ggml_cuda_fattn_sj_live_records == nullptr) {
         const ggml_tensor * mask = dst->src[3];
         const int64_t positions = ggml_get_op_params_i32(dst, 6);
         const bool head_mask = mask && mask->ne[2] > 1;

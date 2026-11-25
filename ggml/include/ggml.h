@@ -2637,6 +2637,11 @@ extern "C" {
     // Logging-only 16/128-cell predicted picks in an otherwise unused source; never consumed by attention.
     // Diagnostic picks [n_units, n_query_rows, 3 look-ahead horizons, 2 budgets (1.0x, 1.5x)].
     GGML_API void ggml_flash_attn_ext_set_lsa_spec_recall(struct ggml_tensor * a, struct ggml_tensor * sel);
+    // fork (multi-user row groups, a hint only): bit r of groups set = query row r starts a new sequence (row 0 always
+    // set when the hint is present; n_q <= 32; op_params[12], free on FA nodes). Backends may split the rows at these boundaries; the
+    // result does not depend on the hint. 0 = no hint.
+    GGML_API void     ggml_flash_attn_ext_set_row_groups(struct ggml_tensor * a, uint32_t groups);
+    GGML_API uint32_t ggml_flash_attn_ext_get_row_groups(const struct ggml_tensor * a);
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lsa_spec_recall(const struct ggml_tensor * a);
     // fork (LSA compensation as virtual keys, opt-in, SJ-KVaRN decode): replaces set_lsa_blocks + set_lse +
     // ggml_lsa_comp_merge with one FA call. ndsel is F32 [nbs, n_q] contiguous: entry (b, t) < 0.5 = block b picked
