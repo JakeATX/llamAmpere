@@ -91,7 +91,7 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
     t0 = time.time()
     W = D.effective({k: v.detach() for k, v in P.items()}, fr, fold_fixed)
     acc = dict(n=0, sumA=np.zeros(walk), sumR=np.zeros(walk), sumAmb=np.zeros(walk), sumRmb=np.zeros(walk),
-               E=np.zeros(walk), Emb=np.zeros(walk), rs=[0.0, 0.0], rsmb=[0.0, 0.0], pt0=0, n_seq=0, wA=np.zeros(2), wR=np.zeros(2))
+               E=np.zeros(walk), Emb=np.zeros(walk), rs=[0.0, 0.0], rsmb=[0.0, 0.0], pt0=0, n_seq=0, wA=np.zeros((2, walk)), wR=np.zeros((2, walk)))
     idx = list(range(len(ds)))
     if max_seq:
         idx = idx[:max_seq]
@@ -119,8 +119,8 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
             acc['E'] += E.sum(0).cpu().numpy(); acc['Emb'] += Em.sum(0).cpu().numpy()
             if WORD_MASK is not None:   # mb acceptance of WORD vs other slots (class of the slot's on-policy token)
                 wd = word_of(tdat)
-                for k, sel_ in ((0, wd), (1, ~wd)):
-                    acc['wA'][k] += float((reachm * Am)[sel_].sum()); acc['wR'][k] += float(reachm[sel_].sum())
+                for k, sel_ in ((0, wd), (1, ~wd)):   # per slot depth: WORD share changes with depth, so compare per k
+                    acc['wA'][k] += ((reachm * Am) * sel_).sum(0).cpu().numpy(); acc['wR'][k] += (reachm * sel_).sum(0).cpu().numpy()
             cs.append(C); cms.append(Cmc)
         acc['n_seq'] += 1
         if roundsim and stride == 1:
@@ -140,9 +140,12 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
                p_t_zero_rows=acc['pt0'], secs=round(time.time() - t0, 2))
     out['anchors_per_s'] = round(acc['n'] / max(out['secs'], 1e-9), 1)
     if WORD_MASK is not None:
-        out['alpha_mb_word'] = round(acc['wA'][0] / max(acc['wR'][0], 1e-30), 4)
-        out['alpha_mb_other'] = round(acc['wA'][1] / max(acc['wR'][1], 1e-30), 4)
-        out['word_reach_share'] = round(acc['wR'][0] / max(acc['wR'].sum(), 1e-30), 4)
+        # WORD = the slot's on-policy (target) token is a whole-word piece; per slot k = 1..walk, plus pooled
+        out['alpha_mb_word'] = (acc['wA'][0] / np.maximum(acc['wR'][0], 1e-30)).round(4).tolist()
+        out['alpha_mb_other'] = (acc['wA'][1] / np.maximum(acc['wR'][1], 1e-30)).round(4).tolist()
+        out['alpha_mb_word_pooled'] = round(acc['wA'][0].sum() / max(acc['wR'][0].sum(), 1e-30), 4)
+        out['alpha_mb_other_pooled'] = round(acc['wA'][1].sum() / max(acc['wR'][1].sum(), 1e-30), 4)
+        out['word_reach_share'] = round(acc['wR'][0].sum() / max(acc['wR'].sum(), 1e-30), 4)
     return out
 
 
