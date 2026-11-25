@@ -11,6 +11,7 @@
 // No weight scratch: a pair of warps decodes each 16-row slab of a 128-wide K step into shared memory.
 
 #include "common.cuh"
+#include "inkglue.cuh"
 
 #define NVFP4PF_MAX_EXPERTS 512
 
@@ -265,10 +266,14 @@ constexpr __host__ __device__ int nvfp4pf_smem_bytes() {
 // its slab (nw 0: block 0, nw 1: block 1) into shared memory, then both run the mma over their columns. x streams through
 // a 2-stage cp.async ring (128-byte column rows, 16-byte pieces xor-swizzled by column).
 // s_exp: per-expert output scale [n_expert] or nullptr; s_all: per-tensor output scale (1 = none)
-template <int KF, int BN>
+// SITU (GFFN-P9, gffn-p9.cu): W is a merged gate_up [M = 2F rows]; slab s takes gate rows 8s..8s+7 as its rows g and up
+// rows F + 8s.. as its rows g + 8, so each lane holds the gate and up value of one (column, j) pair and stores
+// y[col][j] = ink_situ_elem(gate, up) (ldy = F) instead of both rows. The dot products and the scale are those of SITU = false.
+template <int KF, int BN, bool SITU = false>
 static __global__ void __launch_bounds__(256, 2) k_nvfp4pf_mm(const char * __restrict__ w_all, const int64_t stride_blk,
         const int8_t * __restrict__ xq, const float * __restrict__ xs, float * __restrict__ y, const int64_t ldy,
-        const int M, const int K, const nvfp4pf_map map, const float * __restrict__ s_exp, const float s_all) {
+        const int M, const int K, const nvfp4pf_map map, const float * __restrict__ s_exp, const float s_all,
+        const ink_situ_params situ = {}) {
     static_assert(KF == 32 || KF == 64, "NVFP4PF: KF 32 or 64");
     static_assert(BN == 64 || BN == 128, "NVFP4PF: BN 64 or 128");
     constexpr int WN = BN/2, NTI = WN/8, SUBS = 128/KF, JPS = KF/32, STAGE = nvfp4pf_stage_bytes<KF, BN>();
@@ -326,7 +331,14 @@ static __global__ void __launch_bounds__(256, 2) k_nvfp4pf_mm(const char * __res
     nvfp4pf_commit();
 
     const bool slab_ok = (blockIdx.x*4 + mw) < (M >> 4);
-    const int  r0 = (blockIdx.x*4 + mw)*16 + g, r1 = r0 + 8;
+    int r0, r1;
+    if constexpr (SITU) {
+        r0 = (blockIdx.x*4 + mw)*8 + g;   // gate row j
+        r1 = r0 + (M >> 1);               // up row F + j
+    } else {
+        r0 = (blockIdx.x*4 + mw)*16 + g;
+        r1 = r0 + 8;
+    }
     const int  ncols = nt - nw*WN;  // columns of this warp's half (may be <= 0)
     constexpr float QW = 4096.0f*(127.0f/12.0f);
 
@@ -431,6 +443,22 @@ static __global__ void __launch_bounds__(256, 2) k_nvfp4pf_mm(const char * __res
         return;
     }
     const bool scaled = s_exp || s_all != 1.0f;
+    if constexpr (SITU) {
+#pragma unroll
+        for (int i = 0; i < NTI; ++i) {
+            const int c = nw*WN + i*8 + 2*t;
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                if (c + q < nt) {
+                    // __fmul_rn: the rounded product SITU = false stores, never contracted into the SITU expression
+                    const float gv = scaled ? __fmul_rn(acc[i][q], oscale)     : acc[i][q];
+                    const float uv = scaled ? __fmul_rn(acc[i][q + 2], oscale) : acc[i][q + 2];
+                    y[(int64_t) scol[c + q]*ldy + r0] = ink_situ_elem(gv, uv, situ);
+                }
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < NTI; ++i) {
         const int c = nw*WN + i*8 + 2*t;

@@ -87,6 +87,7 @@
 #include "ggml-cuda/nk-dspark-head.cuh"
 #include "ggml-cuda/nk-dense-tc.cuh"
 #include "ggml-cuda/nvfp4pf.cuh"
+#include "ggml-cuda/gffn-p9.cuh"
 #include "ggml-cuda/nk-pf-mm.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
@@ -11556,6 +11557,93 @@ static block_q8_1 * ggml_cuda_nvfp4moe_xq_slot(const ggml_tensor * act, int64_t 
     return (block_q8_1 *) ((char *) act->data + act_q8);
 }
 
+// [GFFN-P9] (gffn-p9.cuh, GGML_CUDA_GFFN_P9=1, default off): NVFP4 MoE prefill gate_up MUL_MAT_ID, RESHAPE REPEAT GET_ROWS
+// MUL (per-expert scale), then the SITU run on its gate (offset 0) and up (offset F) views, as one NVFP4PF GEMM that stores
+// SITU(gate, up) into the SITU output. Taken only where the unfused run takes NVFP4PF at the fused scale-MMQ site (MMQ
+// size, plain weights), so the output is that run's bytes.
+static int ggml_cuda_try_fuse_gffn_p9(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * gu = cgraph->nodes[i];
+    if (!ggml_cuda_gffn_p9_on() || gu->op != GGML_OP_MUL_MAT_ID || gu->src[0]->type != GGML_TYPE_NVFP4 || gu->ne[2] < 512 ||
+            gu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gu) || i + 5 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const int device = ctx ? ctx->device : ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const ggml_tensor * w_gu = gu->src[0];
+    const ggml_tensor * x    = gu->src[1];
+    const ggml_tensor * ids  = gu->src[2];
+    const int64_t F = w_gu->ne[1]/2, ncols = x->ne[2];
+    // the fused scale-MMQ site's conditions for NVFP4PF (else the unfused run is MMVQ / MMQ, other numerics)
+    const bool bad_padding_clear = w_gu->buffer &&
+        ggml_backend_buffer_get_usage(w_gu->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(w_gu) != ggml_backend_buffer_get_alloc_size(w_gu->buffer, w_gu) && w_gu->view_src;
+    if (ncols <= get_mmvq_mmid_max_batch(w_gu->type, cc) || bad_padding_clear ||
+            !ggml_cuda_should_use_mmq(w_gu->type, cc, ncols, w_gu->ne[2])) {
+        return 0;
+    }
+    // weights read by pointer: this device's plain CUDA buffer only (no moe-cache arena, split or compute buffer)
+    if (!w_gu->buffer || w_gu->buffer->buft != ggml_backend_cuda_buffer_type(device) ||
+            ggml_backend_buffer_get_usage(w_gu->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            ggml_cuda_moe_cache_device_supports(gu, device)) {
+        return 0;
+    }
+    ggml_tensor * set[16];
+    int n_set = 0;
+    set[n_set++] = gu;
+    int j = i + 1;
+    if (cgraph->nodes[j]->op != GGML_OP_RESHAPE || cgraph->nodes[j + 1]->op != GGML_OP_REPEAT ||
+            cgraph->nodes[j + 2]->op != GGML_OP_GET_ROWS || cgraph->nodes[j + 3]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    const ggml_tensor * s_gu = ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[j], cgraph->nodes[j + 1], cgraph->nodes[j + 2],
+        cgraph->nodes[j + 3], gu);
+    if (!s_gu) {
+        return 0;
+    }
+    for (int k = 0; k < 4; ++k) {
+        set[n_set++] = cgraph->nodes[j + k];
+    }
+    ggml_tensor * gu_out = cgraph->nodes[j + 3];
+    j += 4;
+    // SITU on the gate (offset 0) and up (offset F) views of the scaled product
+    const ggml_tensor * g = nullptr, * u = nullptr;
+    ggml_tensor * act = nullptr;
+    ink_situ_params sp;
+    int last_situ = -1;
+    for (int js = j; js < j + 3 && js < cgraph->n_nodes && last_situ < 0; ++js) {
+        if (cgraph->nodes[js]->op != GGML_OP_VIEW) {
+            last_situ = ink_situ_find(cgraph, js, &g, &u, &act, &sp, set + n_set);
+            if (last_situ < 0) {
+                break;
+            }
+        }
+    }
+    if (last_situ < 0 || !ggml_is_contiguous(gu_out) || g->view_src != gu_out || u->view_src != gu_out || g->view_offs != 0 ||
+            u->view_offs != (size_t) F*sizeof(float) || g->nb[1] != gu_out->nb[1] || u->nb[1] != gu_out->nb[1] ||
+            g->nb[2] != gu_out->nb[2] || u->nb[2] != gu_out->nb[2] || !ggml_cuda_gffn_p9_supported(cc, gu, s_gu, act, sp)) {
+        return 0;
+    }
+    n_set += 9;
+    const int last = ink_run_check(cgraph, i, set, n_set, act);
+    if (last < 0) {
+        return 0;
+    }
+    if (!ctx) {
+        return last - i;
+    }
+    // act is written while x, ids, the scale and the weights are read
+    const ggml_tensor * reads[] = { x, ids, s_gu, w_gu };
+    for (const ggml_tensor * rd : reads) {
+        if (ink_overlap(act, rd)) {
+            return 0;
+        }
+    }
+    if (!ggml_cuda_gffn_p9_launch(*ctx, gu, s_gu, act, sp)) {
+        return 0;
+    }
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * gu = cgraph->nodes[i];
     if (gu->op != GGML_OP_MUL_MAT_ID) {
@@ -14237,6 +14325,12 @@ static int ggml_cuda_try_fuse_inkglue(ggml_backend_cuda_context * ctx, ggml_cgra
     }
     {
         const int n = ggml_cuda_try_fuse_dspark_gru(ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+    {
+        const int n = ggml_cuda_try_fuse_gffn_p9(ctx, cgraph, i);
         if (n > 0) {
             return n;
         }
@@ -18477,6 +18571,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "nk_nvfp4_tc") == 0) {
         return ggml_cuda_nk_nvfp4_tc_count();
+    }
+    if (strcmp(name, "gffn_p9") == 0) {
+        return ggml_cuda_gffn_p9_count();
     }
     if (strcmp(name, "nk_q8_0_tc") == 0) {
         return ggml_cuda_nk_q8_0_tc_count();
