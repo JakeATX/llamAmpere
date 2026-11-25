@@ -981,8 +981,8 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
         case GGML_TYPE_NVFP4:
 #if defined(AMPERE_MMA_AVAILABLE)
-            if constexpr (prec_src1 == GGML_PREC_Q8) {
-                // BP-1B: Block-128 scale-folded INT8 IMMA (4x full-depth m16n8k32 + magic_i2f, 0 I2FP, 0 ldexpf/MUFU)
+            if constexpr (prec_src1 == GGML_PREC_F16) {
+                // BP-1B (GGML_CUDA_NVFP4_MMQ_MODE=int8; GGML_PREC_F16 is the tag for this path): Block-128 scale-folded INT8 IMMA (4x full-depth m16n8k32 + magic_i2f, 0 I2FP, 0 ldexpf/MUFU)
                 return ggml_cuda_mmq_util_funcs(
                     -1,
                     ggml_cuda_mmq_load_tiles_nvfp4_ampere_k128<type, J, fallback, prec_src1, has_fusion>,
@@ -996,7 +996,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_nvfp4_bf16_mma<type, J, fallback, prec_src1>,
                     ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
             } else {
-                // Legacy: original 16-elem Q8_1 + half-depth m16n8k16 path (GGML_CUDA_NVFP4_MMQ_MODE=legacy)
+                // original 16-elem Q8_1 + half-depth m16n8k16 path (default, GGML_PREC_Q8)
                 return ggml_cuda_mmq_util_funcs(
                     -1,
                     ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1, has_fusion>,
@@ -1154,9 +1154,8 @@ static __global__ void mul_mat_q(
     // Skip unused template specializations for faster compilation (the host only uses 4-bit src1 with native FP4
     // and BF16/F16 NVFP4 dispatch modes on Ampere+):
     if (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT ||
-            (prec_src1 == GGML_PREC_Q4 && !native_fp4_available) ||
-            ((prec_src1 == GGML_PREC_BF16 || prec_src1 == GGML_PREC_F16) && !ampere_nvfp4_available) ||
-            (has_fusion && !fusion_available)) {
+            (has_fusion && (!fusion_available || (prec_src1 == GGML_PREC_Q4 && !native_fp4_available))) ||
+            ((prec_src1 == GGML_PREC_BF16 || prec_src1 == GGML_PREC_F16) && !ampere_nvfp4_available)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1811,8 +1810,8 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 #define DECL_MMQ_CASE_BF16(type)                                                   \
     template void mul_mat_q_case<type, GGML_PREC_BF16>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
-// Ampere NVFP4 legacy 16-elem Q8_1 fallback variant (GGML_CUDA_NVFP4_MMQ_MODE=legacy).
-#define DECL_MMQ_CASE_LEGACY(type)                                                 \
+// Ampere NVFP4 BP-1B block-128 INT8 IMMA variant (GGML_CUDA_NVFP4_MMQ_MODE=int8; GGML_PREC_F16 is its tag).
+#define DECL_MMQ_CASE_K128(type)                                                 \
     template void mul_mat_q_case<type, GGML_PREC_F16>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
@@ -1848,7 +1847,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_BF16(GGML_TYPE_NVFP4);
-extern DECL_MMQ_CASE_LEGACY(GGML_TYPE_NVFP4);
+extern DECL_MMQ_CASE_K128(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 

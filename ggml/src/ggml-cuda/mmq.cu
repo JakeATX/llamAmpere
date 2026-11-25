@@ -138,16 +138,19 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 enum ggml_cuda_nvfp4_mmq_mode {
-    GGML_CUDA_NVFP4_MMQ_INT8   = 0, // BP-1B: Block-128 scale-folded INT8 IMMA (default on Ampere)
-    GGML_CUDA_NVFP4_MMQ_BF16   = 1, // BP-1A: Bit-exact pre-scaled BF16 HMMA
-    GGML_CUDA_NVFP4_MMQ_LEGACY = 2, // Original 16-elem Q8_1 + m16n8k16 path
+    GGML_CUDA_NVFP4_MMQ_INT8   = 0, // BP-1B: Block-128 scale-folded INT8 IMMA (opt-in, measured negative: KLD +3.3%)
+    GGML_CUDA_NVFP4_MMQ_BF16   = 1, // BP-1A: Bit-exact pre-scaled BF16 HMMA (opt-in, measured 9.4% slower)
+    GGML_CUDA_NVFP4_MMQ_LEGACY = 2, // Original 16-elem Q8_1 + m16n8k16 path (default)
 };
+
+// [OPT3] GGML_CUDA_NVFP4_MMQ_MODE=int8|bp1b selects BP-1B, =bf16|bp1a selects BP-1A; unset/legacy keeps the original path.
+// The Ampere kernels are keyed on the src1 precision tag: GGML_PREC_F16 = BP-1B, GGML_PREC_BF16 = BP-1A, GGML_PREC_Q8 = original.
 
 static ggml_cuda_nvfp4_mmq_mode ggml_cuda_nvfp4_mmq_get_mode() {
     static const ggml_cuda_nvfp4_mmq_mode mode = [] {
         const char * env_c = getenv("GGML_CUDA_NVFP4_MMQ_MODE");
         if (env_c == nullptr) {
-            return GGML_CUDA_NVFP4_MMQ_INT8;
+            return GGML_CUDA_NVFP4_MMQ_LEGACY;
         }
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
@@ -156,14 +159,14 @@ static ggml_cuda_nvfp4_mmq_mode ggml_cuda_nvfp4_mmq_get_mode() {
         if (env_cpp == "bf16" || env_cpp == "bp1a") {
             return GGML_CUDA_NVFP4_MMQ_BF16;
         }
-        if (env_cpp == "legacy") {
-            return GGML_CUDA_NVFP4_MMQ_LEGACY;
+        if (env_cpp == "int8" || env_cpp == "bp1b") {
+            return GGML_CUDA_NVFP4_MMQ_INT8;
         }
-        if (env_cpp != "int8" && env_cpp != "bp1b" && env_cpp != "auto") {
+        if (env_cpp != "legacy" && env_cpp != "auto" && env_cpp != "0") {
             GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_NVFP4_MMQ_MODE: '%s'. Available: 'int8', 'bf16', 'legacy'.\n",
                           __func__, env_cpp.c_str());
         }
-        return GGML_CUDA_NVFP4_MMQ_INT8;
+        return GGML_CUDA_NVFP4_MMQ_LEGACY;
     }();
     return mode;
 }
@@ -214,10 +217,10 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
         if (nvfp4_mode == GGML_CUDA_NVFP4_MMQ_BF16) {
             return GGML_PREC_BF16;
         }
-        if (nvfp4_mode == GGML_CUDA_NVFP4_MMQ_LEGACY) {
-            return GGML_PREC_F16;
+        if (nvfp4_mode == GGML_CUDA_NVFP4_MMQ_INT8) {
+            return GGML_PREC_F16; // BP-1B (tag only: src1 is Q8_1 with one scale per 128 values)
         }
-        return GGML_PREC_Q8; // BP-1B default
+        return GGML_PREC_Q8; // original path (default)
     }
     return GGML_PREC_Q8;
 }
@@ -424,7 +427,7 @@ static void ggml_cuda_mul_mat_q_impl(
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const bool use_bf16       = src0->type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_BF16;
-    const bool use_nvfp4_k128 = src0->type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_Q8 && ampere_mma_available(cc);
+    const bool use_nvfp4_k128 = src0->type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_F16 && ampere_mma_available(cc);
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : (use_bf16 ? sizeof(block_bf16_mmq) : sizeof(block_q8_1_mmq));
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : (use_bf16 ? QK_BF16_MMQ            : QK8_1_MMQ);
 
