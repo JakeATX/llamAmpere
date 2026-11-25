@@ -344,7 +344,7 @@ static void rotate_q8(const float * x, void * vq, int64_t k) {
 
 static inline const int16_t * q8_xs(const void * q) { return (const int16_t *) q; }
 static inline const float * q8_d(const void * q, int64_t K) { return (const float *) ((const uint8_t *) q + (size_t) K*4); }
-static inline const int32_t * q8_xu(const void * q, int64_t K) { return q8_xu_w((void *) q, K); }
+static inline const int32_t * q8_xu(const void * q, int64_t K) { return q8_xu_w(const_cast<void *>(q), K); }
 
 // scalar reference of the Q8 path (and the non-AVX2 fallback): same integer dots, same float order as the AVX2 kernel
 static void unit_rows_q8_scalar(ublk blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
@@ -1253,6 +1253,7 @@ struct unit_src {
 
 static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                       const float * const * y, float * const * o, int path = -1) {
+    (void) path;
     unit_src us((const uint8_t *) w + (size_t) a*row_bytes, row_bytes, k, K);
     const int tw = AIK_TILE_WORDS(k);
     float acc[8][AI4_TR] = {};
@@ -1329,6 +1330,7 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
 // kernel when GGML_MOE_AI_HOST_Q8_VBMI=1 and the host has it, 0 = never, 1 = whenever the host has it (test/bench).
 static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                          const void * const * xq, float * const * o, bool scalar = false, int vbmi = -1, int lv = -1) {
+    (void) scalar; (void) vbmi; (void) lv;
     unit_src us((const uint8_t *) w + (size_t) a*row_bytes, row_bytes, k, K);
     float acc[8][AI4_TR] = {};
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {

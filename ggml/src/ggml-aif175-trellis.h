@@ -49,7 +49,9 @@ static void aif175_predecessors(const float * current, int width, int first, int
     } else {
         for (int tail = begin_tail; tail < end_tail; ++tail) { best[tail] = INFINITY; }
     }
-    memset(trace + begin_tail, 0, (size_t)(end_tail-begin_tail));
+    if (end_tail > begin_tail) {
+        memset(trace + begin_tail, 0, (size_t)(end_tail-begin_tail));
+    }
     if (count < tails) { return; }
     // Keep head zero for all-infinite ties; visit only complete reachable bands.
     const int begin = first/tails > 1 ? first/tails : 1;

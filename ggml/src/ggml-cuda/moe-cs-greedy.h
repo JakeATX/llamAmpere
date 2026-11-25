@@ -43,7 +43,9 @@ MOE_CS_HD int moe_cs_greedy(const moe_cs_greedy_cfg & c, float gpu, int ncand, c
         if (nr + n > c.max_route) { break; }
         float saved = 0.0f;
         int nm = 0;
+#if defined(__CUDACC__) || defined(__clang__)
 #pragma unroll
+#endif
         for (int k = 0; k < 3; ++k) {
             if ((flag[k][i] & 3) == 3) { saved += c.bytes[k]; ++nm; }
         }
