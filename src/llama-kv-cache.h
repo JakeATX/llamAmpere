@@ -486,13 +486,22 @@ public:
 
     // fork (SWA-GROW, LLAMA_INK_SWA_GROW=1, off by default; llama-kv-swa-grow.cpp): a single-stream window cache
     // re-allocates its K/V tensors with n cells and keeps its live cells (indices kept when they fit, else packed in
-    // index order; cells no query can attend again go first). The caller has synchronized and dropped every graph
-    // that holds the old tensors. False (nothing changed) when the cache cannot be resized or the alloc fails.
-    bool   swa_resize_ok() const;
-    bool   swa_resize(uint32_t n);
+    // position order; cells no query can attend again go first). The caller has synchronized and dropped every graph
+    // that holds the old tensors. The new buffer is allocated beside the old one (device copy); only when that fails
+    // the kept rows go to host memory, the old buffer is freed and make_room(bytes) is asked for VRAM before a retry.
+    // False (nothing changed) when the cache cannot be resized or no size fits; throws only when even the old size
+    // cannot be allocated again after the make_room retry.
+    const char * swa_resize_why_not() const; // nullptr: resizable, else the check that failed
+    bool   swa_resize_ok() const { return swa_resize_why_not() == nullptr; }
+    bool   swa_resize_fits(uint32_t n) const; // the live cells (less the SWA-masked ones) fit in n cells
+    bool   swa_resize(uint32_t n, const std::function<bool(size_t)> & make_room = nullptr);
     size_t swa_cell_bytes() const; // K + V bytes of one cell over all layers
+    uint32_t get_swa_sink() const { return n_swa_sink; }
 
 private:
+    // fork (SWA-GROW): the cells kept at n_new and where they go; false if they do not fit (or a K shift is pending)
+    bool swa_plan(uint32_t n_new, std::vector<uint32_t> & keep, std::vector<uint32_t> & dst, bool & same) const;
+
     void elastic_init(); // after the buffers are allocated
     // the body pages needed for positions up to n_pos are mapped (asks elastic_make_room if short); throws if impossible
     void elastic_require(uint32_t n_pos);

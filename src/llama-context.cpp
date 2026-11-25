@@ -1517,6 +1517,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                            __func__, kv_stream_arena_bytes / 1024.0 / 1024.0, kv_stream_stage_bytes / 1024.0 / 1024.0);
         }
 
+        // fork (SWA-GROW): a context that may share the other context's cells (a drafter) never sees its window cache
+        // at the decode size, and that cache is never resized again (no-op unless LLAMA_INK_SWA_GROW=1 put it on)
+        if (cparams.ctx_other && cparams.ctx_other->ink_swa_kv) {
+            cparams.ctx_other->ink_swa_full("drafter attach");
+            if (cparams.ctx_other->ink_swa_small) {
+                LLAMA_LOG_WARN("%s: [SWAGROW] the other context's window cache did not grow back before the attach\n", __func__);
+            }
+            cparams.ctx_other->ink_swa_kv = nullptr;
+            LLAMA_LOG_WARN("%s: [SWAGROW] off for the other context (a context attached to it)\n", __func__);
+        }
+
         llama_memory_params params_mem = {
             /*.type_k                =*/params.type_k,
             /*.type_v                =*/params.type_v,
@@ -6672,6 +6683,23 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         LLAMA_LOG_WARN("%s: [HEADLOAN] head uploaded again (retry)\n", __func__);
         sched_need_reserve = true;
     }
+    // fork (CACHELOAN): one sequence (the switch to generation comes without a batch: alone when at most one sequence
+    // has cells), and whether this call runs at the small reserve while the cache holds the loan (`grown`)
+    auto ink_loan_alone = [&]() {
+        bool loan_alone = alone;
+        if (!batch && phase == LLAMA_DECODE_PHASE_GENERATION && memory) {
+            int n_seq = 0;
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max(); ++s) {
+                n_seq += memory->seq_pos_max(s) >= 0 ? 1 : 0;
+            }
+            loan_alone = n_seq <= 1;
+        }
+        return loan_alone;
+    };
+    auto ink_loan_stays = [&](bool grown) {
+        return ink_loan_alone() && (n_tokens <= ink_loan_rows || phase == LLAMA_DECODE_PHASE_GENERATION ||
+                (grown && n_tokens <= loan_cross && phase != LLAMA_DECODE_PHASE_GENERATION));
+    };
     // refill the hot experts once the prompt scratch is back to its boot size
     auto ink_cache_refill = [&]() {
         if (!ink_refill || !moe_cache) {
@@ -6721,11 +6749,14 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         const bool ploan_part = llama_ink_ploan_on() && moe_cache->partial();
         if (ink_loan && sched_reserve_tokens == ink_loan_rows) {
             const size_t cap  = llama_moe_cache_host_expert_bytes(model) + (size_t(64) << 20);
-            if (ink_swa_kv && !ink_swa_small) {
-                // fork (SWA-GROW): the cells past n_swa + the loan rows go to the cache, when the loan grows with them
+            if (ink_swa_kv && !ink_swa_small && ink_loan_stays(false)) {
+                // fork (SWA-GROW): the cells past n_swa + the loan rows go to the cache, when the loan grows with them,
+                // the cache is short of its cap without them, and this call stays on the loan (no shrink-then-regrow)
+                const size_t free_now = gpu_free() + (ploan_part ? moe_cache->kept_bytes() : 0);
                 const size_t gain  = (size_t) (ink_swa_boot - ink_swa_dec)*ink_swa_kv->swa_cell_bytes();
-                const size_t free0 = gpu_free() + (ploan_part ? moe_cache->kept_bytes() : 0) + gain;
-                if (std::min(cap, free0 > loan_margin ? free0 - loan_margin : 0) > ink_loan_boot) {
+                const size_t free0 = free_now + gain;
+                if (std::min(cap, free_now > loan_margin ? free_now - loan_margin : 0) < cap &&
+                        std::min(cap, free0 > loan_margin ? free0 - loan_margin : 0) > ink_loan_boot) {
                     ink_swa_set(true, "decode");
                 }
             }
@@ -6972,16 +7003,8 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         // fork (CACHELOAN): the refill call and, while the cache holds the loan, decode and short single-sequence prompts
         // (up to the crossover) run at the small reserve; anything else first gives the loan back (boot size)
         // the switch to generation (set_decode_phase) comes without a batch: alone when at most one sequence has cells
-        bool loan_alone = alone;
-        if (!batch && phase == LLAMA_DECODE_PHASE_GENERATION && memory) {
-            int n_seq = 0;
-            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max(); ++s) {
-                n_seq += memory->seq_pos_max(s) >= 0 ? 1 : 0;
-            }
-            loan_alone = n_seq <= 1;
-        }
-        if (loan_alone && (n_tokens <= ink_loan_rows || phase == LLAMA_DECODE_PHASE_GENERATION ||
-                    (ink_loan_grown && n_tokens <= loan_cross && phase != LLAMA_DECODE_PHASE_GENERATION))) {
+        const bool loan_alone = ink_loan_alone();
+        if (ink_loan_stays(ink_loan_grown)) {
             rows = ink_loan_rows;
             if (n_tokens > ink_loan_rows && phase != LLAMA_DECODE_PHASE_GENERATION) {
                 ink_loan_chunk_t0 = ggml_time_us();
