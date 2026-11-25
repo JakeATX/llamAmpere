@@ -1,9 +1,19 @@
 name: CI (CUDA, windows)
 
 # llamAmpere release zip: builds llama-server for Windows x64 with CUDA 12.4 from one exact commit.
+#
+# Release builds are dispatched from this one branch (ci/rc-cache) with the commit to build as an input:
+#   gh workflow run build-cuda-windows.yml --ref ci/rc-cache -f sha=<full sha> -f name=<zip base name>
+#
+# Compile cache: sccache wraps cl.exe and nvcc (C, C++ and CUDA compiler launchers) and its local cache
+# directory is saved with actions/cache. GitHub scopes a cache to the branch the workflow runs from, not
+# to the commit it checks out, so every dispatch from ci/rc-cache reads and writes the same cache. The key
+# has no source sha in it: a run restores the newest cache saved on this branch (or else the newest one
+# saved on main) and saves a new one under its run id. There is no push trigger: only dispatches build.
+# The code generation flags are unchanged. The one added nvcc flag, --diag-suppress=177,221, only hides
+# two warnings (unused variable, float constant range): ai4.cu prints about 25 MB of them, and with that
+# much compiler output sccache 0.19.0 never hands the finished compile back to ninja (the build hangs).
 on:
-  push:
-    branches: [ "ci/rc-v0.7.3" ]
   workflow_dispatch:
     inputs:
       sha:
@@ -17,8 +27,12 @@ permissions:
   contents: read
 
 env:
-  BUILD_SHA: ${{ inputs.sha || 'f289dc37731c6e41d566132e19717e826c1e412d' }}
-  ZIP_NAME: ${{ inputs.name || 'llamampere-v0.7.3-rc-windows-x86_64-cuda12-server' }}
+  BUILD_SHA: ${{ inputs.sha }}
+  ZIP_NAME: ${{ inputs.name }}
+  SCCACHE_DIR: C:\sccache
+  SCCACHE_CACHE_SIZE: 4G
+  SCCACHE_IDLE_TIMEOUT: "0"
+  SCCACHE_KEY: sccache-windows-2022-x64-cuda12.4-sm86-v1
 
 jobs:
   windows-cuda-server:
@@ -47,6 +61,19 @@ jobs:
       - name: Install Ninja
         run: choco install ninja
 
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.19.0"
+
+      - name: Restore compile cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ env.SCCACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ env.SCCACHE_KEY }}-
+
       - name: Build
         shell: cmd
         run: |
@@ -55,9 +82,26 @@ jobs:
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_OPENMP=ON ^
             -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_CUDA_FA=ON -DGGML_CUDA_GRAPHS=ON ^
             -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
-            -DLLAMA_BUILD_BORINGSSL=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF || exit /b 1
+            -DLLAMA_BUILD_BORINGSSL=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_FLAGS=--diag-suppress=177,221 || exit /b 1
           cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target llama-server || exit /b 1
           echo VCREDIST=%VCToolsRedistDir%>> %GITHUB_ENV%
+
+      - name: Compile cache stats
+        if: always()
+        shell: cmd
+        run: |
+          sccache --show-stats
+          sccache --stop-server
+          exit /b 0
+
+      - name: Save compile cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ env.SCCACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Pack
         shell: pwsh
