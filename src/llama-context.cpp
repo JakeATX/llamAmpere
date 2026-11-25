@@ -12226,12 +12226,13 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
             LLAMA_LOG_ERROR("%s: SJ-KVaRN cache does not support MLA models\n", __func__);
             return nullptr;
         }
-        // INKKV: Inkling keeps its SJ-KVaRN ring/tail (and sink) in q8_0 instead of the TQ6_0 ring + F16 sink default.
-        // LLAMA_INKKV_RING=tq6_0 = the TQ6_0 ring + F16 sink (kill switch); an explicit F16 staging type is kept.
+        // INKKV (opt-in until gated): LLAMA_INKKV_RING=q8_0 keeps the Inkling SJ-KVaRN ring/tail (and sink) in q8_0
+        // instead of the TQ6_0 ring + F16 sink default; unset or any other value keeps the default. An explicit F16
+        // staging type is kept.
         if ((model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP) &&
                 params.sj_kvarn_staging_type == GGML_TYPE_TQ6_0) {
             const char * e = getenv("LLAMA_INKKV_RING");
-            if (!(e && std::string(e) == "tq6_0")) {
+            if (e && std::string(e) == "q8_0") {
                 params.sj_kvarn_staging_type = GGML_TYPE_Q8_0;
                 params.sj_kvarn_sink_type    = GGML_TYPE_COUNT;
             }
