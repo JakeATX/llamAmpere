@@ -318,16 +318,35 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         kv_base->set_swa_sink(base_sink);
     }
 
+    // INKKV shared SWA staging (several sequences, SJ-KVaRN base): one unified SWA cell pool of n_seq x window + one
+    // ubatch instead of window + ubatch per stream (the base cache keeps its streams); the SWA masks then have one
+    // stream (build_attn_inp_kq_mask). Default OFF (held: mask holes, gate pending): LLAMA_INKKV_SWA_SHARED=1 turns it
+    // on; unset/0 = per-stream SWA caches.
+    bool swa_unified = unified;
+    if (!unified && !swa_full && sj_kvarn.enabled() && n_seq_max > 1 && hparams.n_swa > 0) {
+        const char * e = getenv("LLAMA_INKKV_SWA_SHARED");
+        if (e && *e && atoi(e) != 0) {
+            swa_unified = true;
+            size_swa = GGML_PAD(std::min<uint32_t>(size_base*n_seq_max, hparams.n_swa*n_seq_max + n_ubatch), 256);
+            LLAMA_LOG_INFO("%s: INKKV shared SWA staging: one SWA cell pool for %u sequences (LLAMA_INKKV_SWA_SHARED=1; unset = "
+                    "per-stream)\n", __func__, n_seq_max);
+        }
+    }
+    swa_shared = swa_unified && !unified;
+
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     const bool swa_is_full_length = size_swa == kv_size; // fork (DSPARKWIN): the context, not a windowed base ring
     kv_swa = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k_swa, type_v_swa,
-            v_trans, offload, unified, size_swa, n_seq_max,
+            v_trans, offload, swa_unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share,
             "", swa_is_full_length ? kv_stream_stage_bytes : 0,
             swa_is_full_length ? kv_stream_phase_arena : nullptr,
             swa_is_full_length ? kv_stream_maximum_pool_bytes : 0);
+    if (swa_shared) {
+        kv_swa->set_first_fit(true);
+    }
 
     if (has_swa_mid) {
         LLAMA_LOG_INFO("%s: creating SWA-mid KV cache (n_swa_mid = %u), size = %u cells, type %s/%s\n",

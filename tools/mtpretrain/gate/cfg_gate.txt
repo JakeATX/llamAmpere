@@ -1,0 +1,6 @@
+# MTPRETRAIN gate: same v0.7.2.1 sm86 bundle, same P76 file, bare --preset 24dense; B adds the retrained head as an overlay patch.
+A mbp /mnt/overflow/rel0721/b/rel0721-rel86-76c662548 262144 LLAMA_ARG_NO_CACHE_DISK=1
+B mbp /mnt/overflow/rel0721/b/rel0721-rel86-76c662548 262144 LLAMA_ARG_NO_CACHE_DISK=1;LLAMA_MODEL_OVERLAY_PATCH=/mnt/overflow/mtpretrain/mtp-otp.gguf
+# identity cells: exact MTP (mb off) and MTP off, greedy, 512 tokens
+AX mb0 /mnt/overflow/rel0721/b/rel0721-rel86-76c662548 262144 LLAMA_ARG_NO_CACHE_DISK=1
+BX mb0 /mnt/overflow/rel0721/b/rel0721-rel86-76c662548 262144 LLAMA_ARG_NO_CACHE_DISK=1;LLAMA_MODEL_OVERLAY_PATCH=/mnt/overflow/mtpretrain/mtp-otp.gguf

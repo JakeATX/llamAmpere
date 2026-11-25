@@ -10,6 +10,7 @@
 #define MMQ_DP4A_MAX_BATCH_SIZE 64  // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_PTQ1_0_MAX_BATCH_SIZE (1 << 30)  // MMQ at every batch unless GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH lowers it
 #define MMQ_ITER_K                256
+#define MMQ_ITER_K_BF16           128
 #define MMQ_ITER_K_FP4            512
 #define MMQ_NWARPS                8
 
@@ -24,10 +25,12 @@ enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
     MMQ_Q8_1_DS_LAYOUT_DS4,
     MMQ_Q8_1_DS_LAYOUT_D2S6,
+    MMQ_Q8_1_DS_LAYOUT_D1_128, // 1 fp32 scale per 128 values (stored in d4[0], replicated to d4[0..3])
 };
 
-static constexpr int QK8_1_MMQ  = 4*QK8_1;
-static constexpr int QK_FP4_MMQ = 2*QK8_1_MMQ;
+static constexpr int QK8_1_MMQ   = 4*QK8_1;
+static constexpr int QK_FP4_MMQ  = 2*QK8_1_MMQ;
+static constexpr int QK_BF16_MMQ = 64;
 
 struct block_q8_1_mmq {
     // The y float data is converted to a data layout that can simply be copied to shared memory as a contiguous block.
@@ -58,9 +61,17 @@ struct block_fp4_mmq {
     int8_t   qs[QK_FP4_MMQ / 2];
 };
 
+// Pre-converted BF16 activation tile block for Ampere NVFP4 BP-1A bit-exact HMMA path.
+// 16 bytes header padding matches block_q8_1_mmq (so y_qs = y + 4, stride = MMQ_TILE_Y_K = 36 ints, bank-conflict-free).
+struct block_bf16_mmq {
+    int32_t  pad[4];
+    uint16_t qs[QK_BF16_MMQ];
+};
+
 static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
+static_assert(sizeof(block_bf16_mmq) == sizeof(block_q8_1_mmq),    "Unexpected block_bf16_mmq size");
 
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
@@ -134,8 +145,10 @@ enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K,
-    GGML_CUDA_MMQ_SRAM_LAYOUT_FP4,   // MXFP4 and NVFP4 on Blackwell.
-    GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, // Generic NVFP4
+    GGML_CUDA_MMQ_SRAM_LAYOUT_FP4,        // MXFP4 and NVFP4 on Blackwell.
+    GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4,      // Generic/Legacy NVFP4 (16-elem scales)
+    GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4_K128, // Ampere BP-1B: 256 int8 + 2 fp32 scales + 2 pad = 68 ints/row
+    GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4_BF16, // Ampere BP-1A: 128 pre-scaled bf16 (64 bf16x2) + 4 pad = 68 ints/row
 };
 
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_sram_layout sram_layout) {
@@ -154,18 +167,24 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
             return 2*MMQ_TILE_NE_K + 8                     + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4_K128:
+            return 2*MMQ_TILE_NE_K                         + 4;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4_BF16:
+            return 2*MMQ_TILE_NE_K                         + 4;
         default:
             return -1;
     }
 }
 
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)  % 8 == 4, "Wrong padding.");
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)  % 8 == 4, "Wrong padding.");
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)  % 8 == 4, "Wrong padding.");
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8 == 4, "Wrong padding.");
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K)  % 8 == 4, "Wrong padding.");
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)   % 8 == 4, "Wrong padding.");
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4) % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)       % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)       % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)       % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)       % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K)       % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)        % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4)      % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4_K128) % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4_BF16) % 8 == 4, "Wrong padding.");
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4) == ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1), "Wrong tile size for MXFP4");
 
@@ -218,7 +237,7 @@ struct ggml_cuda_mmq_config {
         static_assert(                          (occupancy_)      <=   8, "bad occupancy");                                               \
         static_assert((I_)        %  32 == 0,                             "bad I");                                                       \
         static_assert((J_)        %   8 == 0 && (J_)              <= 128, "bad J");                                                       \
-        static_assert((K_vram_)   % 256 == 0,                             "bad K_vram");                                                  \
+        static_assert((K_vram_)   % 128 == 0,                             "bad K_vram");                                                  \
         return ggml_cuda_mmq_config((type_), (nthreads_), (occupancy_), (I_), (J_), (sram_layout_), (K_vram_), (stream_k_), (fallback_)); \
     }                                                                                                                                     \
 
@@ -259,14 +278,14 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
     }
     if (blackwell_mma_available(cc)) {
-        // only src1 at Q4 uses the native FP4 config, higher precisions keep src1 at Q8_1
+        // only src1 at Q4 uses the native FP4 config, higher precisions use the Ampere path (BP-1B/BP-1A/legacy)
         if (prec_src1 != GGML_PREC_Q4 && (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4)) {
-            return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+            return ggml_cuda_mmq_get_config_ampere(type, J, fallback, prec_src1, ampere_mma_available(cc));
         }
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
-        return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+        return ggml_cuda_mmq_get_config_ampere(type, J, fallback, prec_src1, ampere_mma_available(cc));
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
         return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
@@ -293,13 +312,15 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #endif // CDNA
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
-    // only src1 at Q4 uses the native FP4 config, higher precisions keep src1 at Q8_1
+    // only src1 at Q4 uses the native FP4 config, higher precisions use the Ampere path (BP-1B/BP-1A/legacy)
     if (prec_src1 != GGML_PREC_Q4 && (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4)) {
-        return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+        return ggml_cuda_mmq_get_config_ampere(type, J, fallback, prec_src1, true);
     }
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+#elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    return ggml_cuda_mmq_get_config_ampere(type, J, fallback, prec_src1, true);
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+    return ggml_cuda_mmq_get_config_ampere(type, J, fallback, prec_src1, false);
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
     return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
 #else
@@ -959,11 +980,36 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
         case GGML_TYPE_NVFP4:
+#if defined(AMPERE_MMA_AVAILABLE)
+            if constexpr (prec_src1 == GGML_PREC_F16) {
+                // BP-1B (GGML_CUDA_NVFP4_MMQ_MODE=int8; GGML_PREC_F16 is the tag for this path): Block-128 scale-folded INT8 IMMA (4x full-depth m16n8k32 + magic_i2f, 0 I2FP, 0 ldexpf/MUFU)
+                return ggml_cuda_mmq_util_funcs(
+                    -1,
+                    ggml_cuda_mmq_load_tiles_nvfp4_ampere_k128<type, J, fallback, prec_src1, has_fusion>,
+                    ggml_cuda_mmq_vec_dot_nvfp4_k128_q8_1_mma<type, J, fallback, prec_src1>,
+                    ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
+            } else if constexpr (prec_src1 == GGML_PREC_BF16) {
+                // BP-1A: Bit-exact pre-scaled BF16 HMMA (m16n8k16.f32.bf16.bf16.f32, 0 I2FP, 0% weight error)
+                return ggml_cuda_mmq_util_funcs(
+                    -1,
+                    ggml_cuda_mmq_load_tiles_nvfp4_ampere_bf16<type, J, fallback, prec_src1, has_fusion>,
+                    ggml_cuda_mmq_vec_dot_nvfp4_bf16_mma<type, J, fallback, prec_src1>,
+                    ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
+            } else {
+                // original 16-elem Q8_1 + half-depth m16n8k16 path (default, GGML_PREC_Q8)
+                return ggml_cuda_mmq_util_funcs(
+                    -1,
+                    ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1, has_fusion>,
+                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback, prec_src1>,
+                    ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
+            }
+#else
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback, prec_src1>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
+#endif // defined(AMPERE_MMA_AVAILABLE)
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
     }
@@ -1016,10 +1062,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    // FP4 tile stores 8 blocks. src1 above Q4 uses the generic
-    // Q8_1 tile layout instead of the packed FP4 tile.
+    // FP4 tile stores 8 blocks. src1 above Q4 uses the Ampere BF16 or Q8_1 tile layout.
     constexpr int ne_block = ((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) && prec_src1 == GGML_PREC_Q4) ?
-        QK_FP4_MMQ : QK8_1_MMQ;
+        QK_FP4_MMQ : ((type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_BF16) ? QK_BF16_MMQ : QK8_1_MMQ);
+#elif defined(AMPERE_MMA_AVAILABLE)
+    constexpr int ne_block = (type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_BF16) ? QK_BF16_MMQ : QK8_1_MMQ;
 #else
     constexpr int ne_block = QK8_1_MMQ;
 #endif  // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1098,10 +1145,17 @@ static __global__ void mul_mat_q(
 #else
     constexpr bool native_fp4_available = false;
 #endif // BLACKWELL_MMA_AVAILABLE
+#ifdef AMPERE_MMA_AVAILABLE
+    constexpr bool ampere_nvfp4_available = true;
+#else
+    constexpr bool ampere_nvfp4_available = false;
+#endif // AMPERE_MMA_AVAILABLE
 
-    // Skip unused template specializations for faster compilation (the host only uses 4-bit src1 with native FP4):
+    // Skip unused template specializations for faster compilation (the host only uses 4-bit src1 with native FP4
+    // and BF16/F16 NVFP4 dispatch modes on Ampere+):
     if (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT ||
-            (has_fusion && (!fusion_available || (prec_src1 == GGML_PREC_Q4 && !native_fp4_available)))) {
+            (has_fusion && (!fusion_available || (prec_src1 == GGML_PREC_Q4 && !native_fp4_available))) ||
+            ((prec_src1 == GGML_PREC_BF16 || prec_src1 == GGML_PREC_F16) && !ampere_nvfp4_available)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1752,6 +1806,14 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 #define DECL_MMQ_CASE_W4A4(type)                                                   \
     template void mul_mat_q_case<type, GGML_PREC_Q4>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
+// Ampere NVFP4 BP-1A bit-exact BF16 HMMA variant.
+#define DECL_MMQ_CASE_BF16(type)                                                   \
+    template void mul_mat_q_case<type, GGML_PREC_BF16>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+
+// Ampere NVFP4 BP-1B block-128 INT8 IMMA variant (GGML_CUDA_NVFP4_MMQ_MODE=int8; GGML_PREC_F16 is its tag).
+#define DECL_MMQ_CASE_K128(type)                                                 \
+    template void mul_mat_q_case<type, GGML_PREC_F16>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
 extern DECL_MMQ_CASE(GGML_TYPE_PQ2_0);
@@ -1784,6 +1846,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
+extern DECL_MMQ_CASE_BF16(GGML_TYPE_NVFP4);
+extern DECL_MMQ_CASE_K128(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 

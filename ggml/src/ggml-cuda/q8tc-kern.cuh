@@ -64,13 +64,14 @@ static __device__ __forceinline__ uint32_t q8tc_h2(const float a, const float b)
 
 // IA (SURGE3 Q8TC-HLF): independent accumulators per (k step, hi/lo) so the 2 (HILO 4) mmas of a block do not form one
 // dependent chain; summed in fixed order (st0 hi + st0 lo) + (st1 hi + st1 lo) before the block scale. IA=false keeps v3 order.
-// (PIPE, a second chunk buffer per warp, was measured slower: mbh2 +5..+22% vs this; the extra smem costs occupancy.)
+// PIPE (GGML_CUDA_Q8TC_PIPE=1, default off): two chunk buffers per warp; the copy of chunk ch + NW flies while chunk ch
+// computes (same arithmetic, bit-exact). Measured slower (mbh2 +5..+22%; the extra smem costs occupancy), kept opt-in.
 //
 // FUSE-WO (EPI): the attn_out launch also runs the Inkling short-conv ring epilogue of its 16 output channels (the
 // expressions of ssm_conv_ring_f32<false, 4, n_t, epi = true>: windows, 4-tap conv, SCALE(ADD(x, conv)), residual ADD),
 // on the T columns the CTA just reduced, so the separate ring launch is gone. x is still stored (other readers).
 
-template <int NW, bool HILO, bool IA, bool EPI>
+template <int NW, bool HILO, bool IA, bool EPI, bool PIPE = false>
 static __device__ __forceinline__ void q8tc3_dev(const q8a16_args & a, const int nb, const int T, const q8tc_epi * ep) {
 #ifdef AMPERE_MMA_AVAILABLE
     extern __shared__ __align__(16) uint32_t sw3[];
@@ -87,19 +88,36 @@ static __device__ __forceinline__ void q8tc3_dev(const q8a16_args & a, const int
     const int nch = nb/8;
     const bool colok = gid < T;
     const float * xc = a.x[k] + (int64_t) (colok ? gid : 0)*a.sx[k] + 4*tig;
-    uint32_t * S = sw3 + w*16*68;
-
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int ch = w; ch < nch; ch += NW) {
+    static_assert(!(PIPE && EPI), "PIPE is not wired for the FUSE-WO epilogue launch");
+    uint32_t * SB = sw3 + w*(PIPE ? 2 : 1)*16*68;
+    auto issue = [&](uint32_t * D, const int ch) {
 #pragma unroll
         for (int i0 = 0; i0 < 9; ++i0) {
             const int i = i0*32 + lane;
             if (i < 16*17) {
                 const int r = i / 17, c = i - r*17;
-                q8tc_cp16(&S[r*68 + c*4], vx + (int64_t) min(r, rmax)*srow + (int64_t) ch*Q8TC_CHUNK_BYTES + c*16);
+                q8tc_cp16(&D[r*68 + c*4], vx + (int64_t) min(r, rmax)*srow + (int64_t) ch*Q8TC_CHUNK_BYTES + c*16);
             }
         }
         asm volatile("cp.async.commit_group;");
+    };
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (PIPE && w < nch) {
+        issue(SB, w);
+    }
+    int buf = 0;
+    for (int ch = w; ch < nch; ch += NW) {
+        uint32_t * S = SB + buf*16*68;
+        const bool more = PIPE && ch + NW < nch;
+        if constexpr (PIPE) {
+            if (more) {
+                issue(SB + (buf ^ 1)*16*68, ch + NW);
+            }
+            buf ^= 1;
+        } else {
+            issue(S, ch);
+        }
         // activation fragments, words tig and tig + 4 of each block: pair 0 while the copies fly, pair j + 1 during pair j
         auto ldx = [&](float4 (&v)[2][2], const int j) {
 #pragma unroll
@@ -111,7 +129,11 @@ static __device__ __forceinline__ void q8tc3_dev(const q8a16_args & a, const int
         };
         float4 xv[2][2][2];
         ldx(xv[0], 0);
-        asm volatile("cp.async.wait_group 0;");
+        if (more) {
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
         __syncwarp();
         const uint32_t * S0 = S + gid*68;
         const uint32_t * S1 = S + (gid + 8)*68;
@@ -266,9 +288,9 @@ static __device__ __forceinline__ void q8tc3_dev(const q8a16_args & a, const int
 #endif
 }
 
-template <int NW, bool HILO, int MINB, bool IA = false>
+template <int NW, bool HILO, int MINB, bool IA = false, bool PIPE = false>
 static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a, const int nb, const int T) {
-    q8tc3_dev<NW, HILO, IA, false>(a, nb, T, nullptr);
+    q8tc3_dev<NW, HILO, IA, false, PIPE>(a, nb, T, nullptr);
 }
 
 template <int NW, bool HILO, int MINB, bool IA = false>

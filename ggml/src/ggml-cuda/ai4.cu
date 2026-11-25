@@ -3852,9 +3852,40 @@ static int aif_mmv_pf() {
     return v;
 }
 
+// [WREAD08] GGML_CUDA_AIF_MMVX: decode widths (N <= 8) at small M take magic2::mmvx, G groups of four warps per 16-row
+// strip (bit-identical to mmv, see magic2-v2.cuh). Unset or 0 = off (release mmv everywhere; measured neutral on the
+// 8 GB f100 gate, 50.60 -> 50.56). -1 = auto: G = 2 when mmv would keep fewer than L warps
+// per SM in flight ((M / 16) * 4 < L * SMs), else mmv. L = 30 for AIF175_U2 (its decode is the most latency-bound: on a
+// Taichi 3090 G = 2 is +42-55% at M = 5120 and +5-18% at M = 6144, N 2-8), 17 for AIF25_U / AIF25_U2 (+17-24% at
+// M = 5120; slower at M >= 10240).
+// 2, 3 or 4 = force that G wherever K / 128 is a multiple of 4 G.
+static int aif_mmvx_env() {
+    static const int v = ai4_env_int("GGML_CUDA_AIF_MMVX", nullptr, 0);
+    return v;
+}
+
+static int aif_mmvx_groups(ggml_type type, int M, int K, int64_t N, int nsm) {
+    const int e = aif_mmvx_env();
+    if (e == 0 || N < 1 || N > 8 || nsm <= 0) {
+        return 0;
+    }
+    if (e > 0) {
+        // a forced G runs only where it qualifies (2..4 groups, K / 128 a multiple of 4 G); elsewhere mmv
+        return e >= 2 && e <= 4 && (K / 128) % (4 * e) == 0 ? e : 0;
+    }
+    const int64_t warps = int64_t(M / 16) * 4;
+    const int64_t limit = type == GGML_TYPE_AIF175_U2 ? 30 : 17;
+    return warps < limit * nsm && (K / 128) % 8 == 0 ? 2 : 0;
+}
+
 template <int XSH, bool ROW_SCALE = false, int B = 5, int V = 2, uint32_t C = AIF25_MUL, int SCALE_CHUNKS = 5>
 static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales, float * y, int M, int K, int64_t N,
-                      cudaStream_t stream, const uint8_t * group_mask = nullptr) {
+                      cudaStream_t stream, const uint8_t * group_mask = nullptr, int groups = 0) {
+    if (groups >= 2 && group_mask == nullptr && N <= 8 &&
+            magic2::mmvx_launch<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS>(groups, w, q, scales, y, M, K, (int) N, stream)) {
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     // CUDA grid.y is limited to 65535; each block handles eight activation rows.
     for (int64_t n0 = 0; n0 < N; n0 += 8*65535) {
         const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
@@ -3873,21 +3904,22 @@ static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales,
 }
 
 // The mmv call for each fractional type (also the reference of GGML_CUDA_AIF25_MMQ_CHECK).
+// groups >= 2: magic2::mmvx where the shape qualifies ([WREAD08]); 0 = magic2::mmv.
 static void aif25_mmv_type(ggml_type type, int xsh, const uint8_t * w, const int8_t * q, const float * scales, float * y,
-                           int M, int K, int64_t N, cudaStream_t stream, const uint8_t * group_mask = nullptr) {
+                           int M, int K, int64_t N, cudaStream_t stream, const uint8_t * group_mask = nullptr, int groups = 0) {
     if (type == GGML_TYPE_AIF175_U2) {
-        aif25_mmv<1, true, 7, 4, AIF175_MUL, 4>(w, q, scales, y, M, K, N, stream, group_mask);
+        aif25_mmv<1, true, 7, 4, AIF175_MUL, 4>(w, q, scales, y, M, K, N, stream, group_mask, groups);
     } else if (type == GGML_TYPE_AIF25_U2_512) {
         // K % 512 == 0, so activation scales always cover 256 columns (xsh == 1); four chunks share the row scales.
-        aif25_mmv<1, true, 5, 2, AIF25_MUL, 4>(w, q, scales, y, M, K, N, stream, group_mask);
+        aif25_mmv<1, true, 5, 2, AIF25_MUL, 4>(w, q, scales, y, M, K, N, stream, group_mask, groups);
     } else if (type == GGML_TYPE_AIF25_U2 && xsh) {
-        aif25_mmv<1, true>(w, q, scales, y, M, K, N, stream, group_mask);
+        aif25_mmv<1, true>(w, q, scales, y, M, K, N, stream, group_mask, groups);
     } else if (type == GGML_TYPE_AIF25_U2) {
-        aif25_mmv<0, true>(w, q, scales, y, M, K, N, stream, group_mask);
+        aif25_mmv<0, true>(w, q, scales, y, M, K, N, stream, group_mask, groups);
     } else if (xsh) {
-        aif25_mmv<1>(w, q, scales, y, M, K, N, stream, group_mask);
+        aif25_mmv<1>(w, q, scales, y, M, K, N, stream, group_mask, groups);
     } else {
-        aif25_mmv<0>(w, q, scales, y, M, K, N, stream, group_mask);
+        aif25_mmv<0>(w, q, scales, y, M, K, N, stream, group_mask, groups);
     }
 }
 
@@ -3972,7 +4004,34 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if (ggml_cuda_ai4_decode_fast_frac_try(ctx, w->type, xsh, wd, qp, sp, y, M, K, N)) {
         return;
     }
-    aif25_mmv_type(w->type, xsh, wd, qp, sp, y, M, K, N, stream);
+    const int groups = aif_mmvx_groups(w->type, M, K, N, ggml_cuda_info().devices[ctx.device].nsm);
+    aif25_mmv_type(w->type, xsh, wd, qp, sp, y, M, K, N, stream, nullptr, groups);
+    // [WREAD08] GGML_CUDA_AIF25_MMQ_CHECK=1 also checks every mmvx call bitwise against mmv (graphs off) and aborts on a difference
+    if (groups >= 2 && aif25_mmq_check()) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        if (capture == cudaStreamCaptureStatusNone) {
+            const int64_t n_out = N*M;
+            ggml_cuda_pool_alloc<float> ref(ctx.pool(), (size_t) n_out);
+            ggml_cuda_pool_alloc<unsigned long long> count(ctx.pool(), 1);
+            CUDA_CHECK(cudaMemsetAsync(count.get(), 0, sizeof(unsigned long long), stream));
+            aif25_mmv_type(w->type, xsh, wd, qp, sp, ref.get(), M, K, N, stream);
+            k_aif25_bits_differ<<<(unsigned) ((n_out + 255)/256), 256, 0, stream>>>(y, ref.get(), n_out, count.get());
+            CUDA_CHECK(cudaGetLastError());
+            unsigned long long differ = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&differ, count.get(), sizeof(differ), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            static std::atomic<long long> checked{0};
+            const long long n_checked = ++checked;
+            if (differ != 0 || aif25_mmq_check() >= 2 || n_checked <= 4 || (n_checked & (n_checked - 1)) == 0) {
+                GGML_LOG_INFO("[AIF_MMVX] check %lld: %s M=%d K=%d N=%lld G=%d: %llu of %lld outputs differ from mmv\n",
+                        n_checked, dst->name, M, K, (long long) N, groups, differ, (long long) n_out);
+            }
+            if (differ != 0) {
+                GGML_ABORT("AIF_MMVX check failed");
+            }
+        }
+    }
 }
 
 // [KAIFUSE R2] Draft vocabulary shortlist on a fractional AI+ head (AIF25_U / AIF25_U2 / AIF175_U2 / AIF25_U2_512).

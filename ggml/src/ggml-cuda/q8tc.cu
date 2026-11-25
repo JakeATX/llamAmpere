@@ -69,8 +69,26 @@ bool ggml_cuda_q8tc_ia() {
     return p;
 }
 
+// GGML_CUDA_Q8TC_PIPE=1 (Q8TC-HLF PIPE): double-buffered chunk copies, same arithmetic (bit-exact); measured slower
+// (+5..+22%), default off. Not combined with IA (IA wins when both are set).
+static bool q8tc_pipe() {
+    static const bool p = [] { const char * e = getenv("GGML_CUDA_Q8TC_PIPE"); return e && atoi(e) == 1; }();
+    return p;
+}
+
 template <int NW, bool HILO, int MINB>
 static void q8tc_launch(const q8a16_args & a, int T, int nb, cudaStream_t st) {
+    if (q8tc_pipe() && !(HILO && ggml_cuda_q8tc_ia())) {
+        const size_t sm = 2*NW*16*68*sizeof(uint32_t);   // 52 KB at NW = 6: over the 48 KB default
+        static bool raised[GGML_CUDA_MAX_DEVICES] = {false};   // per device, like mmq
+        const int id = ggml_cuda_get_device();
+        if (!raised[id]) {
+            CUDA_CHECK(cudaFuncSetAttribute(k_q8tc3<NW, HILO, MINB, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm));
+            raised[id] = true;
+        }
+        k_q8tc3<NW, HILO, MINB, false, true><<<a.blk_end[a.n - 1], 32*NW, sm, st>>>(a, nb, T);
+        return;
+    }
     if constexpr (HILO) {
         if (ggml_cuda_q8tc_ia()) {
             k_q8tc3<NW, HILO, MINB, true><<<a.blk_end[a.n - 1], 32*NW, NW*16*68*sizeof(uint32_t), st>>>(a, nb, T);

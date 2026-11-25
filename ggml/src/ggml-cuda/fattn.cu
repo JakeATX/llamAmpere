@@ -7,6 +7,7 @@
 #include "fattn-sjkvarn-v16.cuh"
 #include "fattn-sjkvarn-w8.cuh"
 #include "fattn-mma-turbo-d128-tq5t4.cuh"
+#include "fattn-sjkvarn-verify.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -4741,8 +4742,11 @@ static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & c
         return true; // fattn-sjkvarn-lowbits.cu rotates in-kernel or takes the separate passes itself
     }
     GGML_UNUSED(ctx);
-    // 4/4: the single-pass V16 / W8 compact kernels (GGML_SJKVARN_V16 / GGML_SJKVARN_W8) rotate in-kernel too
-    if (ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(dst) || ggml_cuda_flash_attn_ext_sj_kvarn_w8_supported(dst)) {
+    // 4/4: the single-pass V16 / W8 compact kernels (GGML_SJKVARN_V16 / GGML_SJKVARN_W8) rotate in-kernel too, as do
+    // the opt-in direct verify / PV16 stream paths (GGML_SJKVARN_DIRECT_VERIFY / GGML_SJKVARN_STREAM_PV16)
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(dst) || ggml_cuda_flash_attn_ext_sj_kvarn_w8_supported(dst) ||
+        ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst) ||
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_applies(dst)) {
         return true;
     }
     // 4/4: the stream decode kernel (fattn-sjkvarn-stream.cuh) through ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl
@@ -4893,6 +4897,9 @@ static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, cons
 // true when every chunk of this node is served by the n_q <= 8 decode kernel (a packed mask is judged by its f16
 // expansion, which ggml_cuda_fattn_mask_packed_native then selects for this node)
 static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst)) {
+        return false; // verify-tuned IMMA path handles T = 4..64 directly in a single launch
+    }
     if (!ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() || dst->src[6] == nullptr || ggml_cuda_fattn_sj_kvarn_is_lowbits(dst) ||
             ggml_flash_attn_ext_get_lsa_block(dst) > 0 || dst->src[7] != nullptr || dst->src[8] != nullptr || dst->src[9] != nullptr) {
         // LSA guard: block-list / value-key / selected-row / LSE nodes keep their per-node inputs whole. With LSA on, the
@@ -4992,6 +4999,10 @@ static bool ggml_cuda_fattn_mask_packed_native(const ggml_tensor * dst) {
     if (dst->src[6] != nullptr) {
         if (ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
             return ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(dst);
+        }
+        if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst) ||
+            ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_applies(dst)) {
+            return false; // expand I32 packed mask to F16 cleanly
         }
         ggml_tensor m16;
         ggml_cuda_fattn_mask_f16_desc(mask, m16);

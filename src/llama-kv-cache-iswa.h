@@ -116,6 +116,7 @@ public:
 
     // INKKV v2: the SWA cache holds the full-attention window copy (the far/near split can run)
     bool inkkv_near_copy() const { return near_copy; }
+    bool inkkv_swa_shared() const { return swa_shared; }
 
     // INKKV v2: most tokens per sequence in a ubatch shared by several sequences (init_batch)
     static uint32_t inkkv_mix_max();
@@ -124,6 +125,7 @@ public:
 private:
 
     bool near_copy = false;
+    bool swa_shared = false; // INKKV shared SWA staging (one unified SWA pool, per-stream base)
 
     const bool unified;
 

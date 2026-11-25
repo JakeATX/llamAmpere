@@ -894,6 +894,12 @@ llama_build_and_test(test-ai4-turbo-ids-route.cpp)   # [TURBO-IDS] direct-ids ro
 llama_build_and_test(test-gguf-deprecated-ai.cpp)
 
 llama_build_and_test(test-i8qk-ext-cpu.cpp LABEL "cpu" LINK ggml-base)
+if (NOT LLAMA_USE_SYSTEM_GGML AND GGML_CPU)
+    add_executable(test-sjkvarn-verify-cpu test-sjkvarn-verify-cpu.cpp)
+    target_link_libraries(test-sjkvarn-verify-cpu PRIVATE ggml-cpu ggml-base)
+    target_include_directories(test-sjkvarn-verify-cpu PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    llama_test(test-sjkvarn-verify-cpu LABEL "main;cpu")
+endif()
 
 if (GGML_CUDA AND NOT GGML_BACKEND_DL) # test-magic2-v2 links ggml-cuda directly (a MODULE under GGML_BACKEND_DL)
     enable_language(CUDA)
@@ -911,6 +917,11 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL) # test-magic2-v2 links ggml-cuda directly
     target_link_libraries(bench-i8qk-unblock PRIVATE ggml ggml-base ggml-cpu ggml-cuda)
     target_include_directories(bench-i8qk-unblock PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     set_target_properties(bench-i8qk-unblock PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 86)
+
+    add_executable(bench-sjkvarn-verify bench-sjkvarn-verify.cu)
+    target_link_libraries(bench-sjkvarn-verify PRIVATE ggml ggml-base ggml-cuda ggml-cpu)
+    target_include_directories(bench-sjkvarn-verify PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/include)
+    set_target_properties(bench-sjkvarn-verify PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 86)
 endif()
 
 # Pure-CPU verification harness for prefill-glue numerics (zero CUDA runtime / GPU device usage)

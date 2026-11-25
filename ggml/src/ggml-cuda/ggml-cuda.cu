@@ -2,6 +2,19 @@
 #include "qsa-resident.cuh"
 #include "ggml-cuda-kv-stream-testing.h"
 #include "moe-devsort.cuh"
+#include "q8p.cuh"
+
+// [INKDENSE Q8P] any copy into or out of a planar weight (or a view of one) first turns it back into Q8_0 blocks for good
+static void ggml_cuda_q8p_to_blocks(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return;
+    }
+    ggml_tensor * base = (ggml_tensor *) (t->view_src ? t->view_src : t);
+    if (ggml_cuda_q8p_is(base)) {
+        ggml_cuda_q8p_unpack_inplace(base, cudaStreamPerThread);
+        base->flags = (base->flags & ~GGML_CUDA_Q8P_FLAG) | GGML_CUDA_Q8P_FLAG_DENY;
+    }
+}
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc-impl.h"
@@ -1599,6 +1612,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1620,6 +1634,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     // TQ4_1S → q8_0 load-time conversion (default on, GGML_TQ_NATIVE=1 disables). Skipped for views
     // and for bases that already have a view (see ggml_backend_cuda_buffer_tq_view_follow_base).
     if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S && offset == 0 && size == ggml_nbytes(tensor) &&
@@ -1657,6 +1672,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1666,6 +1682,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(ggml_cuda_memcpy_h2d_2d_async(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1676,6 +1693,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1687,6 +1705,7 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
     ggml_cuda_set_device(ctx->device);
 
     for (size_t i = 0; i < n_tensors; i++) {
+        ggml_cuda_q8p_to_blocks(tensors[i]);
         if (sizes[i] == 0) {
             continue;
         }
@@ -1712,6 +1731,7 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, 
     }
 
     for (size_t i = 0; i < n_tensors; i++) {
+        ggml_cuda_q8p_to_blocks(tensors[i]);
         if (sizes[i] == 0) {
             continue;
         }
@@ -1727,6 +1747,8 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, 
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_cuda_q8p_to_blocks(src);
+    ggml_cuda_q8p_to_blocks(dst);
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -4461,6 +4483,24 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
+    if (ggml_cuda_q8p_is(src0_)) {
+        // [INKDENSE Q8P] decode: planar matvec; larger batches: unpack to Q8_0 blocks in the pool and take the usual path
+        if (dst->src[0] == src0_ && dst->src[1] == src1_ && ggml_cuda_q8p_mmv(ctx, &dst, 1)) {
+            return;
+        }
+        const size_t nbytes = ggml_nbytes(src0_);
+        const size_t alloc  = std::max(nbytes, ggml_backend_buffer_get_alloc_size(src0_->buffer, src0_));
+        ggml_cuda_pool_alloc<char> blocks(ctx.pool(), alloc);
+        if (alloc > nbytes) {
+            CUDA_CHECK(cudaMemsetAsync(blocks.get() + nbytes, 0, alloc - nbytes, ctx.stream()));
+        }
+        ggml_cuda_q8p_unpack_to(src0_, blocks.get(), ctx.stream());
+        ggml_tensor w = *src0_;
+        w.data   = blocks.get();
+        w.flags &= ~GGML_CUDA_Q8P_FLAG;
+        ggml_cuda_mul_mat(ctx, &w, src1_, dst);
+        return;
+    }
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
     ggml_cuda_pool_alloc<float> src1_rot_buf;
@@ -5594,6 +5634,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cuda_ctx->stream()));
 }
@@ -5605,6 +5646,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -5617,6 +5659,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(ggml_cuda_memcpy_h2d_2d_async(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cuda_ctx->stream()));
@@ -5630,12 +5673,16 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_cuda_q8p_any(src) || ggml_cuda_q8p_any(dst)) {
+        return false;   // [INKDENSE Q8P] the scheduler falls back to the synchronous copy, which converts
+    }
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
@@ -6393,7 +6440,8 @@ static bool ggml_backend_cuda_set_scratch_buffers(ggml_backend_t backend, ggml_b
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
-           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+           (t->op == GGML_OP_NONE && (t->src[0] == nullptr || !ggml_cuda_q8p_enabled()));   // [INKDENSE Q8P] a NONE node with sources is a hidden MUL_MAT
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -6627,6 +6675,22 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->moe_cache_generation = moe_cache_generation;
         res = true;
     }
+    // [INKDENSE Q8P] a weight changed layout (pack / unpack in place): every graph re-captures, including one reused by uid
+    bool q8p_changed = false;
+    if (ggml_cuda_q8p_enabled()) {   // port: no map/mutex work with the flag off
+        static std::unordered_map<const void *, uint64_t> q8p_seen;
+        static std::mutex q8p_seen_mutex;
+        std::lock_guard<std::mutex> q8p_lock(q8p_seen_mutex);
+        const uint64_t gen = ggml_cuda_q8p_generation();
+        auto it = q8p_seen.find(graph);
+        if (it == q8p_seen.end()) {
+            q8p_seen.emplace(graph, gen);
+        } else if (it->second != gen) {
+            it->second = gen;
+            q8p_changed = true;
+            res = true;
+        }
+    }
     // J3 scratch moved (generation bump): every graph holding the old pointers re-captures, including one reused by uid
     bool lsa_j3_changed = false;
     if (ggml_cuda_lsa_j3_graphs()) {
@@ -6669,7 +6733,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
-    if (!moe_cache_changed && !lsa_j3_changed && cgraph->uid != 0 &&
+    if (!moe_cache_changed && !lsa_j3_changed && !q8p_changed && cgraph->uid != 0 &&
         cgraph->uid == graph->uid &&
         kv_stream_generation == previous_kv_stream_generation) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -6748,7 +6812,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
+static void ggml_cuda_graph_instantiate_exec(cudaGraphExec_t * instance, cudaGraph_t cuda_graph) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
     // fork MOEGAP: GGML_CUDA_GRAPH_NODE_PRIORITY=1 (default off) keeps the priority each kernel was captured
     // with. Without it a replayed graph runs every node at one priority, so the hit-first expert copies (captured
@@ -6759,8 +6823,7 @@ static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
         return v && std::strcmp(v, "1") == 0;
     }();
     if (node_prio || ggml_cuda_moe_table_prefetch_enabled()) {
-        CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph,
-                                                 cudaGraphInstantiateFlagUseNodePriority));
+        CUDA_CHECK(cudaGraphInstantiateWithFlags(instance, cuda_graph, cudaGraphInstantiateFlagUseNodePriority));
         return;
     }
 #else
@@ -6768,7 +6831,11 @@ static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
         GGML_ABORT("GGML_MOE_TABLE_PREFETCH requires CUDA >= 11.7 for captured node priorities");
     }
 #endif
-    CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+    CUDA_CHECK(cudaGraphInstantiate(instance, cuda_graph, NULL, NULL, 0));
+}
+
+static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
+    ggml_cuda_graph_instantiate_exec(&graph->instance, graph->graph);
 }
 
 // [HOSTGAP08] GGML_CUDA_GRAPH_LOG=1 also logs the device memory each instantiate takes (cudaMemGetInfo before/after,
@@ -6818,6 +6885,174 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         ggml_cuda_graph_instantiate(graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+    }
+}
+
+// [GLCHUNK] GGML_CUDA_GRAPH_CHUNK=N (default 0 = off): capture a graph as a series of executables of about N ggml nodes each,
+// launching each one as soon as its capture ends, and on replay launching them in order on the same stream. A graph launch
+// call costs host time per node (~0.8 us) and the GPU starts its first kernel only when the call returns, so a 5,000-node
+// multi-user decode graph leaves the GPU idle ~4 ms per step. With chunks the GPU starts after the first chunk and the rest
+// is enqueued while it runs. The kernels, their order and their stream are unchanged. GGML_CUDA_GRAPH_CHUNK_FIRST (default
+// N/4, at least 16) sizes the first chunk. Cuts are made only in a graph whose last whole capture was one chain of nodes (no
+// side-stream fork anywhere in it), only on the main stream, and never inside a concurrent or shared-expert side region.
+static int ggml_cuda_graph_chunk_nodes() {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return 0;
+#else
+    static const int n = [] { const char * e = getenv("GGML_CUDA_GRAPH_CHUNK"); return e ? std::max(0, atoi(e)) : 0; }();
+    return n;
+#endif
+}
+
+static int ggml_cuda_graph_chunk_first() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_CHUNK_FIRST");
+        return std::max(16, e ? atoi(e) : ggml_cuda_graph_chunk_nodes() / 4);
+    }();
+    return n;
+}
+
+// true when every node has at most one dependency and one dependent and the edges connect all nodes (a single chain)
+static bool ggml_cuda_graph_is_chain(cudaGraph_t cuda_graph) {
+    size_t n_nodes = 0, n_edges = 0;
+    if (cudaGraphGetNodes(cuda_graph, nullptr, &n_nodes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 13000
+    cudaError_t err = cudaGraphGetEdges(cuda_graph, nullptr, nullptr, nullptr, &n_edges);
+#else
+    cudaError_t err = cudaGraphGetEdges(cuda_graph, nullptr, nullptr, &n_edges);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (n_nodes <= 1) {
+        return n_edges == 0;
+    }
+    if (n_edges != n_nodes - 1) {
+        return false;
+    }
+    std::vector<cudaGraphNode_t> from(n_edges), to(n_edges);
+#if CUDART_VERSION >= 13000
+    err = cudaGraphGetEdges(cuda_graph, from.data(), to.data(), nullptr, &n_edges);
+#else
+    err = cudaGraphGetEdges(cuda_graph, from.data(), to.data(), &n_edges);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::unordered_map<cudaGraphNode_t, uint8_t> n_out, n_in;
+    n_out.reserve(n_edges);
+    n_in.reserve(n_edges);
+    for (size_t i = 0; i < n_edges; ++i) {
+        if (++n_out[from[i]] > 1 || ++n_in[to[i]] > 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A cut is safe when the capture so far is one chain of nodes whose last node is the capturing stream's only dependency:
+// no side stream holds work that is not joined back yet (ending the capture then would fail). 1 = safe, 0 = nothing captured
+// yet (try a later node), -1 = not a chain (stop cutting this graph).
+static int ggml_cuda_graph_capture_cut_ok(cudaStream_t stream) {
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaGraph_t cuda_graph = nullptr;
+    const cudaGraphNode_t * deps = nullptr;
+    size_t n_deps = 0;
+#if CUDART_VERSION >= 13000
+    cudaError_t err = cudaStreamGetCaptureInfo(stream, &st, nullptr, &cuda_graph, &deps, nullptr, &n_deps);
+#else
+    cudaError_t err = cudaStreamGetCaptureInfo(stream, &st, nullptr, &cuda_graph, &deps, &n_deps);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    if (st != cudaStreamCaptureStatusActive || cuda_graph == nullptr) {
+        return -1;
+    }
+    if (n_deps == 0) {
+        return 0;
+    }
+    if (n_deps != 1 || !ggml_cuda_graph_is_chain(cuda_graph)) {
+        return -1;
+    }
+    size_t n_out = 0;
+#if CUDART_VERSION >= 13000
+    err = cudaGraphNodeGetDependentNodes(deps[0], nullptr, nullptr, &n_out);
+#else
+    err = cudaGraphNodeGetDependentNodes(deps[0], nullptr, &n_out);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    return n_out == 0 ? 1 : -1;
+}
+
+// end the capture of chunk idx, create or update its executable and launch it; chunk 0 lives in graph->graph / instance
+static void ggml_cuda_graph_chunk_launch(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, uint64_t graph_key, size_t idx) {
+    cudaGraph_t cuda_graph = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
+    if (!ggml_cuda_graph_is_chain(cuda_graph)) {
+        graph->chunk_state = -1;  // the next capture of this graph is whole again
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: a graph chunk is not a single chain of nodes; this graph is captured whole from now on\n", __func__);
+        }
+    }
+    if (idx == 0) {
+        if (graph->graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+        }
+        graph->graph = cuda_graph;
+        if (graph->instance == nullptr) {
+            ggml_cuda_graph_instantiate(graph);
+        } else {
+            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        return;
+    }
+    const size_t k = idx - 1;
+    GGML_ASSERT(k <= graph->chunk_tail.size());
+    if (k == graph->chunk_tail.size()) {
+        graph->chunk_tail.push_back(nullptr);
+        ggml_cuda_graph_instantiate_exec(&graph->chunk_tail[k], cuda_graph);
+    } else {
+#if CUDART_VERSION >= 12000
+        cudaGraphExecUpdateResultInfo result_info;
+        cudaError_t stat = cudaGraphExecUpdate(graph->chunk_tail[k], cuda_graph, &result_info);
+#else
+        cudaGraphNode_t errorNode;
+        cudaGraphExecUpdateResult result_info;
+        cudaError_t stat = cudaGraphExecUpdate(graph->chunk_tail[k], cuda_graph, &errorNode, &result_info);
+#endif // CUDART_VERSION >= 12000
+        if (stat == cudaErrorGraphExecUpdateFailure) {
+            (void) cudaGetLastError();
+            CUDA_CHECK(cudaGraphExecDestroy(graph->chunk_tail[k]));
+            graph->chunk_tail[k] = nullptr;
+            ggml_cuda_graph_instantiate_exec(&graph->chunk_tail[k], cuda_graph);
+        } else {
+            GGML_ASSERT(stat == cudaSuccess);
+        }
+    }
+    CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+    CUDA_CHECK(cudaGraphLaunch(graph->chunk_tail[k], cuda_ctx->stream()));
+}
+
+// keep the first n tail executables (a shorter or whole capture drops the rest)
+static void ggml_cuda_graph_chunk_trim(ggml_cuda_graph * graph, size_t n) {
+    for (size_t i = n; i < graph->chunk_tail.size(); ++i) {
+        CUDA_CHECK(cudaGraphExecDestroy(graph->chunk_tail[i]));
+    }
+    if (graph->chunk_tail.size() > n) {
+        graph->chunk_tail.resize(n);
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -11174,6 +11409,96 @@ static int ggml_cuda_try_moe_onechain_fill(ggml_backend_cuda_context & ctx, ggml
     return 2;
 }
 
+// [INKDENSE Q8P] GGML_CUDA_Q8P=1 (default off): before a graph runs, every Q8_0 weight it uses only as src0 of MUL_MAT is
+// repacked in place to planes (q8p.cuh); a weight that any graph uses in another way goes back to blocks for good.
+static void ggml_cuda_q8p_prepare(ggml_backend_cuda_context & ctx, ggml_cgraph * g) {
+    const auto is_weight = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_Q8_0 && t->buffer != nullptr &&
+               ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    };
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            ggml_tensor * s = n->src[k];
+            if (s == nullptr) {
+                continue;
+            }
+            ggml_tensor * base = s->view_src ? s->view_src : s;
+            if ((n->op == GGML_OP_MUL_MAT && k == 0 && s == base) || (base->flags & GGML_CUDA_Q8P_FLAG_DENY) || !is_weight(base)) {
+                continue;
+            }
+            if (base->flags & GGML_CUDA_Q8P_FLAG) {
+                ggml_cuda_q8p_unpack_inplace(base, ctx.stream());
+                base->flags &= ~GGML_CUDA_Q8P_FLAG;
+            }
+            base->flags |= GGML_CUDA_Q8P_FLAG_DENY;
+        }
+    }
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        if (n->op != GGML_OP_MUL_MAT || n->src[0] == nullptr) {
+            continue;
+        }
+        ggml_tensor * w = n->src[0];
+        if ((w->flags & (GGML_CUDA_Q8P_FLAG | GGML_CUDA_Q8P_FLAG_DENY)) || !is_weight(w) || !ggml_cuda_q8p_shape_ok(w) ||
+                w->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) {
+            continue;
+        }
+        ggml_cuda_q8p_pack_inplace(w, ctx.stream());
+        w->flags |= GGML_CUDA_Q8P_FLAG;
+    }
+}
+
+// eval loop: node i is a planar MUL_MAT (op hidden as NONE). With can_group, later planar MUL_MATs with the same batch
+// whose activations do not come from an earlier member join one launch; view / no-op nodes between them are passed
+// over. Returns the nodes to skip.
+static int ggml_cuda_q8p_launch_run(ggml_backend_cuda_context & ctx, ggml_cgraph * g, const int i, const int n_limit,
+                                    const std::vector<uint8_t> & mark, const bool can_group) {
+    ggml_tensor * a = g->nodes[i];
+    ggml_tensor * dsts[GGML_CUDA_Q8P_GRP_MAX] = { a };
+    int n = 1, last = i;
+    const int64_t N = a->src[1]->ne[1];
+    if (can_group && N <= 8 && a->src[1]->ne[2] == 1 && a->src[1]->ne[3] == 1) {
+        for (int j = i + 1; j < n_limit && n < GGML_CUDA_Q8P_GRP_MAX; ++j) {
+            ggml_tensor * b = g->nodes[j];
+            if (!mark[j]) {
+                if (ggml_cuda_is_view_or_noop(b) || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+                break;
+            }
+            if ((b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || b->src[1] != a->src[1]) {
+                break;   // same activations only: a freed src1 of one member may be reused for a later member's dst
+            }
+            const ggml_tensor * x = b->src[1]->view_src ? b->src[1]->view_src : b->src[1];
+            bool dep = false;
+            for (int k = 0; k < n; ++k) {
+                dep |= x == dsts[k] || x == (dsts[k]->view_src ? dsts[k]->view_src : dsts[k]);
+            }
+            if (dep) {
+                break;
+            }
+            dsts[n++] = b;
+            last = j;
+        }
+    }
+    if (n > 1 && ggml_cuda_q8p_mmv(ctx, dsts, n)) {
+        return last - i;
+    }
+    ggml_cuda_mul_mat(ctx, a->src[0], a->src[1], a);
+    return 0;
+}
+
+// graph_optimize test (the flag is set only at the first compute): a MUL_MAT that will run planar
+static bool ggml_cuda_q8p_member(const ggml_tensor * n) {
+    if (!ggml_cuda_q8p_enabled() || n->op != GGML_OP_MUL_MAT || n->src[0] == nullptr || n->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w = n->src[0];
+    return (ggml_cuda_q8p_is(w) || ((w->flags & GGML_CUDA_Q8P_FLAG_DENY) == 0 && ggml_cuda_q8p_shape_ok(w))) &&
+           n->src[1]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32;
+}
+
 // [INKDENSE] GGML_CUDA_AI_MMV_GROUP (default on, =0 off): AI+ unit-type MUL_MATs that read the same activations (Inkling q / gate /
 // rel of a visit, and k / v where they share the input) are moved next to each other at graph_optimize and run as one grouped
 // decode mmv launch (ggml_cuda_mul_mat_ai4_group; bitwise equal to the separate launches).
@@ -11202,6 +11527,15 @@ static bool ggml_cuda_ai_mmv_group_pair(const ggml_tensor * a, const ggml_tensor
            b->src[0]->ne[0] == a->src[0]->ne[0];
 }
 
+static bool ggml_cuda_grp_member(const ggml_tensor * n) {
+    return (ggml_cuda_ai_mmv_group_on() && ggml_cuda_ai_mmv_group_member(n)) || ggml_cuda_q8p_member(n);
+}
+
+static bool ggml_cuda_grp_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    return ggml_cuda_ai_mmv_group_member(a) ? ggml_cuda_ai_mmv_group_pair(a, b)
+                                            : ggml_cuda_q8p_member(b) && b->src[1] == a->src[1];
+}
+
 // graph_optimize: move every later member that shares the first member's activations (and layout, K) up behind it. A member
 // reads only its weight (a leaf) and the shared activations, which are computed before the first member, so the order stays
 // valid.
@@ -11217,7 +11551,7 @@ static void ggml_cuda_ai_mmv_group_optimize(ggml_cgraph * g) {
         }
         ggml_tensor * a = g->nodes[i];
         order.push_back(a);
-        if (!ggml_cuda_ai_mmv_group_member(a)) {
+        if (!ggml_cuda_grp_member(a)) {
             continue;
         }
         int cnt = 1;
@@ -11229,7 +11563,7 @@ static void ggml_cuda_ai_mmv_group_optimize(ggml_cgraph * g) {
             if (!taken[j] && k->view_src == base && !pure_view) {
                 break;   // writes the shared activations in place: no later member may move above it
             }
-            if (!taken[j] && ggml_cuda_ai_mmv_group_pair(a, g->nodes[j])) {
+            if (!taken[j] && ggml_cuda_grp_pair(a, g->nodes[j])) {
                 taken[j] = 1;
                 order.push_back(g->nodes[j]);
                 moved += j != i + cnt;
@@ -16532,6 +16866,12 @@ static void ggml_cuda_launch_stats_add(int n_nodes, int64_t pre_us, int64_t laun
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
+#ifdef USE_CUDA_GRAPH
+    // [GLCHUNK] chunked capture state: chunk_next = node index of the next cut (INT_MAX = no cuts this capture)
+    ggml_cuda_graph * chunk_graph = use_cuda_graph && ggml_cuda_graph_chunk_nodes() > 0 ? cuda_ctx->cuda_graph(graph_key) : nullptr;
+    int    chunk_next  = INT_MAX;
+    size_t n_chunk_cut = 0;
+#endif
 
     // GGML_CUDA_INKGLUE_DUMP=<file> (diagnostic, off by default): write the node list (op, name, shape, sources) of the
     // first graph with >= 1,500 nodes and a 1-row ubatch (decode) to <file>, to map kernels to graph nodes.
@@ -16701,6 +17041,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             const auto kv_stream_runtimes = ggml_cuda_kv_stream_prepare_graph(
                 cgraph, cuda_ctx->stream());
 
+            // [INKDENSE Q8P] planar MUL_MATs read as GGML_OP_NONE for every plan and fusion below (none of them knows the
+            // layout); the loop launches them itself and the ops are restored after it
+            std::vector<uint8_t> q8p_mark;
+            if (ggml_cuda_q8p_enabled()) {
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op == GGML_OP_MUL_MAT && ggml_cuda_q8p_is(n->src[0])) {
+                        if (q8p_mark.empty()) {
+                            q8p_mark.assign(cgraph->n_nodes, 0);
+                        }
+                        q8p_mark[i] = 1;
+                        n->op = GGML_OP_NONE;
+                    }
+                }
+            }
             // [#87] GET_ROWS state gathers the gated_delta_net launches replace (see ggml_cuda_gdn_state_read_plan)
             std::vector<uint8_t> gdn_state_read_skip;
             // [#110] CONCAT and snapshot-window nodes the conv ring ssm_conv launches replace (ggml_cuda_conv_ring_plan)
@@ -16746,8 +17101,36 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_host_block_timer host_block;
 
             const bool pf_on = ggml_cuda_prefill_any_on();
+#ifdef USE_CUDA_GRAPH
+            // [GLCHUNK] cut this capture into chunks (see ggml_cuda_graph_chunk_launch)
+            if (use_cuda_graph && cuda_graph_update_required && chunk_graph != nullptr && chunk_graph->chunk_state == 1 &&
+                    shexp_runs.empty() && stream_ctx.concurrent_events.empty() && !should_launch_concurrent_events &&
+                    kv_stream_runtimes.empty() && cuda_ctx->curr_stream_no == 0) {
+                chunk_next = ggml_cuda_graph_chunk_first();
+            }
+#endif
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                if (i >= chunk_next && i + 32 <= cgraph->n_nodes && !is_concurrent_event_active && shexp_state == 0 &&
+                        cuda_ctx->curr_stream_no == 0) {
+                    const int cut = ggml_cuda_graph_capture_cut_ok(cuda_ctx->stream());
+                    if (cut < 0) {
+                        chunk_graph->chunk_state = -1;  // a side stream is open here: this graph stays whole from now on
+                        chunk_next = INT_MAX;
+                        static std::atomic<int> n_logged{0};
+                        if (n_logged.fetch_add(1) < 4) {
+                            GGML_LOG_INFO("%s: [GLCHUNK] graph %016llx: no safe cut at node %d (side-stream work open), "
+                                          "captured whole from the next capture on\n", __func__, (unsigned long long) graph_key, i);
+                        }
+                    } else if (cut > 0) {
+                        ggml_cuda_graph_chunk_launch(cuda_ctx, chunk_graph, graph_key, n_chunk_cut++);
+                        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                        chunk_next = chunk_graph->chunk_state == 1 ? i + ggml_cuda_graph_chunk_nodes() : INT_MAX;
+                    }
+                }
+#endif
                 if (op_times) {
                     op_times->mark(cuda_ctx->device, op_times_stream, i);
                 }
@@ -16815,6 +17198,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     fusion_graph.n_nodes = shexp_cur->join_at;
                 } else if (shexp_next < shexp_runs.size()) {
                     fusion_graph.n_nodes = shexp_runs[shexp_next].begin;
+                }
+
+                if (!q8p_mark.empty() && q8p_mark[i]) {
+                    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    i += ggml_cuda_q8p_launch_run(*cuda_ctx, cgraph, i, fusion_graph.n_nodes, q8p_mark,
+                            stream_ctx.concurrent_events.empty() && shexp_runs.empty() && !is_concurrent_event_active);
+                    continue;
                 }
 
                 if (ggml_cuda_is_view_or_noop(node)) {
@@ -16962,6 +17354,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            for (size_t k = 0; k < q8p_mark.size(); ++k) {
+                if (q8p_mark[k]) {
+                    cgraph->nodes[k]->op = GGML_OP_MUL_MAT;   // [INKDENSE Q8P] restore
+                }
+            }
             // [VSHX] a chain or a join still open at the end of the graph
             if (shexp_state != 0) {
                 const int dev = cuda_ctx->device;
@@ -17016,12 +17413,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (graph->graph != nullptr) {
-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
-                graph->graph = nullptr;
-            }
+            if (n_chunk_cut > 0) {
+                // [GLCHUNK] the last chunk: earlier chunks were launched at their cuts
+                ggml_cuda_graph_chunk_launch(cuda_ctx, graph, graph_key, n_chunk_cut);
+                ggml_cuda_graph_chunk_trim(graph, n_chunk_cut);
+                static std::atomic<int> n_logged{0};
+                if (n_logged.fetch_add(1) < 4) {
+                    GGML_LOG_INFO("%s: [GLCHUNK] graph %016llx (%d nodes) captured as %zu chunks\n", __func__,
+                                  (unsigned long long) graph_key, cgraph->n_nodes, n_chunk_cut + 1);
+                }
+            } else {
+                if (graph->graph != nullptr) {
+                    CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                    graph->graph = nullptr;
+                }
 
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+                CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+                if (chunk_graph != nullptr) {
+                    ggml_cuda_graph_chunk_trim(graph, 0);  // captured whole: no tail chunks
+                    if (graph->chunk_state == 0) {
+                        graph->chunk_state = ggml_cuda_graph_is_chain(graph->graph) ? 1 : -1;
+                        static std::atomic<int> n_logged{0};
+                        if (graph->chunk_state < 0 && n_logged.fetch_add(1) < 4) {
+                            GGML_LOG_INFO("%s: [GLCHUNK] graph %016llx (%d nodes) is not one chain of nodes (a side-stream fork): "
+                                          "captured whole\n", __func__, (unsigned long long) graph_key, cgraph->n_nodes);
+                        }
+                    } else if (graph->chunk_state == 1) {
+                        graph->chunk_tried = true;  // a capture after the check made no cut (no forced re-capture again)
+                    }
+                }
+            }
+            if (n_chunk_cut > 0) {
+                graph->chunk_tried = true;
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -17035,19 +17459,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            ggml_cuda_graph_instantiate(graph);
-        }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
-        }
-        // Launch graph
-        if (ggml_cuda_launch_stats_enabled()) {
-            const int64_t t_launch = ggml_time_us();
+        if (n_chunk_cut == 0) {  // [GLCHUNK] a chunked capture launched its chunks as they were captured
+            if (graph->instance == nullptr) { // Create executable graph from captured graph.
+                ggml_cuda_graph_instantiate(graph);
+            }
+            if (cuda_graph_update_required) { // Update graph executable
+                ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            }
+            // Launch graph (and, for a graph captured in chunks, the chunks after the first, in order)
+            const int64_t t_launch = ggml_cuda_launch_stats_enabled() ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-            ggml_cuda_launch_stats_add(cgraph->n_nodes, t_launch - g_cuda_graph_compute_t_entry, ggml_time_us() - t_launch);
-        } else {
-            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            for (cudaGraphExec_t exec : graph->chunk_tail) {
+                CUDA_CHECK(cudaGraphLaunch(exec, cuda_ctx->stream()));
+            }
+            if (ggml_cuda_launch_stats_enabled()) {
+                ggml_cuda_launch_stats_add(cgraph->n_nodes, t_launch - g_cuda_graph_compute_t_entry, ggml_time_us() - t_launch);
+            }
         }
         if (!cuda_graph_update_required) {
             cuda_ctx->fusion_stats.cuda_graph_replays++;   // a launch with no host-side op code run this eval
@@ -17087,6 +17514,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_backend_cuda_upload_flush(backend);  // no-op unless GGML_SCHED_UPLOAD_BATCH=1 staged copies are waiting
     ggml_cuda_lsa_ahead_graph_begin(*cuda_ctx, cgraph); // GGML_CUDA_LSA_STAGE_AHEAD: none applied across graphs; first layer queued here
+    if (ggml_cuda_q8p_enabled()) {
+        ggml_cuda_q8p_prepare(*cuda_ctx, cgraph);   // [INKDENSE Q8P] before any capture: repacks are synchronous
+    }
     if (cuda_ctx->scratch_borrowed && !ggml_cuda_borrowed_plan_fits(*cuda_ctx, cgraph)) {
         GGML_LOG_ERROR("%s: graph does not fit borrowed CUDA scratch\n", __func__);
         return GGML_STATUS_ALLOC_FAILED;
@@ -17200,6 +17630,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    // [GLCHUNK] a replayed graph that passed the chain check is captured once more, in chunks
+    if (use_cuda_graph && !cuda_graph_update_required && ggml_cuda_graph_chunk_nodes() > 0) {
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (graph->chunk_state == 1 && !graph->chunk_tried && graph->instance != nullptr &&
+                cgraph->n_nodes > ggml_cuda_graph_chunk_first() + 32) {
+            cuda_graph_update_required = true;
+        }
+    }
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -17264,7 +17702,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_nemotron_ssm_prepare(cgraph, params);
     }
 
-    if (!disable_fusion && ggml_cuda_ai_mmv_group_on()) {
+    if (!disable_fusion && (ggml_cuda_ai_mmv_group_on() || ggml_cuda_q8p_enabled())) {
         ggml_cuda_ai_mmv_group_optimize(cgraph);
     }
 

@@ -98,7 +98,8 @@ static ggml_tensor * build_attn_inp_kq_mask(
         bool allow_packed = false) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    // a unified cache (cparams, or INKKV's shared SWA pool beside a per-stream base) has one-stream masks
+    const auto n_stream = (cparams.kv_unified || mctx->get_n_stream_cache() == 1) ? 1 : ubatch.n_seqs_unq;
 
     if (allow_packed && cparams.kq_mask_packed && cparams.flash_attn && !cparams.training) {
         // [#175] one-bit packed mask: 32 KV positions per I32 word (see ggml_flash_attn_ext); op_params[0] keeps n_kv
@@ -206,7 +207,8 @@ static bool can_reuse_kq_mask(
         const llama_cparams & cparams) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    // a unified cache (cparams, or INKKV's shared SWA pool beside a per-stream base) has one-stream masks
+    const auto n_stream = (cparams.kv_unified || mctx->get_n_stream_cache() == 1) ? 1 : ubatch.n_seqs_unq;
 
     bool res = true;
 

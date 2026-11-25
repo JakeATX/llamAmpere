@@ -214,6 +214,10 @@ public:
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
     std::vector<uint32_t> get_layer_ids() const;
+
+    // INKKV shared SWA staging: search free cells from cell 0 on every ubatch (first fit), so the used cells of a
+    // pool sized for n_seq_max windows stay packed at the front and n_kv follows the cells in use, not the pool
+    void set_first_fit(bool on) { first_fit = on; }
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
     bool get_v_transposed() const;
@@ -705,6 +709,7 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
+    bool first_fit = false;
 
     // [INKB1] b1_undo_mark / b1_undo
     struct {
@@ -871,6 +876,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_stream_cache() const; // streams of the cache (1 = unified: one-stream masks)
     uint32_t get_n_kv_rows() const;
     uint32_t get_kv_size() const; // cells of the cache (LSA index cache rows on SJ-KVaRN)
     // fork PPLAN: the n_kv the rest of this batch reaches plus `extra` cells (0 for a reserve / update context), and a

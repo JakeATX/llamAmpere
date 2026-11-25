@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vecdotq.cuh"
+#include "mmq-nvfp4-ampere.cuh"
 
 #include "mmq.cuh"
 
@@ -2090,3 +2091,149 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
         x_u32_scale[i*sram_stride] = get_int_b4(bxi->d, 0);
     }
 }
+
+#if defined(AMPERE_MMA_AVAILABLE)
+// BP-1B (Fast Default on Ampere): Block-128 scale-folded INT8 tile loader for NVFP4.
+// Decodes the 8 UE4M3 scales per 128-weight chunk with branchless bit-math (0 ldexpf, 0 MUFU),
+// computes s_max across the 8 sub-blocks via a 1-lane warp shuffle, rescales each sub-block's
+// E2M1x2 values via a register-only PRMT LUT into int8 [-127, +127] (0 I2FP, 0 F2I),
+// and stores ONE float scale (s_max * 12/127) per 128 weights in x_df[i*sram_stride + chunk].
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4_ampere_k128(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile,
+        const int kb0, const int i_max, const int stride) {
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
+    constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1);
+
+    int   * x_qs = (int   *) x_tile;
+    float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
+
+    constexpr int threads_per_row = MMQ_ITER_K / QK_NVFP4; // 256 / 64 = 4 threads/row
+    constexpr int rows_per_warp   = warp_size / threads_per_row; // 8 rows/warp
+    const int kbx         = threadIdx.x % threads_per_row; // 0..3 (pairs (0,1) and (2,3) form K=128 chunks)
+    const int row_in_warp = threadIdx.x / threads_per_row;
+
+#pragma unroll 1
+    for (int i0 = 0; i0 < I; i0 += rows_per_warp * nwarps) {
+        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+
+        if constexpr (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_nvfp4 * bxi = ggml_cuda_mmq_x_row<block_nvfp4, has_fusion>(x, x_gate, kb0, i, stride) + kbx;
+        const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
+
+        // Decode 4 UE4M3 scales for this block (0 ldexpf, 0 MUFU):
+        const uint32_t d_packed = get_int_b4(bxi->d, 0);
+        float sc[4];
+        sc[0] = nvfp4_ue4m3_to_fp32_fast(static_cast<uint8_t>((d_packed >>  0) & 0xFFu));
+        sc[1] = nvfp4_ue4m3_to_fp32_fast(static_cast<uint8_t>((d_packed >>  8) & 0xFFu));
+        sc[2] = nvfp4_ue4m3_to_fp32_fast(static_cast<uint8_t>((d_packed >> 16) & 0xFFu));
+        sc[3] = nvfp4_ue4m3_to_fp32_fast(static_cast<uint8_t>((d_packed >> 24) & 0xFFu));
+
+        // Reduce s_max across the 8 sub-blocks of this 128-weight chunk (adjacent lanes kbx^1):
+        float s_max = fmaxf(fmaxf(sc[0], sc[1]), fmaxf(sc[2], sc[3]));
+        s_max = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFFu, s_max, 1));
+
+        // 1/s_max * (4096 * 127/12) via no-MUFU Newton-Raphson reciprocal:
+        const float inv_smax_q12 = (4096.0f * (127.0f / 12.0f)) * nvfp4_fast_rcp_no_mufu(s_max);
+
+        const int kqs = 16 * kbx;
+
+#pragma unroll
+        for (int sub = 0; sub < QK_NVFP4 / QK_NVFP4_SUB; ++sub) {
+            const int r_raw = nvfp4_magic_f2i(sc[sub] * inv_smax_q12);
+            const uint32_t R = static_cast<uint32_t>(min(max(r_raw, 0), 43349));
+
+            const uint32_t R2  = R << 1;
+            const uint32_t R3  = R2 + R;
+            const uint32_t R4  = R << 2;
+            const uint32_t R6  = R3 << 1;
+            const uint32_t R8  = R << 3;
+            const uint32_t R12 = R6 << 1;
+
+            const uint32_t v1  = (R   + 2048u) >> 12;
+            const uint32_t v2  = (R2  + 2048u) >> 12;
+            const uint32_t v3  = (R3  + 2048u) >> 12;
+            const uint32_t v4  = (R4  + 2048u) >> 12;
+            const uint32_t v6  = (R6  + 2048u) >> 12;
+            const uint32_t v8  = (R8  + 2048u) >> 12;
+            const uint32_t v12 = (R12 + 2048u) >> 12;
+
+            // Pack 16-entry signed int8 LUT in 4 registers; (0x80808080 - t) ^ 0x80808080 negates bytes in [0..127] in 2 ops!
+            const uint32_t t0 = (v1 << 8) | (v2 << 16) | (v3 << 24);
+            const uint32_t t1 = v4 | (v6 << 8) | (v8 << 16) | (v12 << 24);
+            const uint32_t t2 = (0x80808080u - t0) ^ 0x80808080u;
+            const uint32_t t3 = (0x80808080u - t1) ^ 0x80808080u;
+
+            const int2 q0 = nvfp4_lut_i8_regs(src_qs[2 * sub + 0], t0, t1, t2, t3);
+            const int2 q1 = nvfp4_lut_i8_regs(src_qs[2 * sub + 1], t0, t1, t2, t3);
+
+            x_qs[i * sram_stride + kqs + 4 * sub + 0] = q0.x;
+            x_qs[i * sram_stride + kqs + 4 * sub + 1] = q1.x;
+            x_qs[i * sram_stride + kqs + 4 * sub + 2] = q0.y;
+            x_qs[i * sram_stride + kqs + 4 * sub + 3] = q1.y;
+        }
+
+        // Store ONE float scale per 128-weight chunk:
+        if ((kbx & 1) == 0) {
+            x_df[i * sram_stride + (kbx >> 1)] = s_max * (12.0f / 127.0f);
+        }
+    }
+}
+
+// BP-1A (Bit-Exact Mode on Ampere): Pre-scaled BF16 tile loader for NVFP4 (K_vram = 128 = 2 blocks/row).
+// Decodes E2M1 x UE4M3 directly into 100% bit-exact BF16 in SMEM using branchless UE4M3 + register PRMT LUT
+// (0 ldexpf, 0 MUFU, 0 I2FP, 0 F2I, 0.00% weight error).
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4_ampere_bf16(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile,
+        const int kb0, const int i_max, const int stride) {
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
+    constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1);
+
+    uint32_t * x_bf2 = reinterpret_cast<uint32_t *>(x_tile);
+
+    // 128 weights/row = 8 sub-blocks of 16 weights -> 8 threads/row, 4 rows/warp.
+    constexpr int threads_per_row = MMQ_ITER_K_BF16 / QK_NVFP4_SUB; // 8
+    constexpr int rows_per_warp   = warp_size / threads_per_row;    // 4
+    const int sub_row     = threadIdx.x % threads_per_row; // 0..7
+    const int row_in_warp = threadIdx.x / threads_per_row; // 0..3
+    const int kbx         = sub_row >> 2;                  // 0..1 (block_nvfp4 index)
+    const int sub_in_blk  = sub_row & 3;                   // 0..3 (sub-block within block_nvfp4)
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += rows_per_warp * nwarps) {
+        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+
+        if constexpr (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_nvfp4 * bxi = ggml_cuda_mmq_x_row<block_nvfp4, has_fusion>(x, x_gate, kb0, i, stride) + kbx;
+        const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
+
+        const float d = nvfp4_ue4m3_to_fp32_fast(bxi->d[sub_in_blk]);
+        uint32_t lo0, lo1, hi0, hi1;
+        nvfp4_build_bf16_lut(d, lo0, lo1, hi0, hi1);
+
+        const uint4 q0 = nvfp4_decode_q4_bf16x8(src_qs[2 * sub_in_blk + 0], lo0, lo1, hi0, hi1);
+        const uint4 q1 = nvfp4_decode_q4_bf16x8(src_qs[2 * sub_in_blk + 1], lo0, lo1, hi0, hi1);
+
+        uint32_t * dst = x_bf2 + i * sram_stride + 8 * sub_row;
+        dst[0] = q0.x;
+        dst[1] = q0.y;
+        dst[2] = q1.x;
+        dst[3] = q1.y;
+        dst[4] = q0.z;
+        dst[5] = q0.w;
+        dst[6] = q1.z;
+        dst[7] = q1.w;
+    }
+}
+#endif // defined(AMPERE_MMA_AVAILABLE)

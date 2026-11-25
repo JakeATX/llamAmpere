@@ -2399,6 +2399,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<common_speculative_cdepth_state> cd_state; // [n_seq]
     bool cd_chain_warned = false;
 
+    // [WEAKCUT] weak-block cut (default OFF after the 11-21 gate failed: 8K -2.2%, f100 +0.2%; LLAMA_SPEC_WEAK_CUT=1 turns it on; LLAMA_SPEC_WEAK_CUT_TAU, default 0.5):
+    // in a one-sequence adaptive round with a cap of 5 or more, when the product of the drafter's top-1 probabilities
+    // at draft positions 0-2 is below tau, stop drafting 2 tokens early. Only the draft length changes; every drafted
+    // token is verified as before (lossless). TREEVERIFY replay: +0.7% @8K, +1.1% @98,766 (model).
+    std::vector<float>    wc_prod; // [n_seq] running product of top-1 draft probabilities this round
+    std::vector<uint8_t>  wc_cut;  // [n_seq] this round was cut
+    uint64_t wc_n_cut = 0, wc_n_rounds = 0;
+    static bool weak_cut_enabled() {
+        static const bool on = [] { const char * e = getenv("LLAMA_SPEC_WEAK_CUT"); return e && atoi(e) != 0; }();
+        return on;
+    }
+    static float weak_cut_tau() {
+        static const float t = [] { const char * e = getenv("LLAMA_SPEC_WEAK_CUT_TAU"); return e ? (float) atof(e) : 0.5f; }();
+        return t;
+    }
+
     void note_target_conf(llama_seq_id seq_id, const float * p, size_t n) override {
         if (cdepth && seq_id >= 0 && seq_id < (llama_seq_id) cd_state.size()) {
             cd_state[seq_id].note_target(p, n, cd_model.window);
@@ -2436,6 +2452,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // n_cap/n_last are written by the shared draft loop in both modes
         n_cap.assign(n_seq, 0);
         n_own.assign(n_seq, 0);
+        wc_prod.assign(n_seq, 1.0f);
+        wc_cut.assign(n_seq, 0);
         n_last.assign(n_seq, 0);
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
@@ -2604,6 +2622,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 adaptive_ctrl[s].reset(this->params.n_max, this->params.n_min_adaptive);
             }
             SPC_TRC("%s", "adaptive draft depth enabled (draft-mtp-adaptive)\n");
+            if (n_seq == 1 && weak_cut_enabled()) {
+                LOG_INF("%s: weak-block cut on: one-sequence rounds with cap >= 5 draft 2 fewer when the top-1 product at "
+                        "positions 0-2 < %.2f (LLAMA_SPEC_WEAK_CUT=1, opt-in)\n", __func__, (double) weak_cut_tau());
+            }
 
             if (this->params.depth_policy == "cdepth") {
                 std::string err;
@@ -2973,6 +2995,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // rows are already handled by the position-rewind trim in process(). Rows
         // that remain here belong to this prompt and feed the next draft decode.
 
+        if (seq_id >= 0 && seq_id < (llama_seq_id) wc_cut.size()) {
+            wc_cut[seq_id] = 0;
+        }
         // new request: reseed the p/q draft RNG once, then it advances across draft rounds
         if (q_smpls[seq_id]) {
             common_sampler_reset(q_smpls[seq_id].get());
@@ -3875,6 +3900,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             n_own[seq_id] = n_cap[seq_id];
+            wc_prod[seq_id] = 1.0f;
+            wc_cut[seq_id]  = 0;
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -4061,6 +4088,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
                 spec_ple_hint(params.ctx_tgt, dp, &result);
+                if (adaptive && !cdepth && !pipe_round && n_seq == 1 && result.size() <= 3 && weak_cut_enabled()) {
+                    wc_prod[seq_id] *= cur_p->data[0].p;
+                    if (result.size() == 3) {
+                        ++wc_n_rounds;
+                        if (n_cap[seq_id] >= 5 && wc_prod[seq_id] < weak_cut_tau()) {
+                            n_cap[seq_id] -= 2;
+                            wc_cut[seq_id] = 1;
+                            if ((++wc_n_cut & 1023) == 0) {
+                                SPC_INF("weak-block cut: %llu of %llu rounds (LLAMA_SPEC_WEAK_CUT=0 turns it off)\n",
+                                        (unsigned long long) wc_n_cut, (unsigned long long) wc_n_rounds);
+                            }
+                        }
+                    }
+                }
                 if (cdepth) {
                     // CDEPTH: stop before the next draft step when one more token is not expected to pay for itself.
                     // Uses only the helper's own distributions and already verified history (lossless).
@@ -4157,17 +4198,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // bonus the controller did not ask for, and verification is sequential, so the accepted prefix within
             // the own depth is what a draft of that depth would have returned
             const int attempted = n_drafted_ctrl >= 0 ? n_drafted_ctrl : n_last[seq_id];
-            const int own = n_own[seq_id] > 0 ? std::min(attempted, n_own[seq_id]) : attempted;
+            int own = n_own[seq_id] > 0 ? std::min(attempted, n_own[seq_id]) : attempted;
             int n_acc = std::min<int>(n_accepted_real >= 0 ? n_accepted_real : n_accepted, own);
             if (n_accepted_ctrl >= 0) {
                 n_acc = std::min<int>(n_acc, n_accepted_ctrl); // [MBFIX] exact-rule count under mode-biased MTP
             }
-            adaptive_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
-            if (seq_id < (llama_seq_id) pos_gate.size()) {
-                pos_gate[seq_id].update(own, n_acc);
+            // [WEAKCUT] a cut round is judged as the uncut round would have been: a miss inside the cut draft is the
+            // same miss at the controller's own depth; a fully accepted cut draft says nothing about the 2 tokens
+            // not drafted, so it does not move the controller
+            bool wc_skip = false;
+            if (seq_id < (llama_seq_id) wc_cut.size() && wc_cut[seq_id]) {
+                wc_cut[seq_id] = 0;
+                if (n_acc >= own) {
+                    wc_skip = true;
+                } else if (n_own[seq_id] > 0 && attempted >= n_own[seq_id] - 2) {
+                    own = n_own[seq_id]; // only when the cut draft reached its cut cap (no p_min / error stop)
+                }
             }
-            if (seq_id < (llama_seq_id) tpm.size()) {
-                tpm[seq_id].update(own, n_acc);
+            if (!wc_skip) {
+                adaptive_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
+                if (seq_id < (llama_seq_id) pos_gate.size()) {
+                    pos_gate[seq_id].update(own, n_acc);
+                }
+                if (seq_id < (llama_seq_id) tpm.size()) {
+                    tpm[seq_id].update(own, n_acc);
+                }
             }
             if (adaptive_ctrl[seq_id].n_cur != depth_before) {
                 SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
