@@ -33,13 +33,19 @@ struct kv_host_us {
         on = en && n >= 256; split = find = cp = apply = restore = ctor = 0; t = std::chrono::steady_clock::now();
     }
     void add(double & acc) {
-        if (!on) return; auto n = std::chrono::steady_clock::now();
+        if (!on) {
+            return;
+        }
+        auto n = std::chrono::steady_clock::now();
         acc += std::chrono::duration<double, std::milli>(n - t).count(); t = n;
     }
 };
 thread_local kv_host_us g_kv_host_us;
 }
 // [PFDIAG] hooks for the hybrid_idx wrapper (the MTP draft context's memory)
+void llama_pfdiag_kv_begin(uint32_t n);
+void llama_pfdiag_kv_mark(int which);
+void llama_pfdiag_kv_report(const char * tag, size_t n_ub);
 void llama_pfdiag_kv_begin(uint32_t n) { g_kv_host_us.begin(n); }
 void llama_pfdiag_kv_mark(int which) {
     double * f[] = { &g_kv_host_us.split, &g_kv_host_us.find, &g_kv_host_us.cp, &g_kv_host_us.apply, &g_kv_host_us.restore, &g_kv_host_us.ctor };
@@ -251,12 +257,12 @@ llama_kv_cache::llama_kv_cache(
        llama_sj_kvarn_config   sj_kvarn,
                      bool   k_host_mapped,
                      bool   is_indexer) :
-    model(model), hparams(hparams), v_trans(v_trans),
+    model(model), hparams(hparams), v_trans(v_trans), sj_kvarn(sj_kvarn),
     n_seq_max(n_seq_max), n_stream((unified && !sj_kvarn.enabled()) ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl), sj_kvarn(sj_kvarn) {
+    v_cells(*v_cells_impl) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the

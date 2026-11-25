@@ -395,7 +395,7 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    ggml_tensor * cur;
+    ggml_tensor * cur = nullptr;
     ggml_tensor * inpL;
 
     inpL = build_inp_embd(model.tok_embd);

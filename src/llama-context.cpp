@@ -5499,7 +5499,7 @@ build_graph:
         // Lossy expert skipping only in one sequence's decode or verify window (every token an output, at most
         // 8 tokens); prompt processing and windows that mix requests stay exact. The scheduler only acts on a change.
         const bool decode_window = cparams.n_seq_max == 1 && !cparams.embeddings &&
-                ubatch.n_tokens <= 8 && n_outputs == (int32_t) ubatch.n_tokens;
+                ubatch.n_tokens <= 8 && n_outputs == ubatch.n_tokens;
         ggml_backend_sched_moe_cache_set_skip_tail(sched.get(), decode_window ? cparams.moe_skip_tail : 0,
                 decode_window && cparams.moe_skip_mass);
     }
