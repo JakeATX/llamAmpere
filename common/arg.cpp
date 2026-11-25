@@ -991,7 +991,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             card_headed = true;
         }
         const std::string card_key = string_ends_with(key, "-headless") ? key.substr(0, key.size() - 9) : key;
-        if (key == "--preset" || card_key == "24dense" || card_key == "12dense" ||
+        if (key == "--preset" || card_key == "24dense" || card_key == "16dense" || card_key == "12dense" ||
             card_key == "10dense" || card_key == "8dense" ||
             card_key == "24ink" || card_key == "12ink" || card_key == "10ink" || card_key == "8ink") {
             if (++card_selectors > 1) {
@@ -6134,7 +6134,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
-        {"--preset"}, "24dense|12dense|10dense|8dense|24ink|12ink|10ink|8ink",
+        {"--preset"}, "24dense|16dense|12dense|10dense|8dense|24ink|12ink|10ink|8ink",
         "card profile: *dense = 27B dense, *ink = Inkling 2 Mini (8/10/12ink: experts in RAM, auto-sized VRAM expert cache, "
         "4/4 KV, drafter off unless --card-drafter on; 24ink: whole model on the GPU, 262K, DSpark drafter "
         "Inkling-2-Mini-ATX-Drafter-Q8_0.gguf from beside the model, or from the -hf repo); append headless or "
@@ -6145,6 +6145,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg({"24dense", "24dense-headless"}, "alias for --preset 24dense",
         [](common_params & params) { params.card_preset = "24dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"16dense", "16dense-headless"}, "alias for --preset 16dense (one slot)",
+        [](common_params & params) { params.card_preset = "16dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg({"12dense", "12dense-headless"}, "alias for --preset 12dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "12dense"; }
