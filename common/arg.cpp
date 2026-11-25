@@ -1197,9 +1197,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 params.speculative.draft.mparams.hf_file.clear();
                 if (!explicit_or_env("--spec-type")) {
                     params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
-                    if (mu4) {
+                    if (mu4 || params.card_drafter == "off") {
                         // a 24 GB card is above the arch table's drafter line: mark the choice made, so that
-                        // common_speculative_apply_model_default does not add the drafter back
+                        // common_speculative_apply_model_default does not add the drafter back (24ink-mu4, and
+                        // --card-drafter off on any ink preset)
                         params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;
                     }
                 }

@@ -3,6 +3,7 @@
 #include "common.h"
 
 #include <string>
+#include <vector>
 
 // fork DEFPATH: per-arch best-config reference (common/arch-defaults.cpp, one JSON row per model family).
 //
@@ -47,7 +48,8 @@ void common_arch_defaults_apply(const common_params & params);
 // the speculative row of the arch (drafter file beside the model): fields for spec-defaults.cpp
 struct common_arch_spec_default {
     std::string type;       // --spec-type, e.g. "draft-dspark"
-    std::string model;      // draft GGUF file name beside the target model
+    std::string model;      // draft GGUF file name beside the target model (the published name)
+    std::vector<std::string> model_alt; // older names of the same file, tried after `model`
     int32_t     ngl = -1;   // --spec-draft-ngl
     int32_t     ubatch = 0; // --spec-draft-ubatch (0 = keep)
     std::string type_k;     // explicit draft KV types ("" = engine resolver)
@@ -56,6 +58,8 @@ struct common_arch_spec_default {
     std::string why;
 };
 bool common_arch_spec_default_get(const std::string & arch, common_arch_spec_default & out);
+// the row's drafter file beside the model: `model` first, then each of `model_alt`; "" = none of them is there
+std::string common_arch_spec_default_file(const common_arch_spec_default & row, const std::string & model_path);
 
 // one WARN block after the main context is created
 void common_arch_defaults_report(const common_params & params, const llama_model * model, const llama_context * ctx);

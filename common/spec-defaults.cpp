@@ -248,11 +248,10 @@ static void common_speculative_apply_file_default(common_params & params, const 
         LOG_WRN("speculative: arch table drafter type '%s' for %s is unknown, no drafter\n", row.type.c_str(), arch.c_str());
         return;
     }
-    const std::string file = (std::filesystem::path(params.model.path).parent_path() / row.model).string();
-    std::error_code ec;
+    const std::string file = common_arch_spec_default_file(row, params.model.path);
     const size_t min_mib = common_arch_min_gpu_total_mib(params);
     const char * why_not = nullptr;
-    if (!std::filesystem::is_regular_file(file, ec)) {
+    if (file.empty()) {
         why_not = "the drafter file is not beside the model";
     } else if (params.n_gpu_layers == 0 || params.n_cpu_moe_auto ||
             (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides[0].pattern != nullptr)) {
@@ -287,7 +286,7 @@ static void common_speculative_apply_file_default(common_params & params, const 
     common_speculative_apply_mtp_sampling_default(params);
     common_speculative_apply_dspark_default(params);
     LOG_INF("speculative: %s on by default for %s (arch table): %s, -ngld %d -ubd %d, draft KV %s/%s, n-max %d; "
-            "--spec-type none or LLAMA_ARCH_DEFAULTS=0 disables\n", row.model.c_str(), arch.c_str(), row.type.c_str(),
+            "--spec-type none or LLAMA_ARCH_DEFAULTS=0 disables\n", file.c_str(), arch.c_str(), row.type.c_str(),
             spec.draft.n_gpu_layers, spec.draft.n_ubatch,
             spec.draft.cache_type_k == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_k),
             spec.draft.cache_type_v == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_v), spec.draft.n_max);
