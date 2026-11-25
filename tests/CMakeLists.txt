@@ -169,8 +169,10 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp  LABEL "main behavior"  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build(test-recurrent-state-rollback.cpp)
-llama_build(test-gdn-replay-lanes.cpp) # [TAG_GDN_REPLAY_LANES] joint vs split replay; needs a GDN model (-m)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS) # links llama internals, which llama.dll does not export
+    llama_build(test-recurrent-state-rollback.cpp)
+    llama_build(test-gdn-replay-lanes.cpp) # [TAG_GDN_REPLAY_LANES] joint vs split replay; needs a GDN model (-m)
+endif()
 llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
@@ -183,18 +185,24 @@ target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml
 # llama_build_and_test(test-sjkvarn-attn.cpp LABEL "turbo")
 # target_include_directories(test-sjkvarn-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-sjkvarn-fused-rot.cpp LABEL "turbo")
-llama_build_and_test(test-sjkvarn-state.cpp LABEL "turbo")
-target_include_directories(test-sjkvarn-state PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS) # links llama internals, which llama.dll does not export
+    llama_build_and_test(test-sjkvarn-state.cpp LABEL "turbo")
+    target_include_directories(test-sjkvarn-state PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
 # not built: calls the llama_model_saver(arch, gguf) constructor, which the upstream sync removed; needs a port
 # llama_build_and_test(test-sjkvarn-split.cpp LABEL "turbo")
 # target_include_directories(test-sjkvarn-split PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-sjkvarn-fill.cpp LABEL "turbo")
 # LLAMA_LSA_RESIDENT=auto slot sizing (pure function, no model)
-llama_build_and_test(test-lsa-resident-fit.cpp LABEL "turbo")
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS) # links llama internals, which llama.dll does not export
+    llama_build_and_test(test-lsa-resident-fit.cpp LABEL "turbo")
+endif()
 # FLASH_ATTN_EXT src[9]: upstream kv_rows vs the LSA LSE output (accessors)
 llama_build_and_test(test-lsa-src9.cpp LABEL "turbo")
 # [D1] exact head rescore: select, sidecar checks, scope, row states, threaded == serial (pure, no model)
-llama_build_and_test(test-d1-rescore.cpp LABEL "turbo")
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS) # links llama internals, which llama.dll does not export
+    llama_build_and_test(test-d1-rescore.cpp LABEL "turbo")
+endif()
 # prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
 llama_build(test-prompt-cache-types.cpp)
 
@@ -613,12 +621,14 @@ llama_build_and_test(test-topk-select-fast.cpp) # [ROUNDFIX] fast radix select b
 llama_build_and_test(test-lid-gather.cpp) # [ROUNDFIX] pooled-key gather read in place, bit-identity; skips without a GPU backend
 llama_build_and_test(test-mtp-vocab.cpp)
 llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.cpp)
-llama_build_and_test(test-gdn-replay-split.cpp)
-# [TAG_GDN_REPLAY_LANES] short static rounds: joined (SHORT=1) and split (SHORT=1 SHORT_JOIN=0)
-llama_test(test-gdn-replay-split NAME test-gdn-replay-split-short)
-set_tests_properties(test-gdn-replay-split-short PROPERTIES ENVIRONMENT "LLAMA_GDN_REPLAY_SHORT=1")
-llama_test(test-gdn-replay-split NAME test-gdn-replay-split-short-nojoin)
-set_tests_properties(test-gdn-replay-split-short-nojoin PROPERTIES ENVIRONMENT "LLAMA_GDN_REPLAY_SHORT=1;LLAMA_GDN_REPLAY_SHORT_JOIN=0")
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS) # links llama internals, which llama.dll does not export
+    llama_build_and_test(test-gdn-replay-split.cpp)
+    # [TAG_GDN_REPLAY_LANES] short static rounds: joined (SHORT=1) and split (SHORT=1 SHORT_JOIN=0)
+    llama_test(test-gdn-replay-split NAME test-gdn-replay-split-short)
+    set_tests_properties(test-gdn-replay-split-short PROPERTIES ENVIRONMENT "LLAMA_GDN_REPLAY_SHORT=1")
+    llama_test(test-gdn-replay-split NAME test-gdn-replay-split-short-nojoin)
+    set_tests_properties(test-gdn-replay-split-short-nojoin PROPERTIES ENVIRONMENT "LLAMA_GDN_REPLAY_SHORT=1;LLAMA_GDN_REPLAY_SHORT_JOIN=0")
+endif()
 llama_build_and_test(test-add-rms-q8.cpp) # [#46] skips without a GPU backend
 llama_build_and_test(test-hc-norm-fuse.cpp) # [HCPN] skips without a GPU backend
 llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
@@ -641,13 +651,15 @@ target_include_directories(test-rpb-knobs PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src
 llama_test(test-rpb-knobs)
 
 llama_build_and_test(test-fattn-alloc-route.cpp) # [#64] skips without a GPU backend
-llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
+if (NOT WIN32) # uses fork and POSIX file calls
+    llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
+endif()
 llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when present
 llama_build_and_test(test-gdn-ingr-compact.cpp) # [#63] CPU always, the GPU when present
 llama_build_and_test(test-draft-vocab-hot.cpp)
 llama_build_and_test(test-draft-vocab-compact.cpp)
 llama_build_and_test(test-nmse-masked-inf.cpp)
-if (NOT LLAMA_USE_SYSTEM_GGML)
+if (NOT LLAMA_USE_SYSTEM_GGML AND NOT WIN32) # uses POSIX file calls
     llama_build(test-moe-cache.cpp)
     if (GGML_CUDA)
         # The test compares the cache's budget grants against cudaMemGetInfo,
@@ -688,7 +700,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 
 if (BUILD_SHARED_LIBS)
-    llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
+    llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-moe-arena.cpp LABEL behavior)
     target_compile_definitions(test-llama-mmap PRIVATE LLAMA_BUILD)
 else()
     llama_build_and_test(test-llama-mmap.cpp LABEL behavior)
@@ -773,7 +785,9 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 # TurboQuant WHT round-trip test (links ggml turbo codec symbols via llama)
 llama_build_and_test(test-turbo-quant.c LABEL "turbo")
-llama_build_and_test(test-drama3-rope.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS) # links llama internals, which llama.dll does not export
+    llama_build_and_test(test-drama3-rope.cpp)
+endif()
 
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
@@ -789,7 +803,7 @@ if (TARGET gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
 
-if (NOT LLAMA_USE_SYSTEM_GGML)
+if (NOT LLAMA_USE_SYSTEM_GGML AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS)) # links llama internals
     add_executable(test-ple-cache test-ple-cache.cpp ../src/llama-ple-cache.cpp ../src/llama-moe-arena.cpp)
     target_link_libraries(test-ple-cache PRIVATE llama ggml ggml-cpu ggml-base)
     llama_test(test-ple-cache LABEL "main;cpu")
