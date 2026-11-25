@@ -61,7 +61,10 @@ static __device__ __forceinline__ uint32_t q8tc_h2(const float a, const float b)
     return *(uint32_t *) &h;
 }
 
-template <int NW, bool HILO, int MINB>
+// IA (SURGE3 Q8TC-HLF): independent accumulators per (k step, hi/lo) so the 2 (HILO 4) mmas of a block do not form one
+// dependent chain; summed in fixed order (st0 hi + st0 lo) + (st1 hi + st1 lo) before the block scale. IA=false keeps v3 order.
+// (PIPE, a second chunk buffer per warp, was measured slower: mbh2 +5..+22% vs this; the extra smem costs occupancy.)
+template <int NW, bool HILO, int MINB, bool IA = false>
 static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a, const int nb, const int T) {
 #ifdef AMPERE_MMA_AVAILABLE
     extern __shared__ __align__(16) uint32_t sw3[];
@@ -123,6 +126,7 @@ static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
                 float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float ci[2][2][4] = {};   // IA: [k step][hi/lo]
 #pragma unroll
                 for (int st = 0; st < 2; ++st) {
                     uint32_t a0, a2, a1, a3;
@@ -130,12 +134,18 @@ static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a
                     q8tc_i8_f16(q1[e][st], a1, a3);
                     const float4 v = xv[j & 1][e][st];
                     const uint32_t b0 = q8tc_h2(v.x, v.y), b1 = q8tc_h2(v.z, v.w);
-                    q8tc_mma16(c, a0, a1, a2, a3, b0, b1);
+                    q8tc_mma16(IA ? ci[st][0] : c, a0, a1, a2, a3, b0, b1);
                     if constexpr (HILO) {
                         const half2 h0 = *(const half2 *) &b0, h1 = *(const half2 *) &b1;
                         const uint32_t l0 = q8tc_h2(v.x - __low2float(h0), v.y - __high2float(h0));
                         const uint32_t l1 = q8tc_h2(v.z - __low2float(h1), v.w - __high2float(h1));
-                        q8tc_mma16(c, a0, a1, a2, a3, l0, l1);
+                        q8tc_mma16(IA ? ci[st][1] : c, a0, a1, a2, a3, l0, l1);
+                    }
+                }
+                if constexpr (IA) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        c[i] = HILO ? (ci[0][0][i] + ci[0][1][i]) + (ci[1][0][i] + ci[1][1][i]) : ci[0][0][i] + ci[1][0][i];
                     }
                 }
                 acc[0] += c[0]*dw0[e];
@@ -181,3 +191,4 @@ static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a
     NO_DEVICE_CODE;
 #endif
 }
+

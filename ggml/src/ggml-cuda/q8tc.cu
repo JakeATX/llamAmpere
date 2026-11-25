@@ -21,8 +21,21 @@ static int q8tc_min_t() {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // tuned on a 3090 (300 W) at the NQ shapes: K = 2304 (9 chunks) -> 3 warps, 4 CTAs/SM; K = 3072 (12 chunks) -> 6 warps, 2 CTAs/SM
+// GGML_CUDA_Q8TC_IA=1 (Q8TC-HLF): mode 2 sums its hi / lo and k-step mmas in independent accumulators (no dependent
+// mma chain; closer to the f32 path, not bit-exact vs IA=0). Default 0 until gated.
+static bool q8tc_ia() {
+    static const bool p = [] { const char * e = getenv("GGML_CUDA_Q8TC_IA"); return e && atoi(e) == 1; }();
+    return p;
+}
+
 template <int NW, bool HILO, int MINB>
 static void q8tc_launch(const q8a16_args & a, int T, int nb, cudaStream_t st) {
+    if constexpr (HILO) {
+        if (q8tc_ia()) {
+            k_q8tc3<NW, HILO, MINB, true><<<a.blk_end[a.n - 1], 32*NW, NW*16*68*sizeof(uint32_t), st>>>(a, nb, T);
+            return;
+        }
+    }
     k_q8tc3<NW, HILO, MINB><<<a.blk_end[a.n - 1], 32*NW, NW*16*68*sizeof(uint32_t), st>>>(a, nb, T);
 }
 
