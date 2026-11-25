@@ -25,13 +25,14 @@ using json = nlohmann::ordered_json;
 //                   (auto = llama-context's free-MiB rule: MoE + < 14,336 MiB free after the weights)
 //   kv              the proven trunk KV pair (report only: the engine's own arch default sets it)
 //   spec            drafter beside the model, applied by spec-defaults.cpp when no drafting was chosen
+//                   (model = the published file name, model_alt = older names of the same file, tried in order)
 //   env_on          engine switches that are ON by default (unset = on, "off" value = the kill switch); report only
 //   apply_env       values the table sets when unset (before the model load)
 //   watch           flags that are OFF by default and still under gate (report only)
 //   best            best config per card class for the gate: preset + extra args/env, the evidence and the file
 static const char * k_arch_defaults_json = R"ARCHJSON(
 {
-  "version": "2026-11-24.2",
+  "version": "2026-11-24.3",
   "protocol": {"chat": true, "temp": 1.0, "npred": 5120, "fill": 100000, "seeds": 6, "order": "ABBA",
                "fail_if_default_slower_pct": 1.0},
   "rows": [
@@ -43,7 +44,8 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
       "lean_prompt": {"24g": "off", "small": "auto",
              "why": "free-MiB rule was tuned on Flash-Next; NQ 24 GB (7,667 MiB free) took it silently. DEFPATH smoke 11-24 3090 300 W, NQ defaults, 16K fill, 5,120-tok chat temp 1, ABBA 2+2: LEAN=0 prefill 1993 vs 1949 (+2.3%), decode 97.9 vs 97.7"},
       "kv": {"type_k": "sjkvarn4", "type_v": "sjkvarn4", "why": "Jake 11-22: Inkling ships SJ-KVaRN 4/4 (LLAMA_INK_KV44 engine default)"},
-      "spec": {"type": "draft-dspark", "model": "Inkling-2-Mini-DSpark-Q8_0-fold.gguf", "ngl": 99, "ubatch": 64,
+      "spec": {"type": "draft-dspark", "model": "Inkling-2-Mini-ATX-Drafter-Q8_0.gguf",
+               "model_alt": ["Inkling-2-Mini-DSpark-Q8_0-fold.gguf"], "ngl": 99, "ubatch": 64,
                "type_k": "f16", "type_v": "f16", "min_gpu_mib": 23552,
                "why": "24ink preset drafter; draft KV F16 explicit (DSJ opt-in measured -3.0% at 100K, 11-22 gate); small cards: drafter -12..-29% at 100K (its VRAM is expert cache)"},
       "parallel": 1,
@@ -285,6 +287,7 @@ bool common_arch_spec_default_get(const std::string & arch, common_arch_spec_def
     const json & s = (*row)["spec"];
     out.type        = s.value("type", "");
     out.model       = s.value("model", "");
+    out.model_alt   = s.value("model_alt", std::vector<std::string>());
     out.ngl         = s.value("ngl", -1);
     out.ubatch      = s.value("ubatch", 0);
     out.type_k      = s.value("type_k", "");
@@ -292,6 +295,23 @@ bool common_arch_spec_default_get(const std::string & arch, common_arch_spec_def
     out.min_gpu_mib = s.value("min_gpu_mib", (size_t) 0);
     out.why         = s.value("why", "");
     return !out.type.empty() && !out.model.empty();
+}
+
+std::string common_arch_spec_default_file(const common_arch_spec_default & row, const std::string & model_path) {
+    if (model_path.empty()) {
+        return "";
+    }
+    const auto dir = std::filesystem::path(model_path).parent_path();
+    std::vector<std::string> names = { row.model };
+    names.insert(names.end(), row.model_alt.begin(), row.model_alt.end());
+    std::error_code ec;
+    for (const auto & name : names) {
+        const std::string file = (dir / name).string();
+        if (!name.empty() && std::filesystem::is_regular_file(file, ec)) {
+            return file;
+        }
+    }
+    return "";
 }
 
 // -------------------------------------------------------------------------------------------------------------------

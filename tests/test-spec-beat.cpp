@@ -1,6 +1,7 @@
 #include "sampling.h"
 #include "arg.h"
 #include "spec-defaults.h"
+#include "arch-defaults.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
@@ -77,6 +78,62 @@ static void test_model_mtp_default() {
     }
     assert(unlink(path) == 0);
     puts("model-header automatic MTP, explicit choices and repeated resolution: PASS");
+#endif
+}
+
+// the arch table's file drafter (Inkling 2): the published name first, the older local name as the fallback, and
+// --card-drafter off on 24ink stays off through common_speculative_apply_model_default
+static void test_arch_file_drafter() {
+#ifndef _WIN32
+    char dir_t[] = "/tmp/test-arch-drafter-XXXXXX";
+    assert(mkdtemp(dir_t));
+    const std::string dir = dir_t;
+    const std::string model = dir + "/model.gguf";
+    const std::string pub   = dir + "/Inkling-2-Mini-ATX-Drafter-Q8_0.gguf";
+    const std::string fold  = dir + "/Inkling-2-Mini-DSpark-Q8_0-fold.gguf";
+    {
+        auto * metadata = gguf_init_empty();
+        gguf_set_val_str(metadata, "general.architecture", "inkling2");
+        assert(gguf_write_to_file(metadata, model.c_str(), true));
+        gguf_free(metadata);
+    }
+    auto touch = [](const std::string & f) { FILE * fp = fopen(f.c_str(), "wb"); assert(fp); fclose(fp); };
+
+    common_arch_spec_default row;
+    assert(common_arch_spec_default_get("inkling2", row));
+    assert(row.model == "Inkling-2-Mini-ATX-Drafter-Q8_0.gguf");
+    assert(common_arch_spec_default_file(row, model).empty());
+    touch(fold);
+    assert(common_arch_spec_default_file(row, model) == fold);
+    touch(pub);
+    assert(common_arch_spec_default_file(row, model) == pub);
+    printf("arch table drafter beside %s: %s\n", model.c_str(), common_arch_spec_default_file(row, model).c_str());
+
+    auto parse = [&](std::vector<std::string> options, common_params & params) {
+        std::vector<std::string> args = {"test-spec-beat", "-m", model};
+        args.insert(args.end(), options.begin(), options.end());
+        std::vector<char *> argv;
+        for (auto & arg : args) { argv.push_back(&arg[0]); }
+        assert(common_params_parse(argv.size(), argv.data(), params, LLAMA_EXAMPLE_SERVER));
+    };
+    {
+        common_params params;
+        parse({"--preset", "24ink"}, params);
+        assert(params.speculative.draft.mparams.path == pub);
+        printf("--preset 24ink: drafter %s\n", params.speculative.draft.mparams.path.c_str());
+    }
+    {
+        common_params params;
+        parse({"--preset", "24ink", "--card-drafter", "off"}, params);
+        assert(!params.speculative.has_dft());
+        assert(params.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_TYPE);
+        assert(common_speculative_apply_model_default(params));
+        assert(!params.speculative.has_dft());
+        assert(params.speculative.types == std::vector<common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE});
+        puts("--preset 24ink --card-drafter off: no drafter after the arch table default");
+    }
+    assert(unlink(pub.c_str()) == 0 && unlink(fold.c_str()) == 0 && unlink(model.c_str()) == 0 && rmdir(dir_t) == 0);
+    puts("arch table file drafter: published name, fallback name, --card-drafter off: PASS");
 #endif
 }
 
@@ -824,6 +881,7 @@ static void bench() {
 
 int main(int argc, char ** argv) {
     test_model_mtp_default();
+    test_arch_file_drafter();
     test_verifier_identity(); test_identity_and_ties(); test_laws(); test_mode_distribution();
     test_mb_weighted();
     if (argc == 2) { test_model_state(argv[1], false); test_model_state(argv[1], true); }
