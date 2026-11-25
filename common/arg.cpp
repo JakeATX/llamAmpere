@@ -993,7 +993,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         const std::string card_key = string_ends_with(key, "-headless") ? key.substr(0, key.size() - 9) : key;
         if (key == "--preset" || card_key == "24dense" || card_key == "16dense" || card_key == "12dense" ||
             card_key == "10dense" || card_key == "8dense" ||
-            card_key == "24ink" || card_key == "12ink" || card_key == "10ink" || card_key == "8ink") {
+            card_key == "24ink" || card_key == "24ink-mu4" || card_key == "12ink" || card_key == "10ink" || card_key == "8ink") {
             if (++card_selectors > 1) {
                 throw std::invalid_argument("select only one card preset");
             }
@@ -1181,19 +1181,30 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // of the expert cache, which costs more than drafting gains on 8/10 GB (see common/preset.cpp)
         // 24ink keeps the model on the GPU, so its drafter stays on unless --card-drafter off
         const bool ink24 = params.card_preset == "24ink";
-        const bool ink_card = string_ends_with(params.card_preset, "ink");
+        // fork (INKMU2): 24ink-mu4 keeps the model on the GPU but its 4 x 106K context leaves no room for the drafter
+        // (common/preset.cpp): drafter off unless --card-drafter on, as on the small cards
+        const bool ink_card = string_ends_with(params.card_preset, "ink") || params.card_preset == "24ink-mu4";
         if (ink_card && (ink24 ? params.card_drafter == "off" : params.card_drafter != "on")) {
             if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
+                const bool mu4 = params.card_preset == "24ink-mu4";
                 LOG_INF("card preset %s: drafter off (%s; --card-drafter on forces it)\n", params.card_preset.c_str(),
-                        params.card_drafter == "off" ? "--card-drafter off" : "it measured slower at 100K depth on 8/10/12 GB: its VRAM comes out of the expert cache");
+                        params.card_drafter == "off" ? "--card-drafter off" :
+                        mu4 ? "4 x 106K of KV leaves no VRAM for its draft KV and compute buffer" :
+                        "it measured slower at 100K depth on 8/10/12 GB: its VRAM comes out of the expert cache");
                 params.speculative.draft.mparams.path.clear();
                 params.speculative.draft.mparams.hf_file.clear();
                 if (!explicit_or_env("--spec-type")) {
                     params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                    if (mu4) {
+                        // a 24 GB card is above the arch table's drafter line: mark the choice made, so that
+                        // common_speculative_apply_model_default does not add the drafter back
+                        params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;
+                    }
                 }
             } else if (params.speculative.has_dft() && !ink24) {
-                LOG_WRN("card preset %s: --model-draft given; on this card size the drafter measured slower (its VRAM comes "
-                        "out of the expert cache), kept because you asked for it\n", params.card_preset.c_str());
+                LOG_WRN("card preset %s: --model-draft given; %s, kept because you asked for it\n", params.card_preset.c_str(),
+                        params.card_preset == "24ink-mu4" ? "4 x 106K of KV leaves no VRAM for the drafter (it may not fit)" :
+                        "on this card size the drafter measured slower (its VRAM comes out of the expert cache)");
             }
         }
         if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
@@ -1300,8 +1311,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     common_dflash_w78_default(params);
 
-    if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
-        throw std::invalid_argument(params.card_preset == "24ink" ? "24ink is one slot (--parallel 1); for several users drop the preset and pass -np N --kv-unified -b 1024 -ub 1024"
+    // fork (INKMU2): 24ink-mu4 is the multi-user Inkling row (up to 4 slots, separate KV streams)
+    if (params.card_preset == "24ink-mu4" && (params.n_parallel < 1 || params.n_parallel > 4)) {
+        throw std::invalid_argument("24ink-mu4 sizes 4 slots (-np 1..4); for more users lower -c and drop the preset");
+    }
+    if (!params.card_preset.empty() && params.card_preset != "24dense" && params.card_preset != "24ink-mu4" && params.n_parallel != 1) {
+        throw std::invalid_argument(params.card_preset == "24ink" ? "24ink is one slot (--parallel 1); for several users use --preset 24ink-mu4 (4 x 106K, separate KV streams)"
                                                                    : "small-card presets require --parallel 1; multi-user support is planned");
     }
 
@@ -6188,6 +6203,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_CARD_DRAFTER"));
     add_opt(common_arg({"24ink", "24ink-headless"}, "alias for --preset 24ink (Inkling 2 Mini, 24 GB card, one slot, DSpark drafter)",
         [](common_params & params) { params.card_preset = "24ink"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"24ink-mu4", "24ink-mu4-headless"}, "alias for --preset 24ink-mu4 (Inkling 2 Mini, 24 GB card, 4 users x 106K, separate KV streams, drafter off)",
+        [](common_params & params) { params.card_preset = "24ink-mu4"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg({"12ink", "12ink-headless"}, "alias for --preset 12ink (Inkling 2 Mini, 12 GB card, one slot)",
         [](common_params & params) { params.card_preset = "12ink"; }

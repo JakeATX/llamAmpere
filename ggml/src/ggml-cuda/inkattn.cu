@@ -15,6 +15,7 @@
 #include "inkattn-fast.cuh"
 
 #include <cstdlib>
+#include <climits>
 #include <cstdint>
 #include <mutex>
 #include <type_traits>
@@ -42,6 +43,7 @@ struct inkattn_params {
     // live tiles (inkattn-live.cu, nullptr = every tile): ids live[(seq*Hkv + kvh)*NTmax + i], i < nlive[seq*Hkv + kvh];
     // the runs of a (seq, KV head) are then min(W, ceil(nlive/tpw_live)) (inkattn_runs, also used by the combine)
     const int * live; const int * nlive; int NTmax; int tpw_live;
+    const int2 * krange; // [INKMU2] per sequence: the 16-key tiles [x, y) that hold every visible key, or nullptr (all)
 };
 
 // runs that hold tiles for one (seq, KV head): W, or with live tiles min(W, ceil(n_live / tpw)) (>= 1)
@@ -161,10 +163,13 @@ static __device__ __forceinline__ void inkattn_decode_body(const inkattn_params 
     const char * Kh = p.K + seq*p.nbk3 + kvh*p.nbk2;
     const char * Vh = p.V + seq*p.nbv3 + kvh*p.nbv2;
 
-    const int NT = p.live ? p.nlive[seq*p.Hkv + kvh] : (p.n_kv + 15) / 16;
-    const int * lt = p.live ? p.live + (int64_t) (seq*p.Hkv + kvh)*p.NTmax : nullptr;
-    const int t0 = (int) ((int64_t) wi*NT / Wd);
-    const int t1 = (int) ((int64_t) (wi + 1)*NT / Wd);
+    // live tiles (opt-in) walk a per-(seq, KV head) tile list; [INKMU2] a per-user row group (MU path, never with live
+    // tiles) visits only the tiles between its first and last visible key
+    const int * lt  = p.live ? p.live + (int64_t) (seq*p.Hkv + kvh)*p.NTmax : nullptr;
+    const int   tlo = (!p.live && p.krange) ? p.krange[seq].x : 0;
+    const int   NT  = p.live ? p.nlive[seq*p.Hkv + kvh] : (p.krange ? p.krange[seq].y - tlo : (p.n_kv + 15) / 16);
+    const int   t0  = tlo + (int) ((int64_t) wi*NT / Wd);
+    const int   t1  = tlo + (int) ((int64_t) (wi + 1)*NT / Wd);
 
     float O[16][4];
 #pragma unroll
@@ -537,6 +542,70 @@ static int inkattn_env_int(const char * name, const int def) {
     return e && *e ? atoi(e) : def;
 }
 
+// [INKMU2 MU-INKATTN] default off; GGML_CUDA_INKATTN_MU=1: a node with more query rows than one warp step holds
+// (g*T > 16: several users' verify rows on one unified KV stream) runs as row groups of R rows (the largest divisor of
+// T with g*R <= 16), each group a "sequence" (grid z) over the shared K/V; GGML_CUDA_INKATTN_MU_RANGE (default 1) then
+// bounds each group's key walk by the first and last key its mask rows see (the rows of one user see only that user's
+// cells). Plain (non-INKREL) nodes on one stream only; the math per row is the one-group kernel's.
+static bool inkattn_mu_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_INKATTN_MU");
+        return e && *e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool inkattn_mu_range_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_INKATTN_MU_RANGE");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    return on;
+}
+
+// rows per group: the largest R dividing T with g*R <= 16 (1 always qualifies), 0 when the MU path does not apply
+static int inkattn_mu_rows(const int T, const int g) {
+    if (g < 1 || g > 16 || g*T <= 16) {
+        return 0;
+    }
+    for (int R = 16 / g; R >= 1; --R) {
+        if (T % R == 0) {
+            return g*R >= 8 ? R : 0; // a prime T (R = 1) would fill 3 of 16 MMA rows: not worth a group per row
+        }
+    }
+    return 0;
+}
+
+// one block per row group: the tile range [x, y) that holds every key a row of the group sees (mask != -inf on the
+// head-0 slice: the per-head masks share the visibility); y = x = 0 when no key is visible
+static __global__ void inkattn_mu_range(const half * __restrict__ M, const int64_t m_row, const int n_kv, const int R,
+        int2 * __restrict__ range) {
+    const int grp = blockIdx.x;
+    int lo = INT_MAX;
+    int hi = -1;
+    for (int r = 0; r < R; ++r) {
+        const unsigned short * row = reinterpret_cast<const unsigned short *>(M + (int64_t) (grp*R + r)*m_row);
+        for (int k = threadIdx.x; k < n_kv; k += blockDim.x) {
+            if (__ldg(row + k) != 0xFC00u) { // f16 -inf
+                lo = min(lo, k);
+                hi = max(hi, k);
+            }
+        }
+    }
+    __shared__ int s_lo, s_hi;
+    if (threadIdx.x == 0) {
+        s_lo = INT_MAX;
+        s_hi = -1;
+    }
+    __syncthreads();
+    atomicMin(&s_lo, lo);
+    atomicMax(&s_hi, hi);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        range[grp] = s_hi < 0 ? make_int2(0, 0) : make_int2(s_lo / 16, s_hi / 16 + 1);
+    }
+}
+
 // [FUSE ATTNCOMB] default off; GGML_CUDA_FUSE_ATTNCOMB=1 folds the combine into the decode launch
 static bool inkattn_comb_on() {
     static const bool on = [] {
@@ -570,7 +639,7 @@ static bool inkattn_aligned(const void * ptr, const int64_t a, const int64_t b, 
 } // namespace
 
 // can INKATTN take dst on a device of compute capability cc (mode: GGML_CUDA_INKATTN scope; INKREL nodes ignore it)
-static bool inkattn_check(const int cc, const ggml_tensor * dst, const int mode) {
+static bool inkattn_check(const int cc, const ggml_tensor * dst, const int mode, const int rows = 0) {
     const bool inkrel = ggml_flash_attn_ext_is_inkrel(dst);
     if (mode == 0 && !inkrel) {
         return false;
@@ -629,7 +698,7 @@ static bool inkattn_check(const int cc, const ggml_tensor * dst, const int mode)
     const int S   = (int) Q->ne[3];
     const int g   = H / Hkv;
     const int n_kv = (int) K->ne[1];
-    if (g*T > 16 || mask->ne[0] < n_kv || mask->ne[1] < T || H % mask->ne[2] != 0 || S % mask->ne[3] != 0) {
+    if (g*(rows > 0 ? rows : T) > 16 || mask->ne[0] < n_kv || mask->ne[1] < T || H % mask->ne[2] != 0 || S % mask->ne[3] != 0) {
         return false;
     }
     // scope: 1 = per-head masks only (the Inkling rel bias: dense decode, SWA, INKREL near, INKLSA compact);
@@ -666,8 +735,29 @@ bool ggml_cuda_inkattn_supported(int device, const ggml_tensor * dst) {
 }
 
 bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (!inkattn_check(ggml_cuda_info().devices[ctx.device].cc, dst, inkattn_mode())) {
-        return false;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    int mu_rows = 0; // [INKMU2] > 0: run the node as row groups of mu_rows rows
+    if (!inkattn_check(cc, dst, inkattn_mode())) {
+        if (!inkattn_mu_on() || ggml_flash_attn_ext_is_inkrel(dst)) {
+            return false;
+        }
+        const ggml_tensor * q = dst->src[0];
+        const ggml_tensor * k = dst->src[1];
+        const ggml_tensor * m = dst->src[3];
+        // verify widths only (a few users x a few draft rows): a prefill ubatch keeps the generic kernels
+        if (q->ne[3] != 1 || q->ne[1] > 64 || k->ne[2] < 1 || q->ne[2] % k->ne[2] != 0 || !m || m->ne[3] != 1) {
+            return false;
+        }
+        mu_rows = inkattn_mu_rows((int) q->ne[1], (int) (q->ne[2] / k->ne[2]));
+        if (mu_rows == 0 || !inkattn_check(cc, dst, inkattn_mode(), mu_rows)) {
+            return false;
+        }
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_INKATTN_MU=1: per-user row groups (%d query rows as %d groups of %d%s)\n", __func__,
+                (int) q->ne[1], (int) q->ne[1] / mu_rows, mu_rows, inkattn_mu_range_on() ? ", key range per group" : "");
+        }
     }
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -679,7 +769,7 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float scale;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    if (ggml_cuda_inkattn_fast_enabled()) {
+    if (ggml_cuda_inkattn_fast_enabled() && mu_rows == 0) {
         const ggml_tensor * tab  = inkrel ? ggml_flash_attn_ext_inkrel_table(dst) : nullptr;
         const ggml_tensor * rp   = inkrel ? ggml_flash_attn_ext_inkrel_pos(dst)   : nullptr;
         const ggml_tensor * gate = inkrel ? ggml_flash_attn_ext_inkrel_gate(dst)  : nullptr;
@@ -688,13 +778,12 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return true;
     }
 
-    const int T    = (int) Q->ne[1];
+    const int T    = mu_rows > 0 ? mu_rows : (int) Q->ne[1];
     const int H    = (int) Q->ne[2];
     const int Hkv  = (int) K->ne[2];
-    const int S    = (int) Q->ne[3];
+    const int S    = mu_rows > 0 ? (int) Q->ne[1] / mu_rows : (int) Q->ne[3];
     const int g    = H / Hkv;
     const int n_kv = (int) K->ne[1];
-
 
     const bool rows16 = g*T > 8;
     const int  nsm    = ggml_cuda_info().devices[ctx.device].nsm;
@@ -716,7 +805,7 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static const int live_on  = inkattn_env_int("GGML_CUDA_INKATTN_LIVE", 0);
     static const int live_max = inkattn_env_int("GGML_CUDA_INKATTN_LIVE_MAX_KV", 16384);
     static const int live_tpw = std::max(1, inkattn_env_int("GGML_CUDA_INKATTN_LIVE_TPW", 2));
-    const bool use_live = live_on != 0 && n_kv <= live_max && NT > 1;
+    const bool use_live = live_on != 0 && n_kv <= live_max && NT > 1 && mu_rows == 0; // [INKMU2] row groups: no live tiles
     ggml_cuda_pool_alloc<int> live(ctx.pool(), use_live ? (size_t) S*Hkv*NT + (size_t) S*Hkv : 1);
 
     inkattn_params p;
@@ -729,6 +818,22 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     p.n_kv = n_kv; p.T = T; p.g = g; p.H = H; p.Hkv = Hkv; p.W = W; p.scale = scale;
     p.Op = Op.get(); p.Mp = Mp.get();
     p.live = nullptr; p.nlive = nullptr; p.NTmax = NT; p.tpw_live = live_tpw;
+    p.krange = nullptr;
+    int64_t nbd3 = dst->nb[3];
+    ggml_cuda_pool_alloc<int2> mu_range(ctx.pool());
+    if (mu_rows > 0) {
+        // groups as sequences: Q / mask / dst rows step by mu_rows, the K/V cache is shared (one stream)
+        p.nbq3 = (int64_t) mu_rows*Q->nb[1];
+        p.nbk3 = 0; p.nbv3 = 0;
+        p.nbm3 = (int64_t) mu_rows*mask->nb[1]; p.ne33 = S;
+        nbd3 = (int64_t) mu_rows*dst->nb[2];
+        if (inkattn_mu_range_on()) {
+            mu_range.alloc(S);
+            inkattn_mu_range<<<S, 256, 0, ctx.stream()>>>((const half *) mask->data, mask->nb[1]/sizeof(half), n_kv, mu_rows, mu_range.get());
+            CUDA_CHECK(cudaGetLastError());
+            p.krange = mu_range.get();
+        }
+    }
     p.tab = nullptr; p.tab_h1 = 0; p.tab_t = 0; p.rp = nullptr; p.rp_t = 0;
     const ggml_tensor * gate = nullptr;
     if (inkrel) {
@@ -752,7 +857,7 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     // [FUSE ATTNCOMB] one launch: the last block of each (sequence, KV head) combines (see inkattn_decode_comb)
     // one combined row per warp: wider R (verify widths) runs the separate combine, whose H*T blocks spread the work
-    const int comb_slot = !use_live && inkattn_comb_on() && S*Hkv <= INKATTN_COMB_CNT && g*T <= INKATTN_WARPS ? inkattn_comb_slot(stream) : -1;
+    const int comb_slot = !use_live && mu_rows == 0 && inkattn_comb_on() && S*Hkv <= INKATTN_COMB_CNT && g*T <= INKATTN_WARPS ? inkattn_comb_slot(stream) : -1;
     if (comb_slot >= 0) {
         inkattn_comb_params cp;
         cp.sinks = snk ? (const float *) snk->data : nullptr;
@@ -792,7 +897,7 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaGetLastError());
 
     inkattn_combine<<<dim3(H, T, S), INKATTN_D, 0, stream>>>(Op.get(), Mp.get(), snk ? (const float *) snk->data : nullptr,
-        (char *) dst->data, dst->nb[1], dst->nb[2], dst->nb[3], lse ? (float *) lse->data : nullptr,
+        (char *) dst->data, dst->nb[1], dst->nb[2], nbd3, lse ? (float *) lse->data : nullptr,
         gate ? (const float *) gate->data : nullptr, gate ? (int64_t) (gate->nb[1]/sizeof(float)) : 0, W, g, Hkv, p.nlive, p.tpw_live);
     CUDA_CHECK(cudaGetLastError());
     return true;

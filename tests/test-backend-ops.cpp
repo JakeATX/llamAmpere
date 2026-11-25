@@ -19043,6 +19043,96 @@ struct test_inkconv_pair : public test_case {
     }
 };
 
+// [INKMU2 MU-INKATTN] several users' verify rows on one unified KV stream: T = U users x rpu rows, row t belongs to
+// user t / rpu and sees only that user's cells (layout 0: one contiguous block per user, 1: 16-cell tiles dealt round
+// robin, 2: user blocks in reverse order), causal inside the user's cells; per-head (24) or broadcast mask, F16 or Q8_0
+// K/V, optional sinks. GGML_CUDA_INKATTN_MU=1 runs it as per-user row groups on INKATTN (CPU reference either way).
+struct test_flash_attn_ext_inkmu : public test_case {
+    const int64_t U, rpu, kv, mh;
+    const int layout;
+    const bool sinks;
+    const ggml_type tkv;
+
+    test_flash_attn_ext_inkmu(int64_t U, int64_t rpu, int64_t kv, int64_t mh, int layout, bool sinks, ggml_type tkv = GGML_TYPE_F16)
+        : U(U), rpu(rpu), kv(kv), mh(mh), layout(layout), sinks(sinks), tkv(tkv) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(U, rpu, kv, mh, layout, sinks) + ",inkmu=1" + (tkv == GGML_TYPE_F16 ? "" : std::string(",kv=") + ggml_type_name(tkv));
+    }
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor *) override { return 2*2*(uint64_t) (24*U*rpu*128*kv); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 128, H = 24, Hkv = 8, T = U*rpu;
+        ggml_tensor * q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, T);     ggml_set_name(q, "q");
+        ggml_tensor * kc = ggml_new_tensor_3d(ctx, tkv, D, Hkv, kv);            ggml_set_name(kc, "k");
+        ggml_tensor * vc = ggml_new_tensor_3d(ctx, tkv, D, Hkv, kv);            ggml_set_name(vc, "v");
+        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, T, mh, 1); ggml_set_name(m, "m");
+        ggml_tensor * a = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), ggml_permute(ctx, kc, 0, 2, 1, 3),
+            ggml_permute(ctx, vc, 0, 2, 1, 3), m, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
+        if (sinks) {
+            ggml_tensor * sk = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H); ggml_set_name(sk, "s");
+            ggml_flash_attn_ext_add_sinks(a, sk);
+        }
+        ggml_prec_set_acc(a, GGML_PREC_F32);
+        ggml_set_name(a, "out");
+        return a;
+    }
+
+    int64_t owner(int64_t c) const {
+        const int64_t blk = kv / U;
+        switch (layout) {
+            case 0:  return std::min<int64_t>(U - 1, c / blk);
+            case 1:  return (c / 16) % U;
+            default: return U - 1 - std::min<int64_t>(U - 1, c / blk);
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x5EED1234u ^ (uint32_t) (kv*7 + U*131 + rpu*17 + layout));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> d(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                std::uniform_real_distribution<float> bias(-2.0f, 2.0f);
+                for (int64_t h = 0; h < t->ne[2]; ++h) {
+                    for (int64_t r = 0; r < U*rpu; ++r) {
+                        const int64_t u = r / rpu;
+                        // the user's cells in cache order; row r sees all but its last rpu - 1 - (r % rpu) (causal tail)
+                        std::vector<int64_t> own;
+                        for (int64_t c = 0; c < kv; ++c) { if (owner(c) == u) { own.push_back(c); } }
+                        const int64_t n_vis = (int64_t) own.size() - (rpu - 1 - r % rpu);
+                        for (int64_t i = 0; i < n_vis; ++i) {
+                            d[(h*t->ne[1] + r)*kv + own[i]] = ggml_fp32_to_fp16(mh > 1 ? bias(gen) : 0.0f);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+static void add_inkmu_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (int64_t kv : {1536, 6144}) {
+        for (int64_t U : {2, 4}) {
+            for (int64_t rpu : {4, 5}) {
+                for (int layout : {0, 1, 2}) {
+                    cases.emplace_back(new test_flash_attn_ext_inkmu(U, rpu, kv, 24, layout, layout == 1));
+                }
+            }
+        }
+        cases.emplace_back(new test_flash_attn_ext_inkmu(4, 5, kv, 24, 1, true, GGML_TYPE_Q8_0));
+    }
+    // a prime row count (17: R = 1, refused, generic kernels) and 3 users x 6 rows (groups of 3)
+    cases.emplace_back(new test_flash_attn_ext_inkmu(1, 17, 1536, 24, 0, false));
+    cases.emplace_back(new test_flash_attn_ext_inkmu(3, 6, 1536, 24, 1, true));
+}
+
 static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     auto add = [&](int64_t kv, int64_t nb, int64_t mh, bool sinks, bool lse, int64_t nh = 8, std::array<int64_t, 2> nr23 = {3, 1},
             ggml_type tkv = GGML_TYPE_F16) {
@@ -22957,6 +23047,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lsa_comp_merge(784, 5, 24, 4, 256, 1));
 
     add_inkattn_cases(test_cases, false);
+    add_inkmu_cases(test_cases);
     add_ink_nvfp4_moe_cases(test_cases, false);
     // GFFN-P9: both NVFP4PF tile widths (bn 64: 128 experts, bn 128: 16 experts), strided ids, all-shared routing, unscaled
     test_cases.emplace_back(new test_gffn_p9(128, 512,  true,  false, 0));

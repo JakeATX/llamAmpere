@@ -198,9 +198,24 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_DEEPCTX_LADDER", "1"}
             }
         };
-        std::vector<common_card_preset> cards {large, large16, medium, small, tiny, ink8, ink10, ink12, ink24};
+        // fork (INKMU2 MU100K-FIT): Inkling 2 Mini on a 24 GB card, 4 users x 106,496 tokens (a 100K prompt + a 5,120-token
+        // reply + headroom), the whole model on the GPU. Separate KV streams (-np 4, no --kv-unified): several deep sequences
+        // take the INKKV far/near split together (llama_inkkv_multi_split_on), while a unified KV keeps every several-sequence
+        // ubatch on the dense rel-bias path. -ub 512: the prompt step's compute buffer and the SWA window cache (window + ub
+        // per stream) set the fit; at -c 425984 ub 1024 leaves 754 MiB short and the fit falls back to host experts.
+        // Measured boot (GPU1 3090 300 W, NQ q8d): 23,083 MiB used, compute 1,518 MiB, KV 3,890 + SWA 1,152 MiB. The DSpark
+        // drafter does not fit beside it (f16 draft KV 1,664 MiB; q4_0 draft KV needs a 1,681 MiB draft compute buffer), so
+        // it is off unless --card-drafter on (which then needs a smaller -c).
+        auto ink24mu4 = ink24;
+        ink24mu4.name = "24ink-mu4";
+        ink24mu4.version = "2026-11-25.1";
+        ink24mu4.status = "fit measured; 4-user 100K speed gate pending";
+        set_ctx(ink24mu4, "425984");
+        set_opt(ink24mu4, "--parallel", "4");
+        set_opt(ink24mu4, "--ubatch-size", "512");
+        std::vector<common_card_preset> cards {large, large16, medium, small, tiny, ink8, ink10, ink12, ink24, ink24mu4};
         for (auto & card : cards) {
-            if (string_ends_with(card.name, "ink")) {
+            if (string_ends_with(card.name, "ink") || card.name == "24ink-mu4") {
                 continue; // fork (INKSMALL2): Inkling profiles keep their own version and the model's sampling defaults
             }
             // 8dense and 12dense: CUDA graphs back on (HOSTGAP08 gates, V07/HOSTGAP08/RESULT.md)
@@ -232,7 +247,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
             return profile;
         }
     }
-    throw std::invalid_argument("unknown card preset: expected 24dense, 16dense, 12dense, 10dense, 8dense, 24ink, 12ink, 10ink, or 8ink");
+    throw std::invalid_argument("unknown card preset: expected 24dense, 16dense, 12dense, 10dense, 8dense, 24ink, 24ink-mu4, 12ink, 10ink, or 8ink");
 }
 
 std::string common_card_preset_apply_env(const common_params & params) {
