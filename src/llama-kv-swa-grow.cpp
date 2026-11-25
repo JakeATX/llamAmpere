@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
@@ -333,7 +334,8 @@ bool llama_kv_cache::swa_resize(uint32_t n_new, const std::function<bool(size_t)
         o = build(n_old);
     }
     if (!o.buf) {
-        throw std::runtime_error("SWA-GROW: the window cache could not be allocated again at its old size");
+        // the old buffer is gone and the layers still point at it: no state to go back to
+        GGML_ABORT("[SWAGROW] the window cache could not be allocated again at its old size (%u cells)", n_old);
     }
     restore(o, false);
     install(o);
@@ -410,10 +412,13 @@ bool llama_context::ink_swa_set(bool small, const char * why) {
         return false;
     }
     if (const char * why_not = ink_swa_kv->swa_resize_why_not()) {
-        // the checks passed at boot: what failed now (a context sharing the cells) does not go away
-        LLAMA_LOG_WARN("%s: [SWAGROW] the window cache can no longer be resized (%s); off%s\n", __func__, why_not,
-                ink_swa_small ? ", it keeps the decode size" : "");
-        ink_swa_kv = nullptr;
+        // only a shared cell list is for good (it leaves the feature off); the rest are refused this time
+        const bool shared = strcmp(why_not, "the cell list is shared with another context") == 0;
+        LLAMA_LOG_WARN("%s: [SWAGROW] the window cache cannot be resized now (%s)%s\n", __func__, why_not,
+                shared ? (ink_swa_small ? "; off, it keeps the decode size" : "; off") : "; size unchanged");
+        if (shared) {
+            ink_swa_kv = nullptr;
+        }
         return false;
     }
     const uint32_t n = small ? ink_swa_dec : ink_swa_boot;
@@ -481,6 +486,7 @@ void llama_context::ink_swa_full(const char * why) {
     if (!ink_swa_small) {
         return;
     }
+    prompt_warm_join(); // the refill thread never runs beside the suspend below
     if (ink_loan_grown && !(ink_stream && ink_stream->armed())) {
         ink_loan_shrink(why); // gives the cells back to the window cache before the cache refills at its boot size
     }

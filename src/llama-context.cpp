@@ -1522,7 +1522,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         if (cparams.ctx_other && cparams.ctx_other->ink_swa_kv) {
             cparams.ctx_other->ink_swa_full("drafter attach");
             if (cparams.ctx_other->ink_swa_small) {
-                LLAMA_LOG_WARN("%s: [SWAGROW] the other context's window cache did not grow back before the attach\n", __func__);
+                // attaching now could pin the other context at the decode size for good: fail the attach instead
+                throw std::runtime_error("[SWAGROW] the other context's window cache did not grow back before the attach");
             }
             cparams.ctx_other->ink_swa_kv = nullptr;
             LLAMA_LOG_WARN("%s: [SWAGROW] off for the other context (a context attached to it)\n", __func__);
