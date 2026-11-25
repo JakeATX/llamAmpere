@@ -10,6 +10,7 @@
 #include "ai4-turbo.cuh"
 #include "ai4-exp-turbo.cuh"
 #include "ai4-decode-fast.cuh"
+#include "ai4-turbo-ids.cuh"
 #include "ait5a16.cuh"
 #include "ai5-coop128.cuh"
 #include "magic2-v2.cuh"
@@ -2362,6 +2363,14 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int8_t * const xq = pre ? pre_q : q_buf.get();
     const float  * const xs = pre ? pre_s : s_buf.get();
 
+    // [TURBO-IDS] opt-in GGML_CUDA_AI4_TURBO_IDS=n (default 0 = never taken): AIT4_U / AIT3_U at n_tok 1..n on the turbo
+    // split-K matvec with direct routing ids (ai4-turbo-ids.cu), ahead of T1 and decode-fast.
+    if (!ampere_grouped && !fused && sms &&
+            ggml_cuda_ai4_turbo_ids_try(src0->type, (const uint8_t *) src0->data, (int64_t) src0->nb[2], ids, xq, xs, y_out,
+                                        M, K, n_tok, n_used, ne11, n_expert, xsh, y_into != nullptr, stream)) {
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     // [INK200 T1] Ampere SM 8.0+ SpecDecode grouped expert turbo (M = 2..32; M = 1 stays untouched on mmvr).
     // M = 2..8 (n_pairs <= 64): zero-ids_helper direct-grouped Split-K; M = 9..32: zero-static-SMEM grouped Split-K
     // with per-visit ids_helper cache shared across gate_up & down. Kill switch: GGML_CUDA_AI4_EXP_TURBO=0.

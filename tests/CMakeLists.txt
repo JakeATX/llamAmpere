@@ -848,6 +848,7 @@ llama_build_and_test(test-gdn-conv-norm.cpp)
 set_tests_properties(test-gdn-conv-norm PROPERTIES SKIP_RETURN_CODE 77)
 llama_build_and_test(test-ait-format.cpp)
 llama_build_and_test(test-ai4-u2.cpp)
+llama_build_and_test(test-ai4-turbo-ids-route.cpp)   # [TURBO-IDS] direct-ids routing math vs the ids_helper contract (CPU only)
 llama_build_and_test(test-gguf-deprecated-ai.cpp)
 
 if (GGML_CUDA AND NOT GGML_BACKEND_DL) # test-magic2-v2 links ggml-cuda directly (a MODULE under GGML_BACKEND_DL)

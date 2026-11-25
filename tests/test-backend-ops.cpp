@@ -18397,6 +18397,14 @@ static void add_ink200_cases(std::vector<std::unique_ptr<test_case>> & cases) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 2304, n, 1152, true));
         }
     }
+    // [TURBO-IDS] AIT3_U (S34d experts) at the same expert shapes, decode / verify N 1-8, plain, skipped ids and repeats;
+    // run unset and with GGML_CUDA_AI4_TURBO_IDS=8 (pin GGML_CUDA_AI23_FAST=1 GGML_CUDA_AI23_ID_REF=0 so AIT3_U cannot take
+    // the reference path; the INFO line "direct-ids turbo expert matvec on" prints once per type when the kernel runs)
+    for (int n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT3_U, 128, 8, true,  2304, n, 2304));
+        cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT3_U, 128, 8, false, 2304, n, 1152, false, false, 1));
+        cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT3_U, 4, 3, false, 2304, n, 1152, true));
+    }
 }
 
 static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
