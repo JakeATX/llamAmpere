@@ -3840,13 +3840,14 @@ static int aif_mmv_pf() {
 }
 
 // [WREAD08] GGML_CUDA_AIF_MMVX: decode widths (N <= 8) at small M take magic2::mmvx, G groups of four warps per 16-row
-// strip (bit-identical to mmv, see magic2-v2.cuh). Unset or -1 = auto: G = 2 when mmv would keep fewer than L warps
+// strip (bit-identical to mmv, see magic2-v2.cuh). Unset or 0 = off (release mmv everywhere; measured neutral on the
+// 8 GB f100 gate, 50.60 -> 50.56). -1 = auto: G = 2 when mmv would keep fewer than L warps
 // per SM in flight ((M / 16) * 4 < L * SMs), else mmv. L = 30 for AIF175_U2 (its decode is the most latency-bound: on a
 // Taichi 3090 G = 2 is +42-55% at M = 5120 and +5-18% at M = 6144, N 2-8), 17 for AIF25_U / AIF25_U2 (+17-24% at
 // M = 5120; slower at M >= 10240).
-// 0 = off (release mmv everywhere; kill switch). 2, 3 or 4 = force that G wherever K / 128 is a multiple of 4 G.
+// 2, 3 or 4 = force that G wherever K / 128 is a multiple of 4 G.
 static int aif_mmvx_env() {
-    static const int v = ai4_env_int("GGML_CUDA_AIF_MMVX", nullptr, -1);
+    static const int v = ai4_env_int("GGML_CUDA_AIF_MMVX", nullptr, 0);
     return v;
 }
 
