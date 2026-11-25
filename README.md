@@ -156,6 +156,17 @@ To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp; not re-measu
 replace `-m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf` with
 `--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
+## Docker (Linux)
+
+From the next release on, each release also ships a Linux image at `ghcr.io/jakeatx/llamampere` (tags: the release tag, e.g. `v0.7.5`, and `latest`). It is the Linux release tar on a slim Ubuntu 22.04 base: CUDA 12.4 runtime, cuBLAS and the GCC runtime are inside, so the host only needs an NVIDIA driver R550 or newer and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Windows stays the zip.
+
+```bash
+docker run --gpus all -v /path/to/models:/models -p 8080:8080 \
+  ghcr.io/jakeatx/llamampere:latest -m /models/model.gguf --preset 24dense
+```
+
+The entrypoint is `llama-server`, listening on `0.0.0.0:8080` inside the container; everything after the image name is passed to it, so the flags and card presets are the same as in the quick start above. Then open `http://localhost:8080`. To build the image yourself from a release tar, see [.devops/llamampere-server.Dockerfile](.devops/llamampere-server.Dockerfile).
+
 ## Headline results
 
 Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
