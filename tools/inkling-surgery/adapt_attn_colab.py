@@ -351,18 +351,16 @@ class InklingAttentionBlock(nn.Module):
             q = q * tau.to(q.dtype)
             r = r * tau.to(r.dtype)
 
-        # Build [T, H, E+1] relative bias table in FP32 for numerical stability
+        # Pad relative bias table once: [16, E+1] (compute per-tile [H, Bq, E+1] to avoid 3+ GiB peak at T=8K)
         b_pad = F.pad(self.rel_bias.float(), (0, 1), value=0.0)  # [16, E+1]
-        # table[t, h, d] = dot(r[t, h], b_pad[:, d]) - sinks[t, h]
-        rel_table = torch.einsum("thd,de->the", r.float(), b_pad) - sinks.float().unsqueeze(-1)
-        if mode == MODE_LSA or (mode == MODE_SWA_MID and self.lsa_far_bias.item() != 0.0):
-            # Apply scalar far-bias on the d >= E entry (matching inkling2.cpp:602)
-            fb = self.lsa_far_bias.float()
-            rel_table = torch.cat([rel_table[:, :, :-1], rel_table[:, :, -1:] + fb], dim=-1)
+        use_fb = (mode == MODE_LSA) or (mode == MODE_SWA_MID and self.lsa_far_bias.item() != 0.0)
+        fb_val = self.lsa_far_bias.float() if use_fb else None
 
         if stats_out is not None and "_diag_rel1023" in stats_out:
-            # Record mean dot(R, B[:, 1023]) - sink for calibration diagnostics
-            stats_out["_diag_rel1023"] = float(rel_table[:, :, min(1023, rel_table.shape[-1] - 2)].mean().item())
+            with torch.no_grad():
+                b_1023 = b_pad[:, min(1023, b_pad.shape[1] - 2)]
+                diag_t = torch.einsum("thd,d->th", r.float(), b_1023) - sinks.float()
+                stats_out["_diag_rel1023"] = float(diag_t.mean().item())
 
         # Prepare K/V in [H, T, D] (repeat_interleave for GQA)
         rep = self.n_head // self.n_head_kv
@@ -390,11 +388,36 @@ class InklingAttentionBlock(nn.Module):
         mid_mass_sum = 0.0
         far4k_mass_sum = 0.0
         far_q_count = 0
+        nested_ckpt = torch.is_grad_enabled() and t_len >= 2048
+
+        def _attn_tile_core(
+            qt_a: torch.Tensor,
+            kt_a: torch.Tensor,
+            vt_a: torch.Tensor,
+            r_tile_a: torch.Tensor,
+            s_tile_a: torch.Tensor,
+            b_pad_a: torch.Tensor,
+            fb_a: Optional[torch.Tensor],
+            d_idx_a: torch.Tensor,
+            valid_a: torch.Tensor,
+        ) -> torch.Tensor:
+            rt_a = torch.einsum("bhd,de->hbe", r_tile_a.float(), b_pad_a) - s_tile_a.float().transpose(0, 1).unsqueeze(-1)
+            if fb_a is not None:
+                rt_a = torch.cat([rt_a[:, :, :-1], rt_a[:, :, -1:] + fb_a], dim=-1)
+            scores_a = torch.bmm(qt_a.float(), kt_a.float().transpose(1, 2)) * scale
+            d_exp_a = d_idx_a.unsqueeze(0).expand(self.n_head, -1, -1)
+            bias_a = torch.gather(rt_a, 2, d_exp_a)
+            scores_a = (scores_a + bias_a).masked_fill(~valid_a.unsqueeze(0), -1e9)
+            m_a = torch.maximum(scores_a.max(dim=-1, keepdim=True).values, torch.zeros_like(scores_a[..., :1]))
+            exp_a = torch.exp(scores_a - m_a) * valid_a.unsqueeze(0).to(scores_a.dtype)
+            probs_a = exp_a / (exp_a.sum(dim=-1, keepdim=True) + torch.exp(-m_a))
+            return torch.bmm(probs_a.to(vt_a.dtype), vt_a)
 
         for q0 in range(0, t_len, q_blk):
             q1 = min(q0 + q_blk, t_len)
             qt = q_h[:, q0:q1, :]  # [H, Bq, D]
-            rt = rel_table[q0:q1].permute(1, 0, 2)  # [H, Bq, E+1]
+            r_tile = r[q0:q1]      # [Bq, H, 16]
+            s_tile = sinks[q0:q1]  # [Bq, H]
             q_pos = torch.arange(q0, q1, device=x0.device, dtype=torch.long)
 
             if mode == MODE_SWA:
@@ -418,7 +441,7 @@ class InklingAttentionBlock(nn.Module):
                 dist = q_pos[:, None] - k_pos[None, :]
                 valid = dist >= 0
             elif mode == MODE_LSA:
-                # Exact INKLSA-SJ block voting: sinks [0..sinks) U topk far blocks U near [q0-W+1..q1)
+                # Exact INKLSA-SJ block voting: sinks [0..sinks) U topk far blocks U near [last_elig_blk*B..q1)
                 near_start = max(0, q0 - (swa_window - 1))
                 first_elig_blk = lsa_sinks // lsa_block
                 last_elig_blk = near_start // lsa_block
@@ -448,35 +471,35 @@ class InklingAttentionBlock(nn.Module):
             else:
                 raise ValueError(f"Unknown mode {mode}")
 
-            scores = torch.bmm(qt.float(), kt.float().transpose(1, 2)) * scale  # [H, Bq, Bk]
-            d_idx = torch.clamp(dist, min=0, max=extent)  # [Bq, Bk]
-            # Gather relative bias: rt is [H, Bq, E+1], d_idx is [Bq, Bk]
-            d_exp = d_idx.unsqueeze(0).expand(self.n_head, -1, -1)
-            bias = torch.gather(rt, 2, d_exp)
-            scores = scores + bias
-            scores = scores.masked_fill(~valid.unsqueeze(0), -1e9)
-
-            # Softmax with zero-logit sink: denom = exp(0) + sum_k exp(scores_k)
-            m = torch.maximum(scores.max(dim=-1, keepdim=True).values, torch.zeros_like(scores[..., :1]))
-            exp_s = torch.exp(scores - m) * valid.unsqueeze(0).to(scores.dtype)
-            denom = exp_s.sum(dim=-1, keepdim=True) + torch.exp(-m)
-            probs = exp_s / denom  # [H, Bq, Bk]
+            d_idx = torch.clamp(dist, min=0, max=extent)
 
             if stats_out is not None and mode in (MODE_SWA_MID, MODE_LSA):
                 with torch.no_grad():
                     eligible_q = q_pos >= 1024
                     n_eq = int(eligible_q.sum().item())
                     if n_eq > 0:
+                        rt_d = torch.einsum("bhd,de->hbe", r_tile.float(), b_pad) - s_tile.float().transpose(0, 1).unsqueeze(-1)
+                        if fb_val is not None:
+                            rt_d = torch.cat([rt_d[:, :, :-1], rt_d[:, :, -1:] + fb_val], dim=-1)
+                        sc_d = torch.bmm(qt.float(), kt.float().transpose(1, 2)) * scale
+                        sc_d = (sc_d + torch.gather(rt_d, 2, d_idx.unsqueeze(0).expand(self.n_head, -1, -1))).masked_fill(~valid.unsqueeze(0), -1e9)
+                        m_d = torch.maximum(sc_d.max(dim=-1, keepdim=True).values, torch.zeros_like(sc_d[..., :1]))
+                        ex_d = torch.exp(sc_d - m_d) * valid.unsqueeze(0).to(sc_d.dtype)
+                        pr_d = ex_d / (ex_d.sum(dim=-1, keepdim=True) + torch.exp(-m_d))
                         far_mask = valid & (dist >= 1024)
                         mid_mask = valid & (dist >= 1024) & (dist < 4096)
                         f4k_mask = valid & (dist >= 4096)
-                        # Sum over eligible query rows & keys, average over heads
-                        far_mass_sum += float((probs[:, eligible_q, :] * far_mask[eligible_q].unsqueeze(0)).sum().item()) / self.n_head
-                        mid_mass_sum += float((probs[:, eligible_q, :] * mid_mask[eligible_q].unsqueeze(0)).sum().item()) / self.n_head
-                        far4k_mass_sum += float((probs[:, eligible_q, :] * f4k_mask[eligible_q].unsqueeze(0)).sum().item()) / self.n_head
+                        far_mass_sum += float((pr_d[:, eligible_q, :] * far_mask[eligible_q].unsqueeze(0)).sum().item()) / self.n_head
+                        mid_mass_sum += float((pr_d[:, eligible_q, :] * mid_mask[eligible_q].unsqueeze(0)).sum().item()) / self.n_head
+                        far4k_mass_sum += float((pr_d[:, eligible_q, :] * f4k_mask[eligible_q].unsqueeze(0)).sum().item()) / self.n_head
                         far_q_count += n_eq
 
-            out_q = torch.bmm(probs.to(vt.dtype), vt)  # [H, Bq, D]
+            if nested_ckpt:
+                out_q = checkpoint(
+                    _attn_tile_core, qt, kt, vt, r_tile, s_tile, b_pad, fb_val, d_idx, valid, use_reentrant=False
+                )
+            else:
+                out_q = _attn_tile_core(qt, kt, vt, r_tile, s_tile, b_pad, fb_val, d_idx, valid)
             out_chunks.append(out_q.permute(1, 0, 2).reshape(q1 - q0, self.n_head * self.head_dim))
 
         if stats_out is not None and far_q_count > 0 and mode in (MODE_SWA_MID, MODE_LSA):
