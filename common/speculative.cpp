@@ -30,6 +30,21 @@
 #include <thread>
 #include <cinttypes>
 
+// CONF_STOP (opt-in: LLAMA_SPEC_CONF_STOP=<thr>, default 0 = off). Before keeping draft slot j >= 2, stop the round
+// when prod_{i<j} q(d_i) * max_x q_j(x) < thr: the product of the drafter's probabilities of the tokens it kept,
+// times the top probability of slot j's distribution. The rule never looks at the token it would drop (d_j), so the
+// draft length is a stopping time of the drafter's own draws and exact p/q verification keeps the output
+// distribution; it is not same-seed identical (fewer verify positions, different RNG use). Rationale and est. gain
+// (with LLAMA_SPEC_VGRAPH=1 only; without it every depth change costs a graph rebuild): MTPPUNCT.
+static float spec_conf_stop_th() {
+    static const float th = [] {
+        const char * v = getenv("LLAMA_SPEC_CONF_STOP");
+        const float t = v ? (float) atof(v) : 0.0f;
+        return t > 0.0f && t < 1.0f ? t : 0.0f;
+    }();
+    return th;
+}
+
 // [RTPORT] LLAMA_PLE_HINT=1: hand the target each token the next check will hold (with its predecessors), so the
 // pages of its per-layer n-gram rows are read while the helper keeps drawing (see llama_ple_hint)
 static void spec_ple_hint(llama_context * ctx_tgt, const common_speculative_draft_params & dp, const llama_tokens * drafted) {
@@ -1779,6 +1794,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // INKSPEC accsim (Taichi 3090, 1,292 depth-7 rounds): max depth 5 + th 0.4 = est +5% over fixed depth 4.
                     static const float stop_th = [] { const char * e = getenv("LLAMA_DSPARK_STOP"); return e ? (float) atof(e) : 0.0f; }();
                     double conf = 1.0;
+                    double conf_kept = 1.0; // CONF_STOP: product of q(d_i) over the kept slots
+                    const float conf_stop = spec_conf_stop_th();
                     const float * h = llama_get_embeddings_nextn(ctx_dft);
                     for (int32_t i = 1; h && i < std::min(n_block_tokens, ds_cap[seq_id] + 1); ++i) {
                         const float * row = h + (size_t) (beg + i) * n_embd_dec + dspark_rank;
@@ -1808,12 +1825,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             dp.result_q->pop_back();
                             break;
                         }
+                        if (i >= 2 && conf_stop > 0.0f && conf_kept * qmax < conf_stop) {
+                            dp.result_q->pop_back();
+                            break;
+                        }
                         if (!found) {
                             // the graph did not take the sampled layout: no draft this round (never a wrong q)
                             LOG_WRN("%s: sampled DSpark slot %d: drawn id not among the candidates, dropping the draft\n", __func__, i);
                             result.clear();
                             dp.result_q->clear();
                             break;
+                        }
+                        if (conf_stop > 0.0f) {
+                            for (const auto & c : q) {
+                                if (c.id == id) {
+                                    conf_kept *= c.p;
+                                    break;
+                                }
+                            }
                         }
                         result.push_back(id);
                     }
@@ -3398,6 +3427,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     chain_st.rounds++;
                     int32_t n_consumed = 0;
                     std::vector<float> repair_hidden;
+                    const float conf_stop = spec_conf_stop_th();
+                    float conf_kept = 1.0f; // CONF_STOP: product of q(d_i) over the kept steps
                     for (int j = 0; j < n_chain; ++j) {
                         const float * row = lp + (size_t) W*j;
                         std::vector<llama_token_data> q;
@@ -3410,6 +3441,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         }
                         ++n_consumed; // the core dist draws before the confidence check, including size-one support
                         if (q[0].p < params.p_min) {
+                            break;
+                        }
+                        if (j >= 1 && conf_stop > 0.0f && conf_kept * q[0].p < conf_stop) {
                             break;
                         }
                         const llama_token id = (llama_token) row[2 + pick];
@@ -3426,6 +3460,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                                 (chain_qwen4exp ? row[0] == (float) id : (int32_t) row[1] == pick) ? "" : " [disagreement]",
                                 common_token_to_piece(ctx_dft, id).c_str());
 
+                        conf_kept *= selected_p;
                         result.push_back(id);
                         if (qwen_cpu_sampler) {
                             common_sampler_accept(qwen_cpu_sampler, id, true);
@@ -3607,7 +3642,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
         }
-        const bool pipe_round = mtp_pipe && n_drafting == 1 && !cdepth && !(params.p_min > 0.0f);
+        const float conf_stop = spec_conf_stop_th();
+        // CONF_STOP decides after each step, so the next step is not queued ahead (as with p_min and CDEPTH)
+        const bool pipe_round = mtp_pipe && n_drafting == 1 && !cdepth && !(params.p_min > 0.0f) && !(conf_stop > 0.0f);
+        std::vector<float> conf_kept(n_seq, 1.0f); // CONF_STOP: product of q(d_i) over each seq's kept tokens
         bool pipe_queued = false; // step i is already on the card (queued in the previous iteration)
 
         while (n_drafting > 0) {
@@ -3712,6 +3750,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     n_drafting--;
 
                     continue;
+                }
+
+                if (conf_stop > 0.0f && !result.empty() && conf_kept[seq_id] * cur_p->data[0].p < conf_stop) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+                if (conf_stop > 0.0f) {
+                    float q_id = cur_p->data[0].p;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id == id) {
+                            q_id = cur_p->data[k].p;
+                            break;
+                        }
+                    }
+                    conf_kept[seq_id] *= q_id;
                 }
 
                 common_sampler_accept(smpl, id, true);
