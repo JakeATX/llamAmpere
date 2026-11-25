@@ -40,7 +40,7 @@ bool ggml_cuda_q8tc_fwo(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     if (src0->type != GGML_TYPE_Q8_0 || !src0->buffer || ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
             src0->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) || src0->ne[0] % QK8_0 != 0 || src0->ne[1] < 1 || src0->ne[2] != 1 ||
             src0->ne[3] != 1 || src0->nb[1] != (size_t) (src0->ne[0]/QK8_0)*sizeof(block_q8_0) ||
-            T < 1 || T > 8 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[0] != src0->ne[0] ||
+            T < 1 || T > 8 || T > ggml_cuda_q8a16_max_t() || (uintptr_t) src0->data % 2 != 0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[0] != src0->ne[0] ||
             src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[0] != src0->ne[1] || dst->ne[1] != T || dst->ne[2] != 1 ||
             dst->ne[3] != 1 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || src1->nb[1] % 16 != 0 ||
             dst->nb[1] % sizeof(float) != 0 || (uintptr_t) src1->data % 16 != 0) {

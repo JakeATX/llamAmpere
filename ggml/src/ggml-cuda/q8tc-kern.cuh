@@ -272,7 +272,7 @@ static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3(const q8a16_args a
 }
 
 template <int NW, bool HILO, int MINB, bool IA = false>
-static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3e(const q8a16_args a, const int nb, const int T, const q8tc_epi e) {
+static __global__ void __launch_bounds__(32*NW, MINB) k_q8tc3e(const q8a16_args a, const int nb, const int T, const __grid_constant__ q8tc_epi e) {
     q8tc3_dev<NW, HILO, IA, true>(a, nb, T, &e);
 }
 
