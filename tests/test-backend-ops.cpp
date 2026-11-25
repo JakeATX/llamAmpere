@@ -29032,7 +29032,7 @@ static int run_nk_dense_tc_check() {
         struct head_corr_case {
             const char * name;
             int64_t M, K, T;
-            int     path; // 2=grid, 1=tc
+            int     path; // 0=auto, 1=tc, 2=grid
         };
         const std::vector<head_corr_case> hcases = {
             { "head_grid_201024_T1",  201024, 2304, 1, 2 },
@@ -29053,6 +29053,37 @@ static int run_nk_dense_tc_check() {
             { "head_tc_201024_T8",    201024, 2304, 8, 1 },
             { "head_tc_M16399_T5",     16399, 2304, 5, 1 },
             { "head_tc_K3072_T5",      16400, 3072, 5, 1 },
+            // Generalized K % 256 == 128 tail shapes (partly filled last warp for RW=4,3,2) at T=4..8
+            { "head_t4_K640_T4",       16397,  640, 4, 2 },
+            { "head_t4_K640_T5",       16397,  640, 5, 2 },
+            { "head_t4_K640_T6",       16397,  640, 6, 2 },
+            { "head_t4_K640_T7",       16397,  640, 7, 2 },
+            { "head_t4_K640_T8",       16397,  640, 8, 2 },
+            { "head_t4_K640_auto_T5",  16397,  640, 5, 0 },
+            { "head_t4_K1152_T4",      32773, 1152, 4, 2 },
+            { "head_t4_K1152_T5",      32773, 1152, 5, 2 },
+            { "head_t4_K1152_T6",      32773, 1152, 6, 2 },
+            { "head_t4_K1152_T7",      32773, 1152, 7, 2 },
+            { "head_t4_K1152_T8",      32773, 1152, 8, 2 },
+            { "head_t4_K1408_T4",      16399, 1408, 4, 2 },
+            { "head_t4_K1408_T5",      16399, 1408, 5, 2 },
+            { "head_t4_K1408_T6",      16399, 1408, 6, 2 },
+            { "head_t4_K1408_T7",      16399, 1408, 7, 2 },
+            { "head_t4_K1408_T8",      16399, 1408, 8, 2 },
+            // Tail-only edge case (nb=4, 0 main loop iterations) at exact min head rows (16385)
+            { "head_t4_K128_T4",       16385,  128, 4, 2 },
+            { "head_t4_K128_T5",       16385,  128, 5, 2 },
+            { "head_t4_K128_T6",       16385,  128, 6, 2 },
+            { "head_t4_K128_T7",       16385,  128, 7, 2 },
+            { "head_t4_K128_T8",       16385,  128, 8, 2 },
+            // K > 3072 (above head_tc cap): both tail4 and mult8 run on head_grid
+            { "head_t4_K3456_T4",      16403, 3456, 4, 2 },
+            { "head_t4_K3456_T5",      16403, 3456, 5, 2 },
+            { "head_t4_K3456_T6",      16403, 3456, 6, 2 },
+            { "head_t4_K3456_T7",      16403, 3456, 7, 2 },
+            { "head_t4_K3456_T8",      16403, 3456, 8, 2 },
+            { "head_grid_K4096_T5",    16397, 4096, 5, 2 },
+            { "head_grid_K4096_T8",    16397, 4096, 8, 2 },
         };
         const size_t tsz = ggml_type_size(GGML_TYPE_Q8_0);
         const int    bsz = (int) ggml_blck_size(GGML_TYPE_Q8_0);
@@ -29099,6 +29130,13 @@ static int run_nk_dense_tc_check() {
                         qs[q4 * 4 + 2] = (int8_t) ((int) ((wv >> 16) & 255u) - 128);
                         qs[q4 * 4 + 3] = (int8_t) ((int) ((wv >> 24) & 255u) - 128);
                     }
+                    // For tail4 shapes, place valid int8 -1 (0xFF bytes = fp16 NaN if misread as scale)
+                    // in the last 8 weights loaded by lane 16 to catch any inactive-lane NaN leak.
+                    if ((nblk_row & 7u) == 4u && b == nblk_row - 1u && (r & 1) != 0) {
+                        for (int q = 24; q < 32; ++q) {
+                            qs[q] = (int8_t) -1;
+                        }
+                    }
                 }
             }
 
@@ -29113,7 +29151,7 @@ static int run_nk_dense_tc_check() {
             ggml_backend_tensor_set(t_x, h_x.data(),   0, h_x.size() * sizeof(float));
             ggml_backend_tensor_set(t_d, h_nan.data(), 0, h_nan.size() * sizeof(float));
 
-            const char * path_cnt_name = (h.path == 2) ? "nk_dense_tc_head_grid" : "nk_dense_tc_head_tc";
+            const char * path_cnt_name = (h.path == 1) ? "nk_dense_tc_head_tc" : "nk_dense_tc_head_grid";
             const int64_t c0 = cnt(be, "nk_dense_tc");
             const int64_t p0 = cnt(be, path_cnt_name);
             const bool ok_nk = run_mm_ex(be, true, h.path, false, t_w, t_x, t_d);
@@ -29203,6 +29241,162 @@ static int run_nk_dense_tc_check() {
             } else {
                 printf("NK_DENSE_TC(%-20s): OK (all %lld finite, nmse_q8=%.2e max_q8=%.2e | nmse_f32=%.2e max_f32=%.2e | %s=+1)\n",
                        h.name, (long long) (h.M * h.T), nmse_q8, max_abs_q8, nmse_f32, max_abs_f32, path_cnt_name);
+            }
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+        }
+    }
+
+    // 2c. Head and tail fallback cases: unsupported K at head rows, K % 256 == 128 below head rows,
+    //     and forced tc path on tail shapes or K > 3072 must return false with +0 NK counters and
+    //     fall back cleanly to base q8a16.
+    {
+        struct head_fb_case {
+            const char * name;
+            int64_t M, K, T;
+            int     path; // 0=auto, 1=tc, 2=grid
+        };
+        const std::vector<head_fb_case> fbcases = {
+            // Unsupported K (not a multiple of 128) at head rows (M >= 16385)
+            { "fb_head_K96_auto",    16399,   96, 5, 0 },
+            { "fb_head_K96_grid",    16399,   96, 5, 2 },
+            { "fb_head_K192_auto",   16399,  192, 5, 0 },
+            { "fb_head_K320_grid",   16399,  320, 5, 2 },
+            { "fb_head_K608_auto",   16397,  608, 8, 0 },
+            // K % 256 == 128 below head rows (M < 16385)
+            { "fb_sub_M16384_K1152", 16384, 1152, 5, 0 },
+            { "fb_sub_M16384_grid",  16384, 1152, 5, 2 },
+            { "fb_sub_M2304_K640",    2304,  640, 5, 0 },
+            { "fb_sub_M512_K1408",     512, 1408, 8, 0 },
+            // Forced tc path on tail shapes (K % 256 == 128) and above tc K cap (> 3072)
+            { "fb_tc_tail_K128_T4",  16385,  128, 4, 1 },
+            { "fb_tc_tail_K640_T5",  16397,  640, 5, 1 },
+            { "fb_tc_tail_K1152_T5", 16399, 1152, 5, 1 },
+            { "fb_tc_tail_K1408_T8", 16399, 1408, 8, 1 },
+            { "fb_tc_K3584_T5",      16400, 3584, 5, 1 },
+        };
+        const size_t tsz = ggml_type_size(GGML_TYPE_Q8_0);
+        const int    bsz = (int) ggml_blck_size(GGML_TYPE_Q8_0);
+        const auto to_float = ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float;
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+
+        for (size_t fi = 0; fi < fbcases.size(); ++fi) {
+            const auto & fc = fbcases[fi];
+            const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, fc.K);
+            const size_t nblk_row  = (size_t) fc.K / (size_t) bsz;
+
+            ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            ggml_tensor * t_w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, fc.K, fc.M);
+            ggml_tensor * t_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  fc.K, fc.T);
+            ggml_tensor * t_d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  fc.M, fc.T);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+            std::vector<uint8_t> h_wq((size_t) fc.M * row_bytes);
+            uint32_t st = 0x51a7c3d9u ^ ((uint32_t) fi * 0x9e3779b9u);
+            auto xorsh = [&]() -> uint32_t {
+                st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+                return st;
+            };
+            const ggml_fp16_t d_val = ggml_fp32_to_fp16(0.019f);
+            for (int64_t r = 0; r < fc.M; ++r) {
+                uint8_t * rp = h_wq.data() + (size_t) r * row_bytes;
+                for (size_t b = 0; b < nblk_row; ++b) {
+                    uint8_t * bp = rp + b * tsz;
+                    std::memcpy(bp, &d_val, sizeof(d_val));
+                    int8_t * qs = (int8_t *) (bp + sizeof(d_val));
+                    uint32_t wv = xorsh() ^ 0x5a5aa5a5u;
+                    for (int q4 = 0; q4 < 8; ++q4) {
+                        wv = wv * 1664525u + 1013904223u;
+                        qs[q4 * 4 + 0] = (int8_t) ((int) ((wv >>  0) & 255u) - 128);
+                        qs[q4 * 4 + 1] = (int8_t) ((int) ((wv >>  8) & 255u) - 128);
+                        qs[q4 * 4 + 2] = (int8_t) ((int) ((wv >> 16) & 255u) - 128);
+                        qs[q4 * 4 + 3] = (int8_t) ((int) ((wv >> 24) & 255u) - 128);
+                    }
+                }
+            }
+
+            std::mt19937 rng(77201u + (uint32_t) fi * 61u);
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            std::vector<float> h_x((size_t) fc.T * fc.K);
+            for (float & v : h_x) { v = nd(rng); }
+
+            std::vector<float> h_nan((size_t) fc.T * fc.M, qnan);
+            ggml_backend_tensor_set(t_w, h_wq.data(),  0, h_wq.size());
+            ggml_backend_tensor_set(t_x, h_x.data(),   0, h_x.size() * sizeof(float));
+            ggml_backend_tensor_set(t_d, h_nan.data(), 0, h_nan.size() * sizeof(float));
+
+            const int64_t c0  = cnt(be, "nk_dense_tc");
+            const int64_t g0  = cnt(be, "nk_dense_tc_head_grid");
+            const int64_t tc0 = cnt(be, "nk_dense_tc_head_tc");
+            const int64_t d0  = cnt(be, "nk_dense_tc_dense");
+            const bool ok_nk = run_mm_ex(be, true, fc.path, false, t_w, t_x, t_d);
+            const int64_t c1  = cnt(be, "nk_dense_tc");
+            const int64_t g1  = cnt(be, "nk_dense_tc_head_grid");
+            const int64_t tc1 = cnt(be, "nk_dense_tc_head_tc");
+            const int64_t d1  = cnt(be, "nk_dense_tc_dense");
+
+            // With respect_mint=true, run_mm_ex falls back to base q8a16 when NK declines.
+            const bool ok_fb = run_mm_ex(be, true, fc.path, true, t_w, t_x, t_d);
+            const int64_t c2  = cnt(be, "nk_dense_tc");
+            const int64_t g2  = cnt(be, "nk_dense_tc_head_grid");
+            const int64_t tc2 = cnt(be, "nk_dense_tc_head_tc");
+            const int64_t d2  = cnt(be, "nk_dense_tc_dense");
+            ggml_backend_synchronize(be);
+
+            std::vector<float> h_out((size_t) fc.T * fc.M);
+            ggml_backend_tensor_get(t_d, h_out.data(), 0, h_out.size() * sizeof(float));
+
+            int64_t bad_fp_cnt = 0;
+            for (float v : h_out) {
+                if (!std::isfinite(v)) { ++bad_fp_cnt; }
+            }
+
+            std::vector<int64_t> check_rows;
+            if (fc.M <= 512) {
+                for (int64_t r = 0; r < fc.M; ++r) {
+                    check_rows.push_back(r);
+                }
+            } else {
+                const int64_t starts[4] = {
+                    0,
+                    (fc.M / 4) & ~15ll,
+                    (fc.M / 2) & ~15ll,
+                    fc.M - 128,
+                };
+                for (int s = 0; s < 4; ++s) {
+                    for (int64_t off = 0; off < 128 && starts[s] + off < fc.M; ++off) {
+                        check_rows.push_back(starts[s] + off);
+                    }
+                }
+            }
+
+            double num_f32 = 0.0, den_f32 = 0.0;
+            std::vector<float> w_row((size_t) fc.K);
+            for (int64_t r : check_rows) {
+                to_float(h_wq.data() + (size_t) r * row_bytes, w_row.data(), fc.K);
+                for (int64_t t = 0; t < fc.T; ++t) {
+                    const float * xt = h_x.data() + (size_t) t * fc.K;
+                    double rf = 0.0;
+                    for (int64_t j = 0; j < fc.K; ++j) {
+                        rf += (double) w_row[(size_t) j] * (double) xt[(size_t) j];
+                    }
+                    const double df = (double) h_out[(size_t) t * fc.M + r] - rf;
+                    num_f32 += df * df;
+                    den_f32 += rf * rf;
+                }
+            }
+            const double nmse_f32 = den_f32 > 0.0 ? (num_f32 / den_f32) : num_f32;
+            const bool cnt_zero = (c1 == c0) && (g1 == g0) && (tc1 == tc0) && (d1 == d0) &&
+                (c2 == c0) && (g2 == g0) && (tc2 == tc0) && (d2 == d0);
+            const bool pass = !ok_nk && ok_fb && cnt_zero && (bad_fp_cnt == 0) && nmse_f32 <= 1e-4;
+            if (!pass) {
+                ++fails;
+                printf("NK_DENSE_TC(%-20s): FAIL fallback ok_nk=%d ok_fb=%d dc=%lld dg=%lld dtc=%lld dd=%lld nan_inf=%lld nmse=%.2e\n",
+                       fc.name, ok_nk, ok_fb, (long long) (c2 - c0), (long long) (g2 - g0),
+                       (long long) (tc2 - tc0), (long long) (d2 - d0), (long long) bad_fp_cnt, nmse_f32);
+            } else {
+                printf("NK_DENSE_TC(%-20s): OK (clean fallback to q8a16, nmse=%.2e cnt=+0)\n", fc.name, nmse_f32);
             }
             ggml_backend_buffer_free(buf);
             ggml_free(ctx);

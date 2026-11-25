@@ -4,14 +4,15 @@
 //   - MIN_ROWS = 16385 (head-only: output.weight 201024x2304; =0 restores r11 attention/grouped)
 //   - MINT     = 4     (T=1..3 stay on base q8a16, which streams 201024x2304 at ~876 GB/s at T=1)
 //   - HEAD_PATH = auto | tc | grid (default auto, selects per T from k_head_auto_table):
-//       * grid (default for T=4..8): k_nk_quant_x_dp4a (~2-3 us pre-quant into 12-21 KB L1-resident
-//         qx_buf via ctx.pool()) + k_nk_head_grid_dp4a (0 B SMEM -> full 128 KB L1, 0 barriers,
-//         4 warps/CTA up to 32 warps/SM, coalesced LDG.E.NA.64 + L2::evict_first, native dp4a + fp32 acc).
-//       * tc (r12 persistent): k_nk_head_tc (NW=8 independent warps/CTA, 2-stage cross-tile cp.async,
-//         x quantized once per SM in SMEM, mma.m16n8k32.s32.s8).
-//   - Fallback / MIN_ROWS=0 (attention or grouped): k_nk_dense_tc (r11 4-warp 3-stage ring).
+//       * grid (default for T=4..8, any K % 128 == 0): k_nk_quant_x_dp4a (~2-3 us pre-quant into
+//         L1-resident qx_buf via ctx.pool()) + k_nk_head_grid_dp4a (K % 256 == 0) or
+//         k_nk_head_grid_dp4a_tail4 in nk-dense-tc-tail.cu (K % 256 == 128).
+//       * tc (r12 persistent, K % 256 == 0 and K <= 3072): k_nk_head_tc (NW=8 independent warps/CTA,
+//         2-stage cross-tile cp.async, x quantized once per SM in SMEM, mma.m16n8k32.s32.s8).
+//   - Fallback / MIN_ROWS=0 (attention or grouped, K % 256 == 0): k_nk_dense_tc (r11 4-warp 3-stage ring).
 
 #include "nk-dense-tc.cuh"
+#include "nk-dense-tc-tail.cuh"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -981,7 +982,7 @@ static bool nk_head_grid_try_launch(
         const int           nb,
         const int           T) {
     const int nr = (int) src0->ne[1];
-    if (nr < NK_HEAD_MIN_ROWS_DEF || nb < 8 || nb % 8 != 0 || T < 1 || T > 8) {
+    if (nr < NK_HEAD_MIN_ROWS_DEF || nb < 4 || nb % 4 != 0 || nb > INT_MAX / 32 || T < 1 || T > 8) {
         return false;
     }
 
@@ -1003,22 +1004,26 @@ static bool nk_head_grid_try_launch(
     const int64_t sx   = (int64_t) (src1->nb[1] / sizeof(float));
     const int64_t sd   = (int64_t) (dst->nb[1] / sizeof(float));
 
-    const uint32_t q_grid = (uint32_t) ((nb * T + 31) / 32);
+    const uint32_t q_grid = (uint32_t) (((int64_t) nb * T + 31) / 32);
     k_nk_quant_x_dp4a<<<q_grid, 128, 0, stream>>>(x, qx_q, qx_d, sx, nb, T);
 
     const bool l2_ef = nk_dense_tc_l2_evict_first_enabled();
-    if (l2_ef) {
-        nk_head_grid_dispatch<true>(vx, qx_q, qx_d, out, srow, sd, nr, nb, T, stream);
+    if ((nb & 7) == 0) {
+        if (l2_ef) {
+            nk_head_grid_dispatch<true>(vx, qx_q, qx_d, out, srow, sd, nr, nb, T, stream);
+        } else {
+            nk_head_grid_dispatch<false>(vx, qx_q, qx_d, out, srow, sd, nr, nb, T, stream);
+        }
     } else {
-        nk_head_grid_dispatch<false>(vx, qx_q, qx_d, out, srow, sd, nr, nb, T, stream);
+        ggml_cuda_nk_head_grid_tail4_launch(vx, qx_q, qx_d, out, srow, sd, nr, nb, T, l2_ef, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 
     g_nk_dense_tc_head_grid_fires.fetch_add(1, std::memory_order_relaxed);
     const int64_t fire = g_nk_dense_tc_fires.fetch_add(1, std::memory_order_relaxed) + 1;
     if (nk_dense_tc_trace() && fire <= 16) {
-        GGML_LOG_WARN("[NK_DENSE_TC] trace #%lld (head_grid l2_ef=%d): rows=%d K=%d T=%d qx=%zu B\n",
-            (long long) fire, (int) l2_ef, nr, nb * QK8_0, T, tot_bytes);
+        GGML_LOG_WARN("[NK_DENSE_TC] trace #%lld (head_grid%s l2_ef=%d): rows=%d K=%d T=%d qx=%zu B\n",
+            (long long) fire, ((nb & 7) == 0) ? "" : "_tail4", (int) l2_ef, nr, nb * QK8_0, T, tot_bytes);
     }
     return true;
 }
@@ -1128,38 +1133,48 @@ bool ggml_cuda_nk_dense_tc_mul_mat(
     const int min_t    = respect_mint ? nk_dense_tc_min_t() : 1;
     const int min_rows = force_enable ? 1 : ggml_cuda_nk_dense_tc_min_rows();
     const int max_rows = force_enable ? 0 : nk_dense_tc_max_rows();
-    if (T < min_t || T > 8 || ne10 < 8 * QK8_0 || ne10 % (8 * QK8_0) != 0) {
+    if (T < min_t || T > 8 || ne10 < 4 * QK8_0 || ne10 % (4 * QK8_0) != 0 ||
+            ne10 / QK8_0 > INT_MAX / 32) {
         return false;
     }
     if (!nk_dense_tc_member_ok(src0, src1, dst, ne10, T, min_rows, max_rows)) {
         return false;
     }
 
-    const int nb  = (int) (ne10 / QK8_0);
-    const int nch = nb / 8;
+    const int  nb    = (int) (ne10 / QK8_0);
+    const bool mult8 = (nb % 8 == 0);
+    const int  nch   = nb / 8;
 
     if (src0->ne[1] >= NK_HEAD_MIN_ROWS_DEF) {
         const nk_dense_tc_head_path mode = (path_override >= 0)
             ? (nk_dense_tc_head_path) path_override
             : nk_dense_tc_head_path_env();
-        const nk_dense_tc_head_path chosen = (mode == NK_HEAD_PATH_AUTO)
-            ? k_head_auto_table[T]
-            : mode;
+        if (mode == NK_HEAD_PATH_TC) {
+            return mult8 && nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T);
+        }
+        if (mode == NK_HEAD_PATH_GRID) {
+            return nk_head_grid_try_launch(ctx, src0, src1, dst, nb, (int) T);
+        }
+        const nk_dense_tc_head_path chosen = k_head_auto_table[T];
         if (chosen == NK_HEAD_PATH_GRID) {
             if (nk_head_grid_try_launch(ctx, src0, src1, dst, nb, (int) T)) {
                 return true;
             }
-            if (nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
+            if (mult8 && nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
                 return true;
             }
         } else {
-            if (nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
+            if (mult8 && nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
                 return true;
             }
             if (nk_head_grid_try_launch(ctx, src0, src1, dst, nb, (int) T)) {
                 return true;
             }
         }
+    }
+
+    if (!mult8) {
+        return false;
     }
 
     nk_dense_tc_args a{};
