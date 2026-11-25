@@ -53,6 +53,16 @@
 #include <vector>
 #include <unordered_map>
 
+#ifdef _WIN32
+// setenv for the MSVC runtime
+static int setenv(const char * name, const char * value, int overwrite) {
+    if (!overwrite && std::getenv(name) != nullptr) {
+        return 0;
+    }
+    return _putenv_s(name, value);
+}
+#endif
+
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
 #else

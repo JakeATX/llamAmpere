@@ -12,6 +12,16 @@
 
 #include <cstdlib>
 
+#ifdef _WIN32
+// setenv for the MSVC runtime
+static int setenv(const char * name, const char * value, int overwrite) {
+    if (!overwrite && std::getenv(name) != nullptr) {
+        return 0;
+    }
+    return _putenv_s(name, value);
+}
+#endif
+
 static_assert(LLAMA_DECODE_PHASE_UNKNOWN == 0, "no tag is 0");
 static_assert(LLAMA_DECODE_PHASE_PROMPT == 1, "prompt tag");
 static_assert(LLAMA_DECODE_PHASE_GENERATION == 2, "generation tag");
