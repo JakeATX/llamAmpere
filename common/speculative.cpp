@@ -240,6 +240,8 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
     virtual bool process_range(const llama_batch & batch, int32_t output_offset) { return output_offset == 0 && process(batch); }
+    virtual bool can_pipe_process(int32_t /*n_tokens*/) const { return false; }
+    virtual bool is_pipe_dflash() const { return false; }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1270,6 +1272,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             aw_ema.assign(n_seq, 0.0f);
             LOG_INF("%s: DSpine adaptive width on (LLAMA_DSPINE_ADAPT): %d or %d tokens, widen at EMA >= %.2f tok/round, "
                     "narrow below %.2f, alpha %.3f\n", __func__, lo, this->params.n_max, up, down, a);
+            if (llama_gdn_replay_enabled(ctx_tgt)) {
+                const char * rshort = getenv("LLAMA_GDN_REPLAY_SHORT");
+                if (rshort == nullptr || std::strcmp(rshort, "1") != 0) {
+                    LOG_WRN("%s: LLAMA_DSPINE_ADAPT with lo=%d < n_max=%d and --gdn-replay: set LLAMA_GDN_REPLAY_SHORT=1 to keep static GDN verify graphs on short-tier rounds\n",
+                            __func__, lo, this->params.n_max);
+                }
+            }
         }
 
         if (has_rnn_context) {
@@ -1358,6 +1367,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             } else {
                 llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
             }
+        }
+        if (const int32_t pipe_mode = llama_dspine_pipe_mode(); is_dflash2 && !has_rnn_context && pipe_mode > 0) {
+            LOG_INF("%s: DSpine pipeline enabled (LLAMA_DSPINE_PIPE=%d): dev_inject=%d (%d rows)\n",
+                    __func__, pipe_mode, (int) use_dev_inject, llama_layer_inp_dev_rows(ctx_tgt));
         }
 
         // [T5-IDLE] H2: defer p35 context-feature readback/sync until draft()/get_state() so p35 overlaps CPU post_decode()
@@ -1536,7 +1549,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
-        const bool dev_inject_ok = use_dev_inject && n_tokens <= (int32_t) llama_n_batch(ctx_tgt);
+        const bool dev_inject_ok = use_dev_inject && n_tokens <= llama_layer_inp_dev_rows(ctx_tgt);
 
         llama_seq_id last_active_seq = -1;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1650,6 +1663,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         return true;
+    }
+
+    bool can_pipe_process(int32_t n_tokens) const override {
+        return is_dflash2 && !is_lilicorr && !has_rnn_context && use_dev_inject &&
+               n_tokens > 0 && n_tokens <= 64 &&
+               n_tokens <= llama_layer_inp_dev_rows(this->params.ctx_tgt) &&
+               n_tokens <= (int32_t) llama_n_ubatch(this->params.ctx_dft);
+    }
+
+    bool is_pipe_dflash() const override {
+        return is_dflash2 && !is_lilicorr && !has_rnn_context && use_dev_inject;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -4096,6 +4120,10 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         return true;
     }
 
+    bool can_pipe_process(int32_t /*n_tokens*/) const override {
+        return true;
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         assert(dparams.size() == n_seq);
 
@@ -4141,6 +4169,10 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 
     bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
+        return true;
+    }
+
+    bool can_pipe_process(int32_t /*n_tokens*/) const override {
         return true;
     }
 
@@ -4299,6 +4331,10 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
     bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
+        return true;
+    }
+
+    bool can_pipe_process(int32_t /*n_tokens*/) const override {
         return true;
     }
 
@@ -4811,6 +4847,10 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
     bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
+        return true;
+    }
+
+    bool can_pipe_process(int32_t /*n_tokens*/) const override {
         return true;
     }
 
@@ -6030,6 +6070,20 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     return result;
+}
+
+bool common_speculative_can_pipe_process(const common_speculative * spec, const common_batch & batch) {
+    if (spec == nullptr || spec->impls.empty() || batch.size() <= 0 || batch.has_embd()) {
+        return false;
+    }
+    bool has_dflash = false;
+    for (const auto & impl : spec->impls) {
+        if (!impl->can_pipe_process(batch.size())) {
+            return false;
+        }
+        has_dflash = has_dflash || impl->is_pipe_dflash();
+    }
+    return has_dflash;
 }
 
 bool common_speculative_supports_process_range(const common_speculative * spec) {

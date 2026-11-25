@@ -4,6 +4,10 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
@@ -1094,14 +1098,105 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
 
 // DSpine pre-write state of the last layer, read again by the lattice
 struct dspine_stash {
-    ggml_tensor * raw = nullptr; // [n_embd, n_tokens]
-    ggml_tensor * rms = nullptr; // [1, n_tokens]
-    ggml_tensor * q   = nullptr; // [rank, n_tokens] gate projection of each row's own code, no bias
+    ggml_tensor * raw = nullptr; // [n_embd, n_tokens] (or [n_embd, n_pos, n_blocks] when pos_only)
+    ggml_tensor * rms = nullptr; // [1, n_tokens] (or [1, n_pos, n_blocks] when pos_only)
+    ggml_tensor * q   = nullptr; // [rank, n_tokens] (or [rank, n_pos, n_blocks] when pos_only)
+    bool pos_only     = false;
 };
 
 // anchor (token 0) of every block
 static ggml_tensor * dspine_anchor_ids(llm_graph_context & g, ggml_tensor * tokens, int64_t block, int64_t n_blocks) {
     return ggml_cont_1d(g.ctx0, ggml_view_2d(g.ctx0, tokens, 1, n_blocks, block * tokens->nb[0], 0), n_blocks);
+}
+
+static bool llama_dspine_fast_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("LLAMA_DSPINE_FAST");
+        if (e == nullptr || *e == '\0') {
+            return false;
+        }
+        if (std::strcmp(e, "1") == 0) {
+            return true;
+        }
+        if (std::strcmp(e, "0") == 0) {
+            return false;
+        }
+        LLAMA_LOG_WARN("LLAMA_DSPINE_FAST: invalid value \"%s\" (expected 0 or 1); using 0\n", e);
+        return false;
+    }();
+    return enabled;
+}
+
+// slice rows [beg, beg + len) of every block from a contiguous [ne0, block, n_blocks] tensor
+static ggml_tensor * dspine_slice_block_rows(ggml_context * ctx0, ggml_tensor * t3, int64_t beg, int64_t len, int64_t n_blocks) {
+    if (n_blocks == 1) {
+        ggml_tensor * t2 = ggml_reshape_2d(ctx0, t3, t3->ne[0], t3->ne[1]);
+        ggml_tensor * v2 = ggml_view_2d(ctx0, t2, t3->ne[0], len, t2->nb[1], beg * t2->nb[1]);
+        return ggml_reshape_3d(ctx0, v2, t3->ne[0], len, 1);
+    }
+    return ggml_cont(ctx0, ggml_view_3d(ctx0, t3, t3->ne[0], len, n_blocks, t3->nb[1], t3->nb[2], beg * t3->nb[1]));
+}
+
+// Lossless DSpine bridge write fast path (LLAMA_DSPINE_FAST=1): skips dead row 0 on read/gate,
+// dead last row on pred_gate/prev, reuses hoisted anchor_codes, and keeps the epilogue contiguous.
+static ggml_tensor * build_dspine_write_fast(llm_graph_context & g, const llama_model & model,
+        ggml_tensor * cur, ggml_tensor * anchor_codes, int il, dspine_stash * stash) {
+    ggml_context * ctx0 = g.ctx0;
+    const auto & layer  = model.layers[il];
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t n_blocks = g.ubatch.n_seqs_unq;
+    const int64_t code     = model.dspine_codebook->ne[0];
+    const int64_t rank     = model.dspine_gate->ne[1];
+    const float   eps      = g.hparams.f_norm_rms_eps;
+
+    GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
+    const int64_t block = n_tokens / n_blocks;
+    if (block < 2) {
+        return cur;
+    }
+    GGML_ASSERT(anchor_codes != nullptr);
+    const int64_t n_pos = block - 1;
+
+    ggml_tensor * cur3     = ggml_reshape_3d(ctx0, cur, n_embd, block, n_blocks);
+    ggml_tensor * cur_pos3 = dspine_slice_block_rows(ctx0, cur3, 1, n_pos, n_blocks);
+    ggml_tensor * cur_pos  = ggml_reshape_2d(ctx0, cur_pos3, n_embd, n_pos * n_blocks);
+
+    ggml_tensor * codes_pos = g.build_lora_mm(layer.dspine_read, ggml_rms_norm(ctx0, cur_pos, eps));
+    codes_pos = ggml_scale(ctx0, ggml_l2_norm(ctx0, codes_pos, eps), sqrtf((float) code));
+    g.cb(codes_pos, "dspine_codes", il);
+
+    ggml_tensor * q_pos = g.build_lora_mm(model.dspine_gate, codes_pos);
+
+    ggml_tensor * pred_codes = anchor_codes;
+    if (n_pos > 1) {
+        ggml_tensor * codes_pos3 = ggml_reshape_3d(ctx0, codes_pos, code, n_pos, n_blocks);
+        ggml_tensor * prev_codes = dspine_slice_block_rows(ctx0, codes_pos3, 0, n_pos - 1, n_blocks);
+        pred_codes = ggml_concat(ctx0, anchor_codes, prev_codes, 1);
+    }
+    pred_codes = ggml_reshape_2d(ctx0, pred_codes, code, n_pos * n_blocks);
+
+    ggml_tensor * s_pos = g.build_lora_mm(model.dspine_pred_gate, pred_codes);
+    ggml_tensor * v_pos = g.build_lora_mm(model.dspine_prev,      pred_codes);
+
+    ggml_tensor * gate  = ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_add(ctx0, q_pos, s_pos), model.dspine_gate_b));
+    ggml_tensor * msg   = ggml_mul(ctx0, gate, v_pos);
+    ggml_tensor * delta = g.build_lora_mm(layer.dspine_write, msg);
+
+    ggml_tensor * rms_pos = ggml_sqrt(ctx0, ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur_pos)), 1.0f / n_embd));
+    delta = ggml_mul(ctx0, delta, rms_pos);
+    delta = ggml_pad_ext(ctx0, ggml_reshape_3d(ctx0, delta, n_embd, n_pos, n_blocks), 0, 0, 1, 0, 0, 0, 0, 0);
+    delta = ggml_reshape_2d(ctx0, delta, n_embd, n_tokens);
+
+    if (stash) {
+        stash->raw      = cur_pos3;
+        stash->rms      = ggml_reshape_3d(ctx0, rms_pos, 1, n_pos, n_blocks);
+        stash->q        = ggml_reshape_3d(ctx0, q_pos,   rank, n_pos, n_blocks);
+        stash->pos_only = true;
+    }
+
+    return ggml_add(ctx0, cur, delta);
 }
 
 // DSpine code bridge write after layer il: every row reads a unit code from its hidden state (the anchor row
@@ -1231,6 +1326,131 @@ static void build_dspine_lattice(llm_graph_context & g, const llama_model & mode
     ggml_tensor * head = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand_run, top_k * n_pos * n_blocks));
     head = ggml_reshape_4d(ctx0, head, n_embd, top_k, n_pos, n_blocks);
     ggml_tensor * table = ggml_mul_mat(ctx0, head, refined);
+
+    ggml_tensor * row = ggml_concat(ctx0,
+            ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
+            ggml_reshape_3d(ctx0, table, top_k * top_k, n_pos, n_blocks), 0);
+    row = ggml_pad(ctx0, row, n_embd - top_k - top_k * top_k, 0, 0, 0);
+
+    ggml_tensor * packed = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_blocks), 0.0f);
+    packed = ggml_reshape_2d(ctx0, ggml_concat(ctx0, packed, row, 1), n_embd, n_tokens);
+    g.cb(packed, "dspine_lattice", -1);
+
+    res->t_h_nextn = packed;
+    ggml_build_forward_expand(g.gf, packed);
+}
+
+// Lossless DSpine lattice fast path (LLAMA_DSPINE_FAST=1): deduplicates the repeated anchor predecessor
+// at pos 0 (1 + top_k*(n_pos-1) rows instead of top_k*n_pos) and orders refine/scoring subgraphs contiguously.
+static void build_dspine_lattice_fast(llm_graph_context & g, const llama_model & model,
+        ggml_tensor * anchor_codes, ggml_tensor * output, const dspine_stash & stash,
+        ggml_tensor * vocab_ids, bool logits_pos_only) {
+    ggml_context * ctx0 = g.ctx0;
+    auto         & res  = g.res;
+
+    const int64_t n_embd   = g.n_embd;
+    const int64_t n_tokens = g.n_tokens;
+    const int64_t n_blocks = g.ubatch.n_seqs_unq;
+    const int64_t top_k    = g.hparams.dflash_selector_top_k;
+    const int64_t code     = model.dspine_codebook->ne[0];
+    const int64_t rank     = model.dspine_gate->ne[1];
+
+    GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
+    const int64_t block = n_tokens / n_blocks;
+    const int64_t n_pos = block - 1;
+    if (block < 2 || block > (int64_t) g.hparams.dflash_block_size || stash.raw == nullptr || anchor_codes == nullptr) {
+        return;
+    }
+    GGML_ASSERT(stash.pos_only);
+
+    const int64_t n_logit_rows = logits_pos_only ? (n_pos * n_blocks) : n_tokens;
+    ggml_tensor * cand = ggml_top_k(ctx0, res->t_logits, top_k);
+    if (vocab_ids) {
+        GGML_ASSERT(res->t_logits->ne[0] == vocab_ids->ne[0]);
+        ggml_tensor * id_rows = ggml_reshape_2d(ctx0, vocab_ids, 1, vocab_ids->ne[0]);
+        cand = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, id_rows, ggml_reshape_1d(ctx0, cand, top_k * n_logit_rows)), top_k, n_logit_rows);
+    }
+    ggml_tensor * cand_run = nullptr;
+    if (logits_pos_only) {
+        cand_run = ggml_reshape_3d(ctx0, cand, top_k, n_pos, n_blocks);
+    } else {
+        cand = ggml_reshape_3d(ctx0, cand, top_k, block, n_blocks);
+        cand_run = dspine_slice_block_rows(ctx0, cand, 1, n_pos, n_blocks);
+    }
+
+    const int64_t n_u = 1 + top_k * (n_pos - 1);
+    ggml_tensor * pred = anchor_codes;
+    if (n_pos > 1) {
+        ggml_tensor * prev_ids = dspine_slice_block_rows(ctx0, cand_run, 0, n_pos - 1, n_blocks);
+        ggml_tensor * prev = ggml_get_rows(ctx0, model.dspine_codebook, ggml_reshape_1d(ctx0, prev_ids, top_k * (n_pos - 1) * n_blocks));
+        prev = ggml_scale(ctx0, ggml_reshape_3d(ctx0, prev, code, top_k * (n_pos - 1), n_blocks), sqrtf((float) code));
+        pred = ggml_concat(ctx0, anchor_codes, prev, 1);
+    }
+    pred = ggml_reshape_2d(ctx0, pred, code, n_u * n_blocks);
+
+    ggml_tensor * gp = ggml_reshape_3d(ctx0, g.build_lora_mm(model.dspine_pred_gate, pred), rank, n_u, n_blocks);
+    ggml_tensor * pv = ggml_reshape_3d(ctx0, g.build_lora_mm(model.dspine_prev,      pred), rank, n_u, n_blocks);
+
+    ggml_tensor * q0   = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, stash.q, 0, 1, n_blocks), rank, 1, 1, n_blocks);
+    ggml_tensor * gp0  = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, gp,      0, 1, n_blocks), rank, 1, 1, n_blocks);
+    ggml_tensor * pv0  = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, pv,      0, 1, n_blocks), rank, 1, 1, n_blocks);
+    ggml_tensor * msg0 = ggml_mul(ctx0, ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_add(ctx0, gp0, q0), model.dspine_gate_b)), pv0);
+    ggml_tensor * msg  = ggml_reshape_3d(ctx0, msg0, rank, 1, n_blocks);
+    if (n_pos > 1) {
+        const int64_t n_rest = top_k * (n_pos - 1);
+        ggml_tensor * qr   = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, stash.q, 1, n_pos - 1, n_blocks), rank, 1,     n_pos - 1, n_blocks);
+        ggml_tensor * gpr  = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, gp,      1, n_rest,    n_blocks), rank, top_k, n_pos - 1, n_blocks);
+        ggml_tensor * pvr  = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, pv,      1, n_rest,    n_blocks), rank, top_k, n_pos - 1, n_blocks);
+        ggml_tensor * msgr = ggml_mul(ctx0, ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_add(ctx0, gpr, qr), model.dspine_gate_b)), pvr);
+        msg = ggml_concat(ctx0, msg, ggml_reshape_3d(ctx0, msgr, rank, n_rest, n_blocks), 1);
+    }
+
+    const auto & last = model.layers[g.n_layer - 1];
+    ggml_tensor * delta  = g.build_lora_mm(last.dspine_write, ggml_reshape_2d(ctx0, msg, rank, n_u * n_blocks));
+    ggml_tensor * delta3 = ggml_reshape_3d(ctx0, delta, n_embd, n_u, n_blocks);
+
+    ggml_tensor * d0   = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, delta3,    0, 1, n_blocks), n_embd, 1, 1, n_blocks);
+    ggml_tensor * rms0 = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, stash.rms, 0, 1, n_blocks), 1,      1, 1, n_blocks);
+    ggml_tensor * raw0 = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, stash.raw, 0, 1, n_blocks), n_embd, 1, 1, n_blocks);
+    ggml_build_forward_expand(g.gf, d0);
+    ggml_build_forward_expand(g.gf, rms0);
+    ggml_build_forward_expand(g.gf, raw0);
+    ggml_tensor * ref0 = g.build_norm(ggml_add(ctx0, ggml_mul(ctx0, d0, rms0), raw0), model.output_norm, NULL, LLM_NORM_RMS, -1);
+    ggml_build_forward_expand(g.gf, ref0);
+
+    ggml_tensor * refr = nullptr;
+    if (n_pos > 1) {
+        const int64_t n_rest = top_k * (n_pos - 1);
+        ggml_tensor * dr   = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, delta3,    1, n_rest,    n_blocks), n_embd, top_k, n_pos - 1, n_blocks);
+        ggml_tensor * rmsr = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, stash.rms, 1, n_pos - 1, n_blocks), 1,      1,     n_pos - 1, n_blocks);
+        ggml_tensor * rawr = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, stash.raw, 1, n_pos - 1, n_blocks), n_embd, 1,     n_pos - 1, n_blocks);
+        ggml_build_forward_expand(g.gf, dr);
+        ggml_build_forward_expand(g.gf, rmsr);
+        ggml_build_forward_expand(g.gf, rawr);
+        refr = g.build_norm(ggml_add(ctx0, ggml_mul(ctx0, dr, rmsr), rawr), model.output_norm, NULL, LLM_NORM_RMS, -1);
+        g.cb(refr, "dspine_refined", -1);
+        ggml_build_forward_expand(g.gf, refr);
+    } else {
+        g.cb(ref0, "dspine_refined", -1);
+    }
+
+    ggml_build_forward_expand(g.gf, cand_run);
+
+    ggml_tensor * head = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand_run, top_k * n_pos * n_blocks));
+    head = ggml_reshape_4d(ctx0, head, n_embd, top_k, n_pos, n_blocks);
+
+    ggml_tensor * table = nullptr;
+    if (n_pos == 1) {
+        ggml_tensor * t0 = ggml_mul_mat(ctx0, head, ref0);
+        table = ggml_repeat_4d(ctx0, t0, top_k, top_k, 1, n_blocks);
+    } else {
+        ggml_tensor * head3 = ggml_reshape_3d(ctx0, head, n_embd * top_k, n_pos, n_blocks);
+        ggml_tensor * head0 = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, head3, 0, 1,         n_blocks), n_embd, top_k, 1,         n_blocks);
+        ggml_tensor * headr = ggml_reshape_4d(ctx0, dspine_slice_block_rows(ctx0, head3, 1, n_pos - 1, n_blocks), n_embd, top_k, n_pos - 1, n_blocks);
+        ggml_tensor * t0 = ggml_repeat_4d(ctx0, ggml_mul_mat(ctx0, head0, ref0), top_k, top_k, 1, n_blocks);
+        ggml_tensor * tr = ggml_mul_mat(ctx0, headr, refr);
+        table = ggml_concat(ctx0, t0, tr, 2);
+    }
 
     ggml_tensor * row = ggml_concat(ctx0,
             ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
@@ -1404,6 +1624,18 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
     cb(inpL, "inp_noise_embd", -1);
 
     dspine_stash dspine;
+    const bool dspine_fast = model.dspine_codebook != nullptr && llama_dspine_fast_enabled();
+    ggml_tensor * dspine_anchor_codes = nullptr;
+    if (dspine_fast) {
+        const int64_t n_blocks = ubatch.n_seqs_unq;
+        GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
+        const int64_t block = n_tokens / n_blocks;
+        if (block >= 2) {
+            const int64_t code = model.dspine_codebook->ne[0];
+            ggml_tensor * anchor = ggml_get_rows(ctx0, model.dspine_codebook, dspine_anchor_ids(*this, inp_tokens, block, n_blocks));
+            dspine_anchor_codes = ggml_scale(ctx0, ggml_reshape_3d(ctx0, anchor, code, 1, n_blocks), sqrtf((float) code));
+        }
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -1523,14 +1755,44 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
         }
 
         if (layer.dspine_write) {
-            cur = build_dspine_write(*this, model, cur, inp_tokens, il, il == n_layer - 1 ? &dspine : nullptr);
+            if (dspine_fast) {
+                cur = build_dspine_write_fast(*this, model, cur, dspine_anchor_codes, il, il == n_layer - 1 ? &dspine : nullptr);
+            } else {
+                cur = build_dspine_write(*this, model, cur, inp_tokens, il, il == n_layer - 1 ? &dspine : nullptr);
+            }
         }
         cb(cur, "l_out", il);
 
         inpL = cur;
     }
 
-    ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    const bool dspine_lattice_only = dspine_fast &&
+            !cparams.embeddings && !model.d2t && n_outputs == 0 &&
+            !model.dflash_selector_hidden && !model.dspark_markov_w1 && !model.lilicorr_pass_hidden_proj &&
+            dspine.raw != nullptr && ubatch.n_seqs_unq > 0 && n_tokens % ubatch.n_seqs_unq == 0 &&
+            (n_tokens / ubatch.n_seqs_unq) <= (int64_t) hparams.dflash_block_size;
+
+    if (dspine_fast && dspine.raw != nullptr) {
+        static std::atomic<int> logged_mode{0};
+        const int mode_bit = dspine_lattice_only ? 2 : 1;
+        if ((logged_mode.fetch_or(mode_bit, std::memory_order_relaxed) & mode_bit) == 0) {
+            const int64_t n_blocks = ubatch.n_seqs_unq;
+            const int64_t block    = n_blocks > 0 ? (n_tokens / n_blocks) : 0;
+            LLAMA_LOG_INFO("DSPINE FAST: active (block=%lld, n_blocks=%lld, lattice_only=%d)\n",
+                    (long long) block, (long long) n_blocks, (int) dspine_lattice_only);
+        }
+    }
+
+    ggml_tensor * norm_in = inpL;
+    if (dspine_lattice_only) {
+        const int64_t n_blocks = ubatch.n_seqs_unq;
+        const int64_t block    = n_tokens / n_blocks;
+        const int64_t n_pos    = block - 1;
+        ggml_tensor * inpL3 = ggml_reshape_3d(ctx0, inpL, n_embd, block, n_blocks);
+        norm_in = ggml_reshape_2d(ctx0, dspine_slice_block_rows(ctx0, inpL3, 1, n_pos, n_blocks), n_embd, n_pos * n_blocks);
+    }
+
+    ggml_tensor * cur = build_norm(norm_in, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
     res->t_embd = cur;
@@ -1599,7 +1861,12 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
     } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
         build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
     } else if (model.dspine_codebook) {
-        build_dspine_lattice(*this, model, inp_tokens, output, dspine, dspine_short ? draft_vocab_ids : nullptr);
+        if (dspine_fast) {
+            build_dspine_lattice_fast(*this, model, dspine_anchor_codes, output, dspine,
+                    dspine_short ? draft_vocab_ids : nullptr, dspine_lattice_only);
+        } else {
+            build_dspine_lattice(*this, model, inp_tokens, output, dspine, dspine_short ? draft_vocab_ids : nullptr);
+        }
     }
 }
 

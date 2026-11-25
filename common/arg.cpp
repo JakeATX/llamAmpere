@@ -595,6 +595,8 @@ static void common_dflash_w78_default(const common_params & params) {
         common_set_env("GGML_SJKVARN_COMPACT_W78", "1");
         LOG_INF("draft-dflash: GGML_SJKVARN_COMPACT_W78=1 (verify widths 7/8 on the compact tile)\n");
     }
+    // DSpine W8 (fattn-sjkvarn-w8.cu, the spill-free 6-warp compact kernel for verify widths 7/8) stays opt-in in the
+    // candidate: GGML_SJKVARN_W8=2 turns it on. It is not set by draft-dflash until a never-slower gate passes.
 }
 
 

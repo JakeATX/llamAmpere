@@ -2158,6 +2158,10 @@ void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) cons
 void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
     common_context_seq_cp(ctx_tgt, seq_id_src, seq_id_dst, p0, p1);
     if (ctx_dft) {
+        // Cross-stream seq_cp copies GPU KV buffers directly; finish any pending async draft inject first.
+        if (llama_dspine_pipe_mode() == 1) {
+            llama_synchronize(ctx_dft);
+        }
         common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
     }
 }
@@ -2165,6 +2169,9 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
 void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
     common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
     if (ctx_dft) {
+        if (llama_dspine_pipe_mode() == 1) {
+            llama_synchronize(ctx_dft);
+        }
         common_context_seq_add(ctx_dft, seq_id, p0, p1, delta);
     }
 }
