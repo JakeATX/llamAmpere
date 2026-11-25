@@ -82,6 +82,18 @@ static std::atomic<uint64_t> g_pp_cache_copies{0};
 
 static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory);
 
+// fork UBDEFAULT: LLAMA_UB_KV_BOUND=1 sizes prompt reserves above the fit rows over the used cells of the main cache
+// plus the prompt guard instead of the whole cache (and memory_update re-reserves at the current ladder rows and
+// bound). Default OFF (not speed-gated on Inkling): unset/0 = every prompt reserve over the whole cache, as before.
+// With =1 the arch-defaults table's needs-ctx ub ceiling (inkling2 1024) also applies without -c (common.cpp).
+static bool llama_ub_bound_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_UB_KV_BOUND");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 // fork UBDEFAULT: rows of the boot reserve (and so of the memory fit) while the dynamic ub ladder is on.
 static uint32_t llama_ub_fit_rows_cfg() {
     static const uint32_t rows = [] {
@@ -2910,6 +2922,14 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+        // fork UBDEFAULT: a large prompt rung is sized over the used cells (ub_bound_next), else the whole cache.
+        llama_kv_reserve_bound bound(ub_bound_next ? ub_bound_next_cache : nullptr, ub_bound_next);
+        ub_bound_cache = ub_bound_next ? ub_bound_next_cache : nullptr;
+        ub_bound_cells = ub_bound_cache ? ub_bound_next : 0;
+        if (ub_bound_cells) {
+            LLAMA_LOG_INFO("%s: prompt reserve sized over %u of %u cells (used cells + prompt guard)\n", __func__,
+                    ub_bound_cells, ub_bound_cache->get_size());
+        }
         mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory module");
@@ -3641,13 +3661,18 @@ bool llama_context::memory_update(bool optimize) {
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
     {
+        // fork UBDEFAULT: with the ladder the scheduler holds a reserve of sched_reserve_tokens rows (maybe sized over
+        // used cells, maybe in the KV-tail loan); re-reserve that, not the ceiling over the whole cache.
+        // Only with LLAMA_UB_KV_BOUND=1; otherwise the reserve is the ub over the whole cache, as before.
+        const bool ladder_rows = llama_ub_bound_enabled() && dynamic_ubatch && sched_reserve_tokens > 0;
+        llama_kv_reserve_bound bound(ladder_rows && ub_bound_cells ? ub_bound_cache : nullptr, ub_bound_cells);
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
         const uint32_t n_seqs   = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = std::min(cparams.n_ctx, ladder_rows ? sched_reserve_tokens : cparams.n_ubatch);
 
         const bool reserve_kv_only = (mtp_reserve_tight || mtp_prefill_async) && !cparams.embeddings &&
                 (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
@@ -6344,6 +6369,16 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     if ((!dynamic_ubatch && (!rotate || rotate[0] != '1' || cparams.n_ubatch <= 512)) ||
             !cparams.causal_attn || cparams.training || cparams.embeddings ||
             kv_stream_phase_arena.configured || cparams.n_ubatch < 256) {
+        // fork UBDEFAULT: no per-call bound check on this path, so a reserve sized over used cells (or lent) is
+        // replaced now by the boot-size reserve over the whole cache, which always fits in owned memory.
+        // (the loan part only with LLAMA_UB_KV_BOUND=1, so the default path is unchanged)
+        if (ub_bound_cells || (llama_ub_bound_enabled() && ub_loan_active)) {
+            if (ub_loan_active) { ub_loan_end(); }
+            sched_reserve_tokens = std::min(cparams.n_ubatch, std::max(llama_ub_fit_rows_cfg(), cparams.n_seq_max));
+            sched_need_reserve = true;
+        }
+        ub_bound_next_cache = nullptr;
+        ub_bound_next = 0;
         return true;
     }
     bool alone = batch != nullptr;
@@ -6840,6 +6875,32 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         if (prompt) { rows = std::min(rows, dynamic_ubatch_rows); }
     }
     const bool trim_packed = n_tokens == 0 && (b1_ffn_scratch_active || b1_layer_scratch_active);
+    // fork UBDEFAULT: a reserve sized over the used cells covers this call only while the cells it can address stay
+    // inside the bound; otherwise re-reserve (the bound is recomputed below) before any graph of this call is built.
+    if (ub_bound_cells && ub_bound_cache->reserve_cells(n_tokens) > ub_bound_cells) {
+        sched_need_reserve = true;
+    }
+    // fork UBDEFAULT: without an expert cache nothing else on the card wants the compute memory back, so an owned
+    // prompt reserve stays through decode and short follow-ups instead of shrinking to the writing scratch and growing
+    // again on the next prompt (two re-reserves per request: P76 24dense 16-token reply after 3K 123.7 -> 93.7 tok/s).
+    // A KV-tail loan is still returned when the prompt ends; a pending reserve keeps the smaller rows.
+    // Default OFF (not speed-gated on Inkling): LLAMA_UB_KEEP=1 turns it on; unset/0 keeps the shrink.
+    static const bool ub_keep = [] {
+        const char * e = getenv("LLAMA_UB_KEEP");
+        return e && e[0] == '1';
+    }();
+    if (ub_keep && ubdefault && dynamic_ubatch && sched_cache_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            !b1_ffn_scratch_active && !b1_layer_scratch_active && !ub_loan_active && !sched_need_reserve &&
+            rows < sched_reserve_tokens && (alone || n_tokens <= std::max(decode_rows, cparams.n_seq_max))) {
+        // shared-slot prompt batches keep their own split (512 rows), so it does not depend on the previous request
+        static bool keep_logged = false;
+        if (!keep_logged) {
+            keep_logged = true;
+            LLAMA_LOG_INFO("%s: dynamic ub keeps the owned %u-row prompt reserve through decode (no expert cache; "
+                    "LLAMA_UB_KEEP=1 on)\n", __func__, sched_reserve_tokens);
+        }
+        rows = sched_reserve_tokens;
+    }
     // fork UBDEFAULT: a KV-tail loan lives only while the same prompt rows keep running and the cells this call
     // writes (plus the loan's guard) stay clear of the lent tail; anything else gives it back first.
     if (ub_loan_active && (rows != sched_reserve_tokens || trim_packed || sched_need_reserve ||
@@ -6891,13 +6952,38 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     const uint32_t want = rows;
     // A rung that did not fit (or failed in the loan) is not measured again for 60 s: free memory only moves when
     // other processes allocate, and a failed attempt costs a full reserve on every ubatch.
-    const bool memo_hit = exact_fit && want == ub_memo_want && ggml_time_us() - ub_memo_us < 60ll * 1000 * 1000;
+    // A rung above the fit rows is sized over the used cells plus this call and the loan guard's later calls of the
+    // same prompt (8 batches), so one reserve covers several calls; the whole cache only when that bound reaches it.
+    // Not with a helper sharing the compute or another KV scratch user (the same conditions as the loan).
+    ub_bound_next_cache = nullptr;
+    ub_bound_next = 0;
+    if (exact_fit && rows > fit_floor && llama_ub_bound_enabled() && compute_peer == nullptr &&
+            mtp_scratch_clients.empty() && !mtp_scratch_active && b1_kv_backend == nullptr && !b1) {
+        if (auto * kv = llama_sj_kvarn_cache(memory.get())) {
+            const uint64_t guard = (uint64_t) n_tokens + 8ull * std::max(cparams.n_ubatch, cparams.n_batch);
+            const uint32_t cells = kv->reserve_cells((uint32_t) std::min<uint64_t>(guard, UINT32_MAX - 1024));
+            if (cells < kv->get_size()) {
+                ub_bound_next_cache = kv;
+                ub_bound_next = cells;
+            }
+        }
+    }
+    // A memo taken over a smaller used-cells bound does not cover a larger one (the masks grow with it).
+    const bool memo_hit = exact_fit && want == ub_memo_want && ggml_time_us() - ub_memo_us < 60ll * 1000 * 1000 &&
+            (ub_memo_bound == 0 || (ub_bound_next != 0 && ub_bound_next <= ub_memo_bound));
     if (memo_hit) {
         rows = ub_memo_rows;
     } else if (exact_fit && rows > fit_floor) {
         rows = ub_fit_rows(rows, fit_floor, n_tokens);
     }
+    if (rows <= fit_floor) {
+        ub_bound_next_cache = nullptr; // the fit rows keep the whole-cache reserve, as at boot
+        ub_bound_next = 0;
+    }
     if (ubdefault && rows == sched_reserve_tokens && !trim_packed && !sched_need_reserve) {
+        // the current reserve stays: keep its bound
+        ub_bound_next_cache = ub_bound_cache;
+        ub_bound_next = ub_bound_cells;
         return true;
     }
     for (;;) {
@@ -6921,6 +7007,10 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             if (exact_fit && rows > fit_floor) {
                 rows = ub_fit_rows(rows, fit_floor, n_tokens);
             }
+            if (rows <= fit_floor) {
+                ub_bound_next_cache = nullptr;
+                ub_bound_next = 0;
+            }
         }
     }
     // Only owned-memory rungs are remembered: a lent rung is re-lent (or stepped down) on the next call.
@@ -6928,6 +7018,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         if (rows < want) {
             ub_memo_want = want;
             ub_memo_rows = rows;
+            ub_memo_bound = ub_bound_next;
             ub_memo_us = ggml_time_us();
         } else if (want == ub_memo_want) {
             ub_memo_want = 0;
@@ -7085,6 +7176,7 @@ uint32_t llama_context::ub_fit_rows(uint32_t rows, uint32_t floor, uint32_t n_to
     if (!memory || model.no_alloc()) {
         return rows;
     }
+    llama_kv_reserve_bound bound(ub_bound_next ? ub_bound_next_cache : nullptr, ub_bound_next);
     auto mctx = memory->init_full();
     if (!mctx) {
         return rows;

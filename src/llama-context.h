@@ -744,7 +744,12 @@ private:
     ggml_backend_t ub_loan_backend = nullptr;
     bool ub_loan_active = false;
     bool ub_path_logged = false;
-    uint32_t ub_memo_want = 0, ub_memo_rows = 0; // last exact fit that stepped down (want -> rows)
+    // fork UBDEFAULT: a prompt reserve above the fit rows is sized over the used cells of the main cache plus the
+    // cells the prompt can still add (ub_bound_next, for the next reserve), not over the whole context; ub_bound_cells
+    // is what the current reserve covers (0 = whole cache). A call that could address more cells re-reserves first.
+    llama_kv_cache * ub_bound_cache = nullptr, * ub_bound_next_cache = nullptr;
+    uint32_t ub_bound_cells = 0, ub_bound_next = 0;
+    uint32_t ub_memo_want = 0, ub_memo_rows = 0, ub_memo_bound = 0; // last exact fit that stepped down (want -> rows)
     int64_t ub_memo_us = 0;
     bool ub_loan_begin(uint32_t rows, uint32_t n_tokens, size_t gpu, size_t bytes, ggml_cgraph * gf);
     void ub_loan_end();
