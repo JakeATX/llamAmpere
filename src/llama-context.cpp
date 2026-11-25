@@ -9545,6 +9545,11 @@ bool llama_context::sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_ten
     // its row counts, in stream order (no host wait, no mask copy). Otherwise its host buffer is filled now and the normal copy follows.
     const bool nk_dev_mask = llama_nk_dev_mask_enabled();
     if ((llama_kq_mask_device_enabled() || nk_dev_mask) && src->type == GGML_TYPE_F16) {
+        if (src->view_src != nullptr) {
+            // a view of a deferred mask (row chunks, per-stream nodes): the record is keyed on the whole tensor, so
+            // fill its host bytes before any part of it is copied (no-op without a pending record)
+            llama_kq_mask_deferred_fill_host(src->view_src);
+        }
         thread_local std::vector<int32_t> n_visible;
         int64_t n_kv = 0;
         const char * tag = nullptr;
