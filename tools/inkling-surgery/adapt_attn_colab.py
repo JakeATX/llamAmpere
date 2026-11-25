@@ -775,11 +775,14 @@ class Inkling2MiniSurgeryModel(nn.Module):
 
         cur = depth_mix(blocks, cur, self.out_res_q)[:, 0]
         cur = rms_norm(cur, self.out_norm_w)
-        # Compute logits in FP32 for exact softcapping & KL stability
-        logits = F.linear(cur.float(), self.unembed_w.float())
+        return cur, taps
+
+    def lm_head_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project [N, H] -> softcapped FP32 logits [N, unpadded_vocab]."""
+        logits = F.linear(hidden.float(), self.unembed_w.float())
         if self.softcap != 0.0:
             logits = self.softcap * torch.tanh(logits / self.softcap)
-        return logits, taps
+        return logits
 
 
 def pattern_stock_modes(n_phys: int = 24) -> List[int]:
@@ -823,8 +826,8 @@ def run_verify_logits(model: Inkling2MiniSurgeryModel, token_ids: List[int], out
     ids = torch.tensor(token_ids, dtype=torch.long, device=device)
     modes = pattern_stock_modes(model.n_phys)
     diag = {"_diag_rel1023": 0.0}
-    logits, taps = model.forward_sequence(ids, modes, use_checkpoint=False, q_blk=256, stats_out=diag)
-    last = logits[-1].float()
+    hidden, taps = model.forward_sequence(ids, modes, use_checkpoint=False, q_blk=256, stats_out=diag)
+    last = model.lm_head_logits(hidden[-1:])[0]
     probs = F.softmax(last, dim=-1)
     topv, topi = torch.topk(last, k=10)
     topp = probs[topi]
@@ -962,53 +965,69 @@ def train_surgery(args: argparse.Namespace) -> None:
         student_backup, saved_rel = swap_to_teacher()
         try:
             with torch.no_grad():
-                t_logits, t_taps = model.forward_sequence(kl_seq, stock_modes, use_checkpoint=False, q_blk=args.q_blk)
-                t_log_probs = F.log_softmax(t_logits, dim=-1)
-                t_probs = t_log_probs.exp()
+                t_hidden, t_taps = model.forward_sequence(kl_seq, stock_modes, use_checkpoint=False, q_blk=args.q_blk)
+                t_hidden = t_hidden.detach()
                 t_taps_det = {k: v.detach().float() for k, v in t_taps.items()}
-                del t_logits
+                del t_taps
         finally:
             restore_student(student_backup, saved_rel)
             del student_backup, saved_rel
 
-        s_logits, s_taps = model.forward_sequence(
+        s_hidden, s_taps = model.forward_sequence(
             kl_seq, pat_a_modes, use_checkpoint=True, q_blk=args.q_blk, stats_out=None
         )
-        s_log_probs = F.log_softmax(s_logits, dim=-1)
-        # Forward KL(teacher || student) over positions >= 128
-        kl_pos = slice(128, None) if kl_seq.shape[0] > 256 else slice(None)
-        loss_kl = F.kl_div(s_log_probs[kl_pos], t_probs[kl_pos], reduction="batchmean", log_target=False)
+        # Chunked LM-head KL(teacher || student) over positions >= 128 (avoids 3+ GiB full-vocab logits)
+        kl_start = 128 if kl_seq.shape[0] > 256 else 0
+        n_kl_toks = kl_seq.shape[0] - kl_start
+        kl_chunk = 256
+        grad_s_hidden = torch.zeros_like(s_hidden, dtype=torch.float32)
+        kl_val_sum = 0.0
+        for c0 in range(kl_start, kl_seq.shape[0], kl_chunk):
+            c1 = min(c0 + kl_chunk, kl_seq.shape[0])
+            with torch.no_grad():
+                t_probs_c = F.softmax(model.lm_head_logits(t_hidden[c0:c1]), dim=-1)
+            s_hc = s_hidden[c0:c1].detach().float().requires_grad_(True)
+            s_logp_c = F.log_softmax(model.lm_head_logits(s_hc), dim=-1)
+            chunk_kl = F.kl_div(s_logp_c, t_probs_c, reduction="sum", log_target=False) / float(n_kl_toks)
+            kl_val_sum += float(chunk_kl.item())
+            (g_hc,) = torch.autograd.grad(args.lambda_kl * chunk_kl, s_hc)
+            grad_s_hidden[c0:c1] = g_hc
+            del t_probs_c, s_hc, s_logp_c, chunk_kl, g_hc
+
+        kl_pos = slice(kl_start, None)
         loss_hid = torch.zeros((), device=device, dtype=torch.float32)
         for tid in (5, 23, 41):
-            # Relative MSE normalized by teacher variance so scale is O(1)
             diff = s_taps[tid][kl_pos].float() - t_taps_det[tid][kl_pos]
             denom = t_taps_det[tid][kl_pos].pow(2).mean().clamp_min(1e-4)
             loss_hid = loss_hid + (diff.pow(2).mean() / denom) / 3.0
 
-        loss_1 = args.lambda_kl * loss_kl + args.lambda_hid * loss_hid
-        loss_1.backward()
-        kl_val = float(loss_kl.item())
+        # Combined backward through student graph once (exact sum of KL + tap MSE gradients)
+        surrogate_1 = (s_hidden.float() * grad_s_hidden).sum() + args.lambda_hid * loss_hid
+        surrogate_1.backward()
+        kl_val = kl_val_sum
         hid_val = float(loss_hid.item())
-        del s_logits, s_log_probs, s_taps, t_log_probs, t_probs, t_taps_det, loss_kl, loss_hid, loss_1
+        del s_hidden, grad_s_hidden, s_taps, t_hidden, t_taps_det, loss_hid, surrogate_1
 
         # --- Sub-batch 2: Long-context multi-needle / cross-file retrieval CE (8K..12K) ---
         ce_item = ce_items[(step - 1) % len(ce_items)]
         ce_ids = ce_item["ids"][: args.ce_len].to(device=device, dtype=torch.long)
         ce_mask = ce_item["loss_mask"][: args.ce_len].to(device=device, dtype=torch.bool)
-        s_ce_logits, _ = model.forward_sequence(
+        s_ce_hidden, _ = model.forward_sequence(
             ce_ids, pat_a_modes, use_checkpoint=True, q_blk=args.q_blk, tap_visits=(), stats_out=step_stats
         )
-        shift_logits = s_ce_logits[:-1]
-        shift_labels = ce_ids[1:]
         shift_mask = ce_mask[1:]
         if int(shift_mask.sum().item()) > 0:
-            loss_ce = F.cross_entropy(shift_logits[shift_mask], shift_labels[shift_mask])
+            sel_h = s_ce_hidden[:-1][shift_mask]
+            sel_y = ce_ids[1:][shift_mask]
         else:
-            loss_ce = F.cross_entropy(shift_logits[-256:], shift_labels[-256:])
+            sel_h = s_ce_hidden[-257:-1]
+            sel_y = ce_ids[-256:]
+        sel_logits = model.lm_head_logits(sel_h)
+        loss_ce = F.cross_entropy(sel_logits, sel_y)
         loss_2 = args.lambda_ce * loss_ce
         loss_2.backward()
         ce_val = float(loss_ce.item())
-        del s_ce_logits, shift_logits, loss_ce, loss_2
+        del s_ce_hidden, sel_h, sel_logits, loss_ce, loss_2
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_(weight_params + bias_params, args.grad_clip).item())
         optimizer.step()
