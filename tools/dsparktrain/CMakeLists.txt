@@ -1,0 +1,5 @@
+# INKSPEC2 DSPARKTRAIN: offline data + parity tool for the Inkling2 DSpark drafter retrain (no runtime change)
+set(TARGET llama-dspark-dump)
+add_executable(${TARGET} dspark-dump.cpp)
+target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
