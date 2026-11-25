@@ -184,8 +184,10 @@ static bool lsa_overflow_log() {
 }
 // stage_ctl words: 0 entries this resolve, 1 first entry this resolve copies (the ahead entries sit below it), u64 at 2
 // copied total, u64 at 4 stage full, 7 ahead_list entries for the next ahead copy, u64 at 8 ahead entries picked again,
-// u64 at 10 ahead entries offered
-constexpr int LSA_STAGE_CTL_WORDS = 12;
+// u64 at 10 ahead entries offered; HOSTKV-RECLAIM: u64 at 12 reclaimed total, 14 reclaimed this resolve, 15 overflow
+// records listed this resolve; with GGML_CUDA_LSA_STAGE_RECLAIM the block continues with hit flags [stage_n] (ahead
+// entry picked again) and the overflow list [stage_n] (records that found the stage full), see lsa_stage_reclaim
+constexpr int LSA_STAGE_CTL_WORDS = 16;
 // GGML_CUDA_LSA_STAGE_AHEAD (default on, =0 off): see ggml_cuda_qsa_clock_map::ahead_list. Needs the whole-record stage
 // (GGML_CUDA_LSA_RESIDENT_STAGE) and stays off with STAGE_ALL, stage strips and GGML_CUDA_LSA_PREFETCH; a J3 prefetch
 // (LLAMA_LSA_J3) turns it off for the process. Costs a second stage of the same size per buffer.
@@ -217,6 +219,24 @@ static int lsa_prefetch_cap();
 static bool lsa_stage_ahead_on(const ggml_cuda_qsa_clock_map & m) {
     return lsa_stage_ahead_env() && m.cells == GGML_LSA_PAGE_CELLS && m.stage_n > 0 && !m.stage_all && !m.stage_stride &&
         !m.strip_master && lsa_prefetch_cap() == 0;
+}
+// HOSTKV-RECLAIM: GGML_CUDA_LSA_STAGE_RECLAIM=1 (opt-in, needs the stage ahead). After a decode resolve's mark and
+// assign, stage entries that hold an ahead record nobody picked again (or one whose table entry moved on) are given to
+// records that found the stage full, which are then copied from the master like any other stage entry. Speed only:
+// the pick is unchanged, a reclaimed entry holds the same master bytes the attention would have read over the bus.
+static bool lsa_stage_reclaim_env() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_STAGE_RECLAIM");
+        return v != nullptr && atoi(v) > 0;
+    }();
+    return on;
+}
+static bool lsa_stage_reclaim_on(const ggml_cuda_qsa_clock_map & m) {
+    return lsa_stage_reclaim_env() && lsa_stage_ahead_on(m);
+}
+static size_t lsa_stage_ctl_bytes(const ggml_cuda_qsa_clock_map & m) {
+    if (!m.stage_n) return 0;
+    return (LSA_STAGE_CTL_WORDS + (lsa_stage_reclaim_on(m) ? 2*size_t(m.stage_n) : 0))*sizeof(uint32_t);
 }
 static size_t lsa_stage_stride(size_t stride, uint32_t heads) {
     GGML_ASSERT(heads > 0 && stride <= SIZE_MAX - size_t(heads)*4096);
@@ -293,7 +313,7 @@ static size_t qsa_clock_layout(ggml_cuda_qsa_clock_map & m, ggml_cuda_qsa_clock_
     char * ctl = take(QSA_CLOCK_CTL_WORDS*sizeof(uint32_t));
     char * seen = take(m.cells == GGML_LSA_PAGE_CELLS && lsa_admit_filter() ? size_t(m.records)*sizeof(uint32_t) : 0);
     char * stage_page = take(size_t(m.stage_n)*sizeof(int32_t));
-    char * stage_ctl = take(m.stage_n ? LSA_STAGE_CTL_WORDS*sizeof(uint32_t) : 0);
+    char * stage_ctl = take(lsa_stage_ctl_bytes(m));
     char * ahead_list = take(lsa_stage_ahead_on(m) ? size_t(m.stage_n)*sizeof(int32_t) : 0);
     const bool overflow_log = m.cells == GGML_LSA_PAGE_CELLS && m.stage_n && lsa_overflow_log();
     const bool strip_mask = m.stage_stride || overflow_log;
@@ -370,7 +390,7 @@ static void qsa_clock_reset(ggml_backend_buffer_t buffer) {
             CUDA_CHECK(cudaMemset(m.j3_src, 0, size_t(m.records)*sizeof(uint32_t)));
         }
         if (m.stage_ctl) {
-            CUDA_CHECK(cudaMemset(m.stage_ctl, 0, LSA_STAGE_CTL_WORDS*sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemset(m.stage_ctl, 0, lsa_stage_ctl_bytes(m)));
         }
         if (m.stage_mask) {
             CUDA_CHECK(cudaMemset(m.stage_mask, 0, size_t(m.records)*sizeof(uint32_t)));
@@ -455,6 +475,11 @@ static void qsa_clock_free(ggml_backend_buffer_t buffer) {
                     "%s, %.2f MiB still read from host\n", e->map.layer, e->map.stage_n,
                     (unsigned long long) st[1], (unsigned long long) st[2], st[1]*rec_mib/calls,
                     e->map.stage_stride ? "whole-record equivalent (actual bytes in LSA STRIP STAGE)" : "copied to the stage", st[2]*rec_mib/calls);
+                if (lsa_stage_reclaim_on(e->map)) {
+                    GGML_LOG_WARN("LSA STAGE RECLAIM: layer %d reclaimed=%llu (stage_full before reclaim=%llu), per resolve: "
+                        "%.2f MiB moved from host reads to the stage\n", e->map.layer, (unsigned long long) st[6],
+                        (unsigned long long) (st[2] + st[6]), st[6]*rec_mib/calls);
+                }
             }
             if (e->map.stage_stats) {
                 unsigned long long st[3]{};
@@ -569,6 +594,10 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
                     } else {
                         GGML_LOG_WARN("LSA STAGE AHEAD: on, second stage of %u records (%.1f MiB); "
                             "GGML_CUDA_LSA_STAGE_AHEAD=0 turns it off\n", stage_n, b->stage_bytes/1048576.0);
+                        if (lsa_stage_reclaim_env()) {
+                            GGML_LOG_WARN("LSA STAGE RECLAIM: on (GGML_CUDA_LSA_STAGE_RECLAIM=1): unpicked ahead entries "
+                                "go to records that find the stage full\n");
+                        }
                     }
                 }
                 if (b->stage2 && (b->page_layers++ & 1u)) {
@@ -613,7 +642,7 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
         CUDA_CHECK(cudaMemset(m.seen, 0, size_t(m.records)*sizeof(uint32_t)));
     }
     if (m.stage_ctl) {
-        CUDA_CHECK(cudaMemset(m.stage_ctl, 0, LSA_STAGE_CTL_WORDS*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(m.stage_ctl, 0, lsa_stage_ctl_bytes(m)));
     }
     if (m.stage_mask) {
         CUDA_CHECK(cudaMemset(m.stage_mask, 0, size_t(m.records)*sizeof(uint32_t)));
@@ -1031,7 +1060,8 @@ static __global__ void lsa_ahead_mirror(ggml_cuda_qsa_clock_map m, int32_t * mir
 
 // GGML_CUDA_LSA_RESIDENT_STAGE: a picked record without a CLOCK slot takes the next stage index for this resolve
 // (table -3 - k); with no stage, or the stage full, it is read from the master (table -1) exactly as before.
-static __device__ void lsa_stage_or_master(const ggml_cuda_qsa_clock_map & m, int record) {
+// reclaim (HOSTKV-RECLAIM): a record that finds the stage full is also listed for lsa_stage_reclaim.
+static __device__ void lsa_stage_or_master(const ggml_cuda_qsa_clock_map & m, int record, int reclaim = 0) {
     if (m.stage_n) {
         const uint32_t k = atomicAdd(m.stage_ctl, 1u);
         if (k < m.stage_n) {
@@ -1042,6 +1072,10 @@ static __device__ void lsa_stage_or_master(const ggml_cuda_qsa_clock_map & m, in
                 if (a < m.stage_n) m.ahead_list[a] = record;
             }
             return;
+        }
+        if (reclaim) {
+            const uint32_t o = atomicAdd(m.stage_ctl + 15, 1u);
+            if (o < m.stage_n) reinterpret_cast<int32_t *>(m.stage_ctl + LSA_STAGE_CTL_WORDS + m.stage_n)[o] = record;
         }
     }
     m.table[record] = -1;
@@ -1082,14 +1116,64 @@ static __global__ void lsa_stage_reset(ggml_cuda_qsa_clock_map m, int apply, con
     __syncthreads();
     if (threadIdx.x == 0) {
         auto * c = reinterpret_cast<unsigned long long *>(m.stage_ctl + 2);
-        c[0] += used - first; // copied by the resolve (ahead entries below first were not)
-        c[1] += n - used;
+        const uint32_t rc = min(m.stage_ctl[14], n - used); // HOSTKV-RECLAIM: overflow records that got a reclaimed entry
+        c[0] += used - first + rc; // copied by the resolve (ahead entries below first were not, reclaimed ones were)
+        c[1] += n - used - rc;     // read from the master
+        reinterpret_cast<unsigned long long *>(m.stage_ctl + 12)[0] += rc;
+        m.stage_ctl[14] = 0;
+        m.stage_ctl[15] = 0;
         if (m.ahead_list) {
             reinterpret_cast<unsigned long long *>(m.stage_ctl + 8)[1] += keep;
             m.stage_ctl[7] = 0; // this resolve offers the next list
         }
         m.stage_ctl[0] = keep;
         m.stage_ctl[1] = keep;
+    }
+}
+
+// HOSTKV-RECLAIM (GGML_CUDA_LSA_STAGE_RECLAIM=1, decode, after mark + assign, one thread): ahead entries j < first
+// that no pick of this resolve hit (hit flag clear) or whose record no longer points at them (sealed by this ubatch,
+// or the reset's CAS lost to a CLOCK slot) go to the records listed as stage full, in order. The old record goes back
+// to -1 (master), the new one takes -3 - j and is offered to the next ahead list; overflow[i] is rewritten with its
+// stage index for lsa_stage_reclaim_copy. Clears the hit flags for the next resolve.
+static __global__ void lsa_stage_reclaim(ggml_cuda_qsa_clock_map m) {
+    uint32_t * hit = m.stage_ctl + LSA_STAGE_CTL_WORDS;
+    int32_t * over = reinterpret_cast<int32_t *>(hit + m.stage_n);
+    if (threadIdx.x == 0) {
+        const uint32_t first = min(m.stage_ctl[1], m.stage_n);
+        const uint32_t nover = min(m.stage_ctl[15], m.stage_n);
+        uint32_t r = 0, done = 0;
+        for (uint32_t j = 0; j < first && r < nover; ++j) {
+            const int old = m.stage_page[j];
+            const bool held = old >= 0 && uint32_t(old) < m.records && m.table[old] == -3 - int(j);
+            if (held && hit[j]) continue;
+            int rec = -1;
+            while (r < nover) {
+                rec = over[r++];
+                if (rec >= 0 && uint32_t(rec) < m.records && m.table[rec] == -1) break;
+                rec = -1;
+            }
+            if (rec < 0) break;
+            if (held) m.table[old] = -1;
+            m.stage_page[j] = rec;
+            m.table[rec] = -3 - int(j);
+            over[done++] = int32_t(j); // done <= r - 1: never overwrites an unread entry
+            const uint32_t a = m.stage_ctl[7];
+            if (a < m.stage_n) m.ahead_list[a] = rec;
+            m.stage_ctl[7] = a + 1;
+        }
+        m.stage_ctl[14] = done;
+    }
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < m.stage_n; i += blockDim.x) hit[i] = 0;
+}
+// HOSTKV-RECLAIM: copy the reclaimed stage entries (stage_ctl 14 indices in the overflow list) from the master
+static __global__ void lsa_stage_reclaim_copy(ggml_cuda_qsa_clock_map m) {
+    const int32_t * idx = reinterpret_cast<const int32_t *>(m.stage_ctl + LSA_STAGE_CTL_WORDS + m.stage_n);
+    const uint32_t n = min(m.stage_ctl[14], m.stage_n);
+    for (uint32_t i = blockIdx.x; i < n; i += gridDim.x) {
+        const int j = idx[i];
+        lsa_record_copy(m, m.stage_page[j], m.stage, j, blockIdx.y);
     }
 }
 
@@ -1545,7 +1629,7 @@ void ggml_cuda_qsa_strip_prepare(ggml_backend_cuda_context & ctx, const ggml_ten
 // limit: most misses queued (m.slots normally). pf: prefetch for the next LSA layer's map m from this layer's mask:
 // picked is not counted and records sealed by this ubatch are skipped (their master bytes are being written now).
 static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * desc, const half * mask, int64_t pitch,
-        int nrows, uint32_t limit, int pf) {
+        int nrows, uint32_t limit, int pf, int reclaim = 0) {
     const int g = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int S = desc[GGML_SJKVARN_DESC_S], B = desc[GGML_SJKVARN_DESC_B], G = desc[GGML_SJKVARN_DESC_G];
@@ -1603,7 +1687,7 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
         m.stamp[slot] = epoch;
         m.ref[slot] = 1;
     } else if (slot == -1 && !admit) {
-        lsa_stage_or_master(m, record); // first pick in a row: no slot (stage, else the master)
+        lsa_stage_or_master(m, record, reclaim); // first pick in a row: no slot (stage, else the master)
         atomicAdd(m.ctl + 7, 1u);
     } else if (slot == -1) {
         const uint32_t miss = atomicAdd(m.ctl + 2, 1u);
@@ -1612,20 +1696,23 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
         } else if (pf) {
             m.table[record] = -1; // prefetch past its cap: not picked by anyone yet
         } else {
-            lsa_stage_or_master(m, record); // past the slots: stage, else the master
+            lsa_stage_or_master(m, record, reclaim); // past the slots: stage, else the master
         }
     } else if (slot <= -3 && !pf && m.ahead_list) {
         // GGML_CUDA_LSA_STAGE_AHEAD: picked again, read in place from its ahead entry and offered to the next list
         const uint32_t a = atomicAdd(m.stage_ctl + 7, 1u);
         if (a < m.stage_n) m.ahead_list[a] = record;
         atomicAdd(reinterpret_cast<unsigned long long *>(m.stage_ctl + 8), 1ull);
+        const uint32_t j = uint32_t(-3 - slot);
+        if (reclaim && j < m.stage_n) m.stage_ctl[LSA_STAGE_CTL_WORDS + j] = 1u; // HOSTKV-RECLAIM: entry j stays
     }
 }
 
 // pf: 0 own resolve, 1 GGML_CUDA_LSA_PREFETCH, 2/3 LLAMA_LSA_J3 (2: the previous own pick's slots are protected too).
 // A J3 prefetch never evicts a slot stamped after the target's last own resolve (an earlier source of the same step
 // put or found it there), so the sources of one step add up instead of evicting each other.
-static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit, int pf, bool stage_all = false) {
+static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit, int pf, bool stage_all = false,
+        int reclaim = 0) {
     __shared__ uint32_t epoch, assigned, hand, nmiss, keep_from, cand;
     if (threadIdx.x == 0) {
         cand = 0;
@@ -1663,7 +1750,7 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
     }
     const uint32_t got = min(assigned, nmiss);
     for (uint32_t i = got + threadIdx.x; i < nmiss; i += blockDim.x) {
-        if (pf) m.table[m.miss_page[i]] = -1; else lsa_stage_or_master(m, m.miss_page[i]); // every slot protected by this pick
+        if (pf) m.table[m.miss_page[i]] = -1; else lsa_stage_or_master(m, m.miss_page[i], reclaim); // every slot protected by this pick
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -2224,11 +2311,17 @@ void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tens
         lsa_page_prefetch(ctx, e, static_cast<const int32_t *>(dst->src[6]->data), m16, pitch, nrows);
     }
     const int per_block = 8;
+    // HOSTKV-RECLAIM: stage_ctl was sized for it at layout time (lsa_stage_reclaim_on), ahead still live
+    const int reclaim = e->map.ahead_list && !lsa_ahead_blocked && lsa_stage_reclaim_on(e->map) ? 1 : 0;
     lsa_page_mark<<<(e->map.records + per_block - 1)/per_block, per_block*WARP_SIZE, 0, ctx.stream()>>>(
-        e->map, static_cast<const int32_t *>(dst->src[6]->data), m16, pitch, nrows, lsa_fetch_cap(e->map.slots), 0);
+        e->map, static_cast<const int32_t *>(dst->src[6]->data), m16, pitch, nrows, lsa_fetch_cap(e->map.slots), 0, reclaim);
     CUDA_CHECK(cudaGetLastError());
-    lsa_page_assign<<<1, 1024, 0, ctx.stream()>>>(e->map, lsa_fetch_cap(e->map.slots), 0, lsa_stage_all());
+    lsa_page_assign<<<1, 1024, 0, ctx.stream()>>>(e->map, lsa_fetch_cap(e->map.slots), 0, lsa_stage_all(), reclaim);
     CUDA_CHECK(cudaGetLastError());
+    if (reclaim) {
+        lsa_stage_reclaim<<<1, 256, 0, ctx.stream()>>>(e->map);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if (e->ahead_host && e->map.ahead_list && !lsa_ahead_blocked) {
         lsa_ahead_mirror<<<1, 256, 0, ctx.stream()>>>(e->map, e->ahead_host_dev);
         CUDA_CHECK(cudaGetLastError());
@@ -2241,6 +2334,10 @@ void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tens
     CUDA_CHECK(cudaGetLastError());
     if (e->map.stage_n) {
         lsa_stage_copy<<<dim3(copy_blocks, e->map.heads), 256, 0, ctx.stream()>>>(e->map, bits >> 8, bits & 255);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (reclaim) {
+        lsa_stage_reclaim_copy<<<dim3(copy_blocks, e->map.heads), 256, 0, ctx.stream()>>>(e->map);
         CUDA_CHECK(cudaGetLastError());
     }
 }
