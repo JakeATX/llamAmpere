@@ -2,8 +2,8 @@
 
 #include "common.cuh"
 
-// GGML_CUDA_NK_DENSE_TC=1: opt-in Ampere int8 kernel for dense Q8_0 decode/verify
-// projections (default OFF; unset or 0 = exact base q8a16/mmvq).
+// GGML_CUDA_NK_DENSE_TC (default ON, =0 is the kill switch): Ampere int8 kernel for dense Q8_0 decode/verify
+// projections (0 = exact base q8a16/mmvq).
 // GGML_CUDA_NK_DENSE_TC_MIN_ROWS: minimum weight rows (default 16385 = head-only;
 // set 0 to include attention-sized and grouped projections).
 // GGML_CUDA_NK_DENSE_TC_MINT: minimum batch width T (default 4 so T=1..3 stay on base q8a16).

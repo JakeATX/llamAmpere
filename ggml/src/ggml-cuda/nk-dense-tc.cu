@@ -1,6 +1,6 @@
 // NEONKERN NK_DENSE_TC: Ampere int8 dense Q8_0 decode/verify head kernels (T=1..8).
 //
-// Default policy when GGML_CUDA_NK_DENSE_TC=1 (default OFF):
+// Default policy (default ON; GGML_CUDA_NK_DENSE_TC=0 = kill switch):
 //   - MIN_ROWS = 16385 (head-only: output.weight 201024x2304; =0 restores r11 attention/grouped)
 //   - MINT     = 4     (T=1..3 stay on base q8a16, which streams 201024x2304 at ~876 GB/s at T=1)
 //   - HEAD_PATH = auto | tc | grid (default auto, selects per T from k_head_auto_table):
@@ -60,7 +60,7 @@ static int nk_parse_nonneg_env(const char * name, const int def_val) {
 bool ggml_cuda_nk_dense_tc_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_NK_DENSE_TC");
-        return e != nullptr && strcmp(e, "1") == 0;
+        return e == nullptr || strcmp(e, "0") != 0; // default ON; GGML_CUDA_NK_DENSE_TC=0 = kill switch
     }();
     return on;
 }

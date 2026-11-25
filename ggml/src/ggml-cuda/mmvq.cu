@@ -3834,7 +3834,7 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
-    // NEONKERN NK_DENSE_TC: opt-in Ampere int8 TC dense Q8_0 decode/verify matmul (GGML_CUDA_NK_DENSE_TC=1, default OFF)
+    // NEONKERN NK_DENSE_TC: Ampere int8 dense Q8_0 matmul, weights with >= 16385 rows at T=4..8 (default ON, GGML_CUDA_NK_DENSE_TC=0 = off)
     if (src0->type == GGML_TYPE_Q8_0 && !ids && !fusion && !convrot &&
             ggml_cuda_nk_dense_tc_mul_mat(ctx, src0, src1, dst)) {
         return;
@@ -4000,7 +4000,7 @@ static bool mmvq_group_launch(ggml_backend_cuda_context & ctx, ggml_tensor * con
     if (n < 1 || n > MMVQ_GROUP_MAX) {
         return false;
     }
-    // NEONKERN NK_DENSE_TC: opt-in int8 TC group (reads each member's f32 src1; vy unused)
+    // NEONKERN NK_DENSE_TC: int8 TC group (default ON, GGML_CUDA_NK_DENSE_TC=0 = off; head-only unless MIN_ROWS is lowered) (reads each member's f32 src1; vy unused)
     if (ggml_cuda_nk_dense_tc_group(ctx, dsts, n, vy == nullptr)) {
         return true;
     }
@@ -4136,7 +4136,7 @@ static bool mmvq_group_nc_launch(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (n < 1 || n > MMVQ_GROUP_MAX) {
         return false;
     }
-    // NEONKERN NK_DENSE_TC: opt-in int8 TC group at verify widths (reads each member's f32 src1; vy unused)
+    // NEONKERN NK_DENSE_TC: int8 TC group (default ON, GGML_CUDA_NK_DENSE_TC=0 = off; head-only unless MIN_ROWS is lowered) at verify widths (reads each member's f32 src1; vy unused)
     if (ggml_cuda_nk_dense_tc_group(ctx, dsts, n, vy == nullptr)) {
         return true;
     }
