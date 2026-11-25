@@ -15760,6 +15760,17 @@ static void ggml_cuda_shexp_uses(const ggml_cgraph * g, std::unordered_map<const
     }
 }
 
+// An input of a side-stream chain that is not a node of this graph and not a weight. With a model split over several
+// backends the scheduler gives each split its own copy of a graph input (e.g. the positions); that copy lives in the
+// compute buffer, so it must stay allocated until the join like the node inputs, or main-stream nodes can take its
+// memory while the side stream still reads it (seen as run-to-run token differences at temperature 0 with a layer
+// split and replayed CUDA graphs). Weights are never freed. GGML_CUDA_SIDE_INPUT_KEEP=0 restores the old rule.
+static bool ggml_cuda_side_input_needs_keep(const ggml_tensor * x) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_SIDE_INPUT_KEEP"); return e == nullptr || atoi(e) != 0; }();
+    return on && x->op == GGML_OP_NONE &&
+        (x->buffer == nullptr || ggml_backend_buffer_get_usage(x->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+}
+
 // the chain of node d (the ffn_shexp tensor): d and every earlier node whose readers are all in the chain
 static bool ggml_cuda_shexp_chain_find(const ggml_cgraph * g, int d, const std::unordered_map<const ggml_tensor *, int> & idx,
                                        const std::unordered_map<const ggml_tensor *, int> & n_use, ggml_cuda_shexp_chain & c) {
@@ -15816,6 +15827,8 @@ static bool ggml_cuda_shexp_chain_find(const ggml_cgraph * g, int d, const std::
                     if (std::find(c.ext.begin(), c.ext.end(), x) == c.ext.end()) {
                         c.ext.push_back(x);
                     }
+                } else if (ggml_cuda_side_input_needs_keep(x) && std::find(c.ext.begin(), c.ext.end(), x) == c.ext.end()) {
+                    c.ext.push_back(x);
                 }
             }
         }
@@ -15925,6 +15938,8 @@ static bool ggml_cuda_side_group_find(const ggml_cgraph * g, const std::vector<i
                     if (std::find(c.ext.begin(), c.ext.end(), x) == c.ext.end()) {
                         c.ext.push_back(x);
                     }
+                } else if (ggml_cuda_side_input_needs_keep(x) && std::find(c.ext.begin(), c.ext.end(), x) == c.ext.end()) {
+                    c.ext.push_back(x);
                 }
             }
         }
