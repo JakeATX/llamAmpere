@@ -222,6 +222,9 @@ struct common_speculative_impl {
     virtual bool process(const llama_batch & batch) = 0;
     virtual bool process_range(const llama_batch & batch, int32_t output_offset) { return output_offset == 0 && process(batch); }
 
+    // whether process() reads the rows of an embedding batch (the draft model decodes them); false skips their copy
+    virtual bool needs_embd_rows() const { return true; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -630,6 +633,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     (int) pos_max, N - 2);
         }
     }
+
+    // process() skips an embedding batch
+    bool needs_embd_rows() const override { return false; }
 
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
@@ -1209,6 +1215,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     __func__, (int) pos_max, N - 1);
         }
     }
+
+    // process() skips an embedding batch
+    bool needs_embd_rows() const override { return false; }
 
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
@@ -2276,6 +2285,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     (int) pos_max, N - 1);
         }
     }
+
+    // process() skips an embedding batch
+    bool needs_embd_rows() const override { return false; }
 
     bool process(const llama_batch & batch_in) override {
         return process_range(batch_in, 0);
@@ -3433,6 +3445,8 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         // noop
     }
 
+    bool needs_embd_rows() const override { return false; }
+
     bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
         return true;
@@ -3480,6 +3494,8 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 
         common_ngram_map_begin(config[seq_id], prompt);
     }
+
+    bool needs_embd_rows() const override { return false; }
 
     bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
@@ -3638,6 +3654,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // store length of drafted n-gram for later acceptance analysis
         sinfo.n_draft_last = result.size();
     }
+
+    bool needs_embd_rows() const override { return false; }
 
     bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
@@ -4150,6 +4168,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             result.clear();
         }
     }
+
+    bool needs_embd_rows() const override { return false; }
 
     bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
@@ -5077,13 +5097,18 @@ struct spec_batch_view {
     std::vector<llama_seq_id *> seq_id;
     std::vector<int8_t>         logits;
 
-    llama_batch render(const common_batch & cb) {
+    // copy_embd: copy the embedding rows; without it, embd of an embedding batch only marks it as one (it is not row data)
+    llama_batch render(const common_batch & cb, bool copy_embd) {
         const int32_t n = cb.size();
         const bool has_tok  = cb.has_token();
         const bool has_embd = cb.has_embd();
+        const bool copy     = has_embd && copy_embd;
+
+        // an embedding batch of an M-RoPE model carries every position section, one after the other as llama_decode reads them; a token batch carries one position per token
+        const int32_t n_pos = has_embd ? std::max<int32_t>(1, cb.n_pos) : 1;
 
         token.resize(has_tok ? n : 0);
-        pos.resize(n);
+        pos.resize((size_t) n * n_pos);
         n_seq_id.resize(n);
         logits.resize(n);
         seq_id.resize(n);
@@ -5092,12 +5117,12 @@ struct spec_batch_view {
         size_t n_embd = 0;
         for (int32_t i = 0; i < n; ++i) {
             n_seq_total += 1 + cb.tokens[i].seq_ids_extra.size();
-            if (has_embd) {
+            if (copy) {
                 n_embd = std::max(n_embd, cb.tokens[i].embd.n_embd);
             }
         }
         seq_flat.resize(n_seq_total);
-        embd.resize(has_embd ? (size_t) n * n_embd : 0);
+        embd.resize(copy ? (size_t) n * n_embd : (has_embd ? 1 : 0));
 
         size_t o = 0;
         for (int32_t i = 0; i < n; ++i) {
@@ -5105,10 +5130,12 @@ struct spec_batch_view {
             if (has_tok) {
                 token[i] = t.id;
             }
-            if (has_embd && t.embd.data != nullptr) {
+            if (copy && t.embd.data != nullptr) {
                 std::memcpy(embd.data() + (size_t) i * n_embd, t.embd.data, t.embd.n_embd * sizeof(float));
             }
-            pos[i]      = t.pos[0];
+            for (int32_t j = 0; j < n_pos; ++j) {
+                pos[(size_t) j * n + i] = t.pos[j];
+            }
             logits[i]   = t.output ? 1 : 0;
             n_seq_id[i] = 1 + (int32_t) t.seq_ids_extra.size();
             seq_id[i]   = seq_flat.data() + o;
@@ -5139,7 +5166,11 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     static thread_local spec_batch_view view;
-    const llama_batch b = view.render(batch);
+    bool copy_embd = false;
+    for (const auto & impl : spec->impls) {
+        copy_embd = copy_embd || impl->needs_embd_rows();
+    }
+    const llama_batch b = view.render(batch, copy_embd);
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(b);
@@ -5172,7 +5203,7 @@ bool common_speculative_process_range(common_speculative * spec, const common_ba
         return true;
     }
     static thread_local spec_batch_view view;
-    llama_batch b = view.render(batch);
+    llama_batch b = view.render(batch, false); // a token batch: there are no embedding rows
     b.n_tokens = count;
     b.token += first;
     b.pos += first;

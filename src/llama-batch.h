@@ -294,6 +294,11 @@ private:
     // batch indices of the output
     std::vector<int32_t> out_ids;
 
+    // the data of the ubatches built by ubatch_add(), reused once no ubatch holds it: at most UDATA_POOL_MAX blocks, each with at most UDATA_POOL_MAX_BYTES of rows
+    static constexpr size_t UDATA_POOL_MAX       = 4;
+    static constexpr size_t UDATA_POOL_MAX_BYTES = 32u << 20;
+    std::vector<std::shared_ptr<llama_ubatch::data_t>> udata_pool;
+
     uint32_t n_used;
 
     // used[i] indicates if token i has already been used in a previous ubatch

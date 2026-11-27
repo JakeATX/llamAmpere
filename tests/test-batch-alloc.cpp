@@ -723,6 +723,82 @@ static void test_split(testing & t) {
     });
 }
 
+static void test_udata_reuse(testing & t) {
+    llama_vocab vocab;
+
+    // n embedding rows at positions 0..n-1, output on the last one
+    auto add_rows = [](batch_builder & bb, int n) {
+        for (int i = 0; i < n; ++i) {
+            bb.add(i, {0}, i + 1 == n);
+        }
+    };
+
+    t.test("idle_block_is_reused", [&](testing & t) {
+        llama_batch_allocr ba(1);
+        batch_builder b1;
+        add_rows(b1, 8);
+        t.assert_true(ba.init(b1.b, vocab, false));
+        const llama_ubatch::data_t * block = nullptr;
+        const float * rows = nullptr;
+        {
+            const llama_ubatch ub = ba.split_simple(8);
+            block = ub.data.get();
+            rows  = ub.embd;
+        }
+
+        batch_builder b2;
+        add_rows(b2, 8);
+        t.assert_true(ba.init(b2.b, vocab, false));
+        const llama_ubatch ub = ba.split_simple(8);
+        t.assert_true("the idle block is taken again", ub.data.get() == block);
+        t.assert_true("its rows keep their memory", ub.embd == rows);
+        t.assert_equal(701.0f, ub.embd[7*b2.n_embd + 1]);
+    });
+
+    t.test("held_block_is_not_reused", [&](testing & t) {
+        llama_batch_allocr ba(1);
+        batch_builder bb;
+        add_rows(bb, 8);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        const llama_ubatch a = ba.split_simple(4);
+        const llama_ubatch b = ba.split_simple(4);
+        t.assert_true(a.data.get() != b.data.get());
+        t.assert_equal(0.0f,   a.embd[0]);
+        t.assert_equal(301.0f, a.embd[3*bb.n_embd + 1]);
+        t.assert_equal(400.0f, b.embd[0]);
+    });
+
+    t.test("pool_keeps_at_most_4_blocks", [&](testing & t) {
+        llama_batch_allocr ba(1);
+        batch_builder bb;
+        add_rows(bb, 6);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        std::vector<std::weak_ptr<llama_ubatch::data_t>> blocks;
+        {
+            std::vector<llama_ubatch> held;
+            for (int i = 0; i < 6; ++i) {
+                held.push_back(ba.split_simple(1));
+                blocks.push_back(held.back().data);
+            }
+        }
+        int kept = 0;
+        for (const auto & block : blocks) {
+            kept += block.expired() ? 0 : 1;
+        }
+        t.assert_equal(4, kept);
+    });
+
+    t.test("large_block_is_not_kept", [&](testing & t) {
+        // 33 rows of 1 MiB, more than a block in the pool may hold
+        llama_batch_allocr ba(1);
+        batch_builder bb(1u << 18);
+        add_rows(bb, 33);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        const std::weak_ptr<llama_ubatch::data_t> block = ba.split_simple(33).data;
+        t.assert_true(block.expired());
+    });
+}
+
 static void test_keep_tail(testing & t) {
     llama_vocab vocab;
 
@@ -1407,6 +1483,7 @@ int main(int argc, char ** argv) {
     t.test("compat",         test_compat);
     t.test("mtp_compat_reuse", test_mtp_compat_reuse);
     t.test("split",          test_split);
+    t.test("udata_reuse",    test_udata_reuse);
     t.test("cached_decode_split", test_cached_decode_split);
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
