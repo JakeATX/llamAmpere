@@ -1038,6 +1038,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
     }
 
+    // SJ-KVaRN seals whole KV heads into a mirrored body and its attention kernels index records from head 0,
+    // so the attention subgraph runs replicated on every device; the FFN stays tensor-split
+    if (ud->sj_kvarn && is_attention_tensor && !hparams.is_recr(tc.il)) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
+
     if (exl3_side != EXL3_SIDE_NONE) {
         const bool follows = exl3_side == EXL3_SIDE_SUH ? tc.axis == GGML_BACKEND_SPLIT_AXIS_0 : tc.axis == GGML_BACKEND_SPLIT_AXIS_1;
         tc.axis = follows ? GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_MIRRORED;
@@ -3089,6 +3095,10 @@ llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
 
+bool llama_model::sj_kvarn() const {
+    return params.sj_kvarn;
+}
+
 bool llama_model::no_alloc() const {
     return params.no_alloc;
 }
@@ -4208,6 +4218,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.fit_ram                     =*/ false,
+        /*.sj_kvarn                    =*/ false,
     };
 
     return result;

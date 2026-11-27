@@ -727,6 +727,7 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+    bool                       sj_kvarn = false;
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
@@ -1039,6 +1040,7 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    bool sj_kvarn() const;
     bool no_alloc() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;

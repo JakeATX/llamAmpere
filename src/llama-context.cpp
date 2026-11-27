@@ -10730,6 +10730,11 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
             LLAMA_LOG_ERROR("%s: SJ-KVaRN cache does not support MLA models\n", __func__);
             return nullptr;
         }
+        if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR && model->n_devices() > 1 && !model->sj_kvarn()) {
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN cache with --split-mode tensor requires loading the model with"
+                    " llama_model_params::sj_kvarn = true (mirrors the attention subgraph on every device)\n", __func__);
+            return nullptr;
+        }
         if (params.sj_kvarn_staging_type != GGML_TYPE_F16 && params.sj_kvarn_staging_type != GGML_TYPE_Q8_0 && params.sj_kvarn_staging_type != GGML_TYPE_TQ6_0) {
             LLAMA_LOG_ERROR("%s: SJ-KVaRN staging type must be f16, q8_0 or tq6_0\n", __func__);
             return nullptr;

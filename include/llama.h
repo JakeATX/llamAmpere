@@ -376,6 +376,7 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool fit_ram;         // cap optional model read-ahead using available host RAM
+        bool sj_kvarn;        // an SJ-KVaRN KV cache is planned: mirror the attention subgraph under SPLIT_MODE_TENSOR
     };
 
     struct llama_sampler_seq_config {
