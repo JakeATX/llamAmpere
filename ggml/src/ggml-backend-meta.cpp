@@ -425,6 +425,9 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container stc_compute[2];
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
+    // a container is reset on its next allocation, not when another graph starts computing:
+    // two contexts (MTP target + draft) share this buffer and reuse graphs across each other's computes
+    bool stc_compute_dirty[2] = {true, true};
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // FIXME
@@ -453,6 +456,13 @@ struct ggml_backend_meta_buffer_context {
         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
             return stc_static;
         }
+        if (stc_compute[stc_compute_index].simple_tensors.find(tensor) != stc_compute[stc_compute_index].simple_tensors.end()) {
+            return stc_compute[stc_compute_index];
+        }
+        // a reused graph can belong to the other container while a second context holds the current index
+        if (stc_compute[stc_compute_index ^ 1].simple_tensors.find(tensor) != stc_compute[stc_compute_index ^ 1].simple_tensors.end()) {
+            return stc_compute[stc_compute_index ^ 1];
+        }
         return stc_compute[stc_compute_index];
     }
 };
@@ -476,6 +486,23 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
+
+// shards of a live registration always derive from the tensor's type and dims (the split axis shrinks)
+static bool ggml_backend_meta_shards_match(const ggml_tensor * tensor, const std::vector<ggml_tensor *> & shards) {
+    for (const ggml_tensor * s : shards) {
+        if (s->type != tensor->type) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            if (s->ne[i] > tensor->ne[i]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -483,8 +510,24 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
+    if (it != stc.simple_tensors.end() && !ggml_backend_meta_shards_match(tensor, it->second)) {
+        // a reset container can still hold an entry for a recycled tensor address: treat it as missing
+        it = stc.simple_tensors.end();
+    }
     if (it == stc.simple_tensors.end()) {
-        return nullptr;
+        // a reused graph (MTP target + draft) can outlive the container rotation and lose its registration:
+        // re-register the still-live tensor on demand instead of returning null
+        static uint64_t reregistrations = 0;
+        ggml_backend_meta_simple_tensor_container & cur = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
+        if (ggml_backend_meta_buffer_init_tensor_impl(cur, const_cast<ggml_tensor *>(tensor)) != GGML_STATUS_SUCCESS) {
+            GGML_ABORT("meta backend: on-demand re-registration failed for tensor '%s'", tensor->name);
+        }
+        it = cur.simple_tensors.find(tensor);
+        GGML_ASSERT(it != cur.simple_tensors.end());
+        if (++reregistrations == 1) {
+            GGML_LOG_WARN("meta backend: re-registered a graph tensor lost to container rotation ('%s'; further occurrences silent)\n",
+                    tensor->name);
+        }
     }
     return it->second[index];
 }
@@ -1406,7 +1449,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
-    return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
+    if (buf_ctx->stc_compute_dirty[buf_ctx->stc_compute_index]) {
+        for (ggml_context_ptr & ctx : stc.ctxs) {
+            ggml_reset(ctx.get());
+        }
+        stc.simple_tensors.clear();
+        buf_ctx->stc_compute_dirty[buf_ctx->stc_compute_index] = false;
+    }
+    return ggml_backend_meta_buffer_init_tensor_impl(stc, tensor);
 }
 
 // EXL3 trellis weights are stored k-tile-major, [K/16][N/16][tile], one 16x16 tile per quant block (see ggml.h), so a
@@ -2209,11 +2260,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
-                ggml_reset(ctx.get());
-            }
-            stc.simple_tensors.clear();
+            // defer the reset to the next allocation into that container: a second context (MTP draft)
+            // may still reuse graphs registered there
+            buf_ctx->stc_compute_dirty[buf_ctx->stc_compute_index_next] = true;
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
