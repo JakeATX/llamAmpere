@@ -1033,7 +1033,33 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         // [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER=1: under tensor split the backend sampler chains (draft top-k, -bs)
         // run on the meta device's first card instead of falling back to CPU sampling; build_sampling() gathers the
         // vocab-split logits rows onto it. Unset or 0 = off (CPU sampling, as before).
+        // Scope: the extra card must only ever run the sampler nodes. The scheduler offers every op whose weight sits
+        // in host memory to each higher-priority backend (op offload), and this card would accept prompt matmuls, so
+        // the flag is refused (CPU sampling, as with the flag off) when any weight other than the token embedding is in
+        // host memory (-ngl below all layers, -ot / CPU-MoE overrides, host expert buffers).
+        const char * tsplitbs_host_weight = nullptr;
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tsplit_backend_sampler_wanted()) {
+            if (model.has_tensor_overrides()) {
+                tsplitbs_host_weight = "tensor buffer overrides (-ot / CPU-MoE)";
+            } else if (model.n_gpu_layers() <= model.hparams.n_layer_all) {
+                tsplitbs_host_weight = "-ngl below all layers";
+            } else {
+                for (const auto & [name, t] : model.tensors_by_name) {
+                    if (t == model.tok_embd || t->buffer == nullptr) {
+                        continue;
+                    }
+                    if (ggml_backend_buffer_is_host(t->buffer)) {
+                        tsplitbs_host_weight = name.c_str();
+                        break;
+                    }
+                }
+            }
+            if (tsplitbs_host_weight) {
+                LLAMA_LOG_WARN("%s: [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER=1 ignored: weights in host memory (%s); "
+                        "using CPU sampling\n", __func__, tsplitbs_host_weight);
+            }
+        }
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tsplit_backend_sampler_wanted() && !tsplitbs_host_weight) {
             for (auto & backend : backends) {
                 if (!ggml_backend_is_meta(backend.get()) || ggml_backend_meta_n_backends(backend.get()) == 0) {
                     continue;
@@ -1672,6 +1698,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // without the streamer, prompt ubatches stay at 512 rows (the MoE cache batch cap), as with -ub 512
             if (llama_ink_stream::wanted(model) && !model.no_alloc()) {
                 for (ggml_backend_t backend : backend_ptrs) {
+                    if (backend == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
                     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
                     if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                         ink_stream = std::make_unique<llama_ink_stream>(model, backend);
@@ -2940,6 +2967,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
         }
         size_t trim = 0;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (backend_ptrs[i] == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
             auto dev = ggml_backend_get_device(backend_ptrs[i]);
             if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
                 continue;
@@ -3978,6 +4006,7 @@ void llama_context::pp_warm_start() {
     using epoch_fn = uint64_t (*)(void);
     epoch_fn epoch = nullptr;
     for (ggml_backend_t backend : backend_ptrs) {
+        if (backend == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
         auto * dev = ggml_backend_get_device(backend);
         if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             epoch = (epoch_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
@@ -6221,6 +6250,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         auto gpu_free = [&]() {
             size_t free = 0, total = 0;
             for (ggml_backend_t backend : backend_ptrs) {
+                if (backend == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
                 auto dev = ggml_backend_get_device(backend);
                 if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     ggml_backend_dev_memory(dev, &free, &total);
@@ -6475,6 +6505,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 dynamic_ubatch_pp_bytes.assign(backend_ptrs.size(), 0);
             }
             for (size_t bi = 0; bi < backend_ptrs.size(); ++bi) {
+                if (backend_ptrs[bi] == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
                 auto backend = backend_ptrs[bi];
                 auto dev = ggml_backend_get_device(backend);
                 if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
@@ -6523,6 +6554,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r /= 2) {
                     bool fits = true;
                     for (auto backend : backend_ptrs) {
+                        if (backend == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
                         auto dev = ggml_backend_get_device(backend);
                         if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
                         size_t free = 0, total = 0;
@@ -8337,6 +8369,7 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
     if (!b1_kv_scratch_release()) { return false; }
     size_t gpu = backend_ptrs.size();
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (backend_ptrs[i] == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
         auto * dev = ggml_backend_get_device(backend_ptrs[i]);
         if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu = i; }
     }
@@ -8460,6 +8493,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         synchronize();
         size_t gpu_index = backend_ptrs.size();
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (backend_ptrs[i] == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
             const auto dev = ggml_backend_get_device(backend_ptrs[i]);
             if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
             if (gpu_index != backend_ptrs.size()) { return false; }
@@ -8594,6 +8628,9 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             ggml_backend_t gpu = nullptr;
             int n_gpu = 0;
             for (auto & be : backends) {
+                if (be.get() == backend_tsplit_sampler) {
+                    continue; // [TSPLITBS] sampler-only card, not a compute GPU
+                }
                 ggml_backend_dev_t d = ggml_backend_get_device(be.get());
                 if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     ++n_gpu;
@@ -8751,6 +8788,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         synchronize();
         ggml_backend_dev_t loan_device = nullptr;
         for (ggml_backend_t backend : backend_ptrs) {
+            if (backend == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
             auto dev = ggml_backend_get_device(backend);
             if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
                 continue;
@@ -9121,6 +9159,7 @@ void llama_context::b1_cache_profile_load() {
             tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t) tensor->type});
         }
         for (ggml_backend_t backend : backend_ptrs) {
+            if (backend == backend_tsplit_sampler) { continue; } // [TSPLITBS] sampler-only card
             auto * device = ggml_backend_get_device(backend);
             if (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                 model.moe_resident_init(device, tensors.data(), (int) tensors.size());
