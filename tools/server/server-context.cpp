@@ -3495,6 +3495,17 @@ private:
             // have loaded. Existing bank/staging RAM is already debited here.
             uint64_t total_host = 0, avail_host = 0;
             common_host_memory(total_host, avail_host);
+            // fork (GH-135): MemAvailable counts the page cache, including the expert file pages a model left
+            // unpinned (experts=file-pages). An auto-sized tier must not take that RAM: filling it would evict
+            // expert pages and send decode back to disk. Explicit --cache-ram N is left as asked.
+            // The 11 GiB headroom branch below must keep firing when unpinned_host > 0: with avail_host cut to 0 the
+            // non-fit auto tier skips its half-of-available clamp, and that branch is what brings it to 0.
+            const uint64_t unpinned_host = llama_model_moe_unpinned_size(model_tgt);
+            std::string unpinned_why;
+            if (unpinned_host > 0 && cache_ram_mib == COMMON_CACHE_RAM_AUTO) {
+                avail_host -= std::min(avail_host, unpinned_host);
+                unpinned_why = ", " + std::to_string(unpinned_host >> 20) + " MiB unpinned expert pages not counted as free";
+            }
             size_t explicit_free = 0, explicit_total = 0;
             if (cache_ram_mib < 0 && cache_ram_mib != COMMON_CACHE_RAM_AUTO) {
                 if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
@@ -3511,6 +3522,7 @@ private:
                 cache_ram_mib = (int32_t) std::min<uint64_t>(cache_ram_mib, spare >> 20);
                 why += ", expert arena keeps 11 GiB host headroom";
             }
+            why += unpinned_why;
             SRV_INF("prompt cache RAM tier: %d MiB (%s; set --cache-ram N to override, 0 disables it)\n",
                     cache_ram_mib, why.c_str());
         }
