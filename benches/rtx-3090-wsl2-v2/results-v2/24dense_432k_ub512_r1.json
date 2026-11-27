@@ -1,0 +1,76 @@
+{
+  "preset": "24dense",
+  "variant": "24dense_432k_ub512",
+  "rep": 1,
+  "extra_args": "-c 432538 --rope-scaling yarn --rope-scale 1.65 -ub 512",
+  "ctx_actual": 432640,
+  "batch_params": "batch=4096 ubatch=512",
+  "max_ctx_tokens": 423987,
+  "load_seconds": 84,
+  "probe_seconds": 7200,
+  "peak_vram_mib": 23489,
+  "ceiling_mib": 23552,
+  "headroom_mib": 63,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "pp_tok_s": 1363.91,
+      "tg_tok_s": 105.35,
+      "prompt_tokens": 16509
+    },
+    {
+      "task": "coding_64k",
+      "pp_tok_s": 1120.79,
+      "tg_tok_s": 101.57,
+      "prompt_tokens": 65465
+    },
+    {
+      "task": "coding_128k",
+      "pp_tok_s": 674.52,
+      "tg_tok_s": 85.8,
+      "prompt_tokens": 130984
+    },
+    {
+      "task": "coding_160k",
+      "pp_tok_s": 533.37,
+      "tg_tok_s": 101.12,
+      "prompt_tokens": 163709
+    },
+    {
+      "task": "coding_200k",
+      "pp_tok_s": 428.74,
+      "tg_tok_s": 84.97,
+      "prompt_tokens": 204619
+    },
+    {
+      "task": "coding_250k",
+      "pp_tok_s": 349.55,
+      "tg_tok_s": 80.01,
+      "prompt_tokens": 255797
+    },
+    {
+      "task": "coding_300k",
+      "pp_tok_s": 296.45,
+      "tg_tok_s": 68.31,
+      "prompt_tokens": 306733
+    },
+    {
+      "task": "coding_350k",
+      "pp_tok_s": 257.51,
+      "tg_tok_s": 69.2,
+      "prompt_tokens": 358061
+    },
+    {
+      "task": "coding_400k",
+      "pp_tok_s": 228.29,
+      "tg_tok_s": 67.51,
+      "prompt_tokens": 408927
+    }
+  ],
+  "error": "Expecting value: line 1 column 1 (char 0)",
+  "note": "probe hit its 7200 s timeout during the final max_ctx request; the nine ladder rows were recovered from the probe stderr log. max_ctx confirmed by a separate max-only run.",
+  "pass": false,
+  "fail_reasons": "max_ctx not completed (probe timeout)"
+}

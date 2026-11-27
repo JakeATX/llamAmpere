@@ -1,0 +1,111 @@
+{
+  "variant": "405k_b4096_ub1024",
+  "ctx": "405k",
+  "batch": 4096,
+  "ubatch": 1024,
+  "rep": 1,
+  "load_seconds": 68,
+  "probe_seconds": 4563,
+  "rss_mb": 15521,
+  "peak_vram_mib": 23515,
+  "headroom_mib": 461,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "prompt_tokens": 16403,
+      "prompt_ms": 9492.3,
+      "pp_tok_s": 1728.03,
+      "gen_tokens": 512,
+      "gen_ms": 4520.1,
+      "tg_tok_s": 113.05,
+      "wall_s": 14.13
+    },
+    {
+      "task": "coding_64k",
+      "prompt_tokens": 66188,
+      "prompt_ms": 46138.8,
+      "pp_tok_s": 1434.54,
+      "gen_tokens": 512,
+      "gen_ms": 4913.3,
+      "tg_tok_s": 104.0,
+      "wall_s": 51.46
+    },
+    {
+      "task": "coding_128k",
+      "prompt_tokens": 130982,
+      "prompt_ms": 119012.2,
+      "pp_tok_s": 1100.58,
+      "gen_tokens": 512,
+      "gen_ms": 5631.4,
+      "tg_tok_s": 90.74,
+      "wall_s": 126.08
+    },
+    {
+      "task": "coding_160k",
+      "prompt_tokens": 163754,
+      "prompt_ms": 165489.8,
+      "pp_tok_s": 989.51,
+      "gen_tokens": 512,
+      "gen_ms": 5993.7,
+      "tg_tok_s": 85.26,
+      "wall_s": 173.92
+    },
+    {
+      "task": "coding_200k",
+      "prompt_tokens": 204701,
+      "prompt_ms": 231680.9,
+      "pp_tok_s": 883.55,
+      "gen_tokens": 512,
+      "gen_ms": 6730.1,
+      "tg_tok_s": 75.93,
+      "wall_s": 241.25
+    },
+    {
+      "task": "coding_250k",
+      "prompt_tokens": 255783,
+      "prompt_ms": 488195.8,
+      "pp_tok_s": 523.94,
+      "gen_tokens": 512,
+      "gen_ms": 7376.4,
+      "tg_tok_s": 69.27,
+      "wall_s": 502.85
+    },
+    {
+      "task": "coding_300k",
+      "prompt_tokens": 306886,
+      "prompt_ms": 794647.0,
+      "pp_tok_s": 386.19,
+      "gen_tokens": 512,
+      "gen_ms": 7624.4,
+      "tg_tok_s": 67.02,
+      "wall_s": 808.72
+    },
+    {
+      "task": "coding_350k",
+      "prompt_tokens": 358099,
+      "prompt_ms": 1154208.2,
+      "pp_tok_s": 310.26,
+      "gen_tokens": 512,
+      "gen_ms": 8670.4,
+      "tg_tok_s": 58.94,
+      "wall_s": 1174.07
+    },
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 396608,
+      "prompt_ms": 1453665.8,
+      "pp_tok_s": 272.83,
+      "gen_tokens": 64,
+      "gen_ms": 1119.3,
+      "tg_tok_s": 56.29,
+      "wall_s": 1464.18,
+      "max_ctx_request": 397000
+    }
+  ],
+  "max_ctx_pp": 272.83,
+  "max_ctx_tg": 56.29,
+  "max_ctx_tokens": 396608,
+  "pass": true
+}

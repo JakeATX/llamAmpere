@@ -1,0 +1,92 @@
+{
+  "variant": "262k_b4864_ub4864",
+  "ctx": "262k",
+  "batch": 4864,
+  "ubatch": 4864,
+  "rep": 2,
+  "load_seconds": 69,
+  "probe_seconds": 1526,
+  "rss_mb": 20273,
+  "peak_vram_mib": 23514,
+  "headroom_mib": 462,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "prompt_tokens": 16477,
+      "prompt_ms": 9840.6,
+      "pp_tok_s": 1674.39,
+      "gen_tokens": 512,
+      "gen_ms": 4377.2,
+      "tg_tok_s": 116.74,
+      "wall_s": 14.34
+    },
+    {
+      "task": "coding_64k",
+      "prompt_tokens": 66074,
+      "prompt_ms": 45743.5,
+      "pp_tok_s": 1444.45,
+      "gen_tokens": 512,
+      "gen_ms": 5036.5,
+      "tg_tok_s": 101.46,
+      "wall_s": 51.28
+    },
+    {
+      "task": "coding_128k",
+      "prompt_tokens": 131029,
+      "prompt_ms": 108218.5,
+      "pp_tok_s": 1210.78,
+      "gen_tokens": 512,
+      "gen_ms": 5373.9,
+      "tg_tok_s": 95.09,
+      "wall_s": 115.07
+    },
+    {
+      "task": "coding_160k",
+      "prompt_tokens": 163735,
+      "prompt_ms": 146523.4,
+      "pp_tok_s": 1117.47,
+      "gen_tokens": 512,
+      "gen_ms": 6212.0,
+      "tg_tok_s": 82.26,
+      "wall_s": 155.24
+    },
+    {
+      "task": "coding_200k",
+      "prompt_tokens": 204678,
+      "prompt_ms": 247034.9,
+      "pp_tok_s": 828.54,
+      "gen_tokens": 512,
+      "gen_ms": 6115.5,
+      "tg_tok_s": 83.56,
+      "wall_s": 256.06
+    },
+    {
+      "task": "coding_250k",
+      "prompt_tokens": 255830,
+      "prompt_ms": 466167.0,
+      "pp_tok_s": 548.79,
+      "gen_tokens": 512,
+      "gen_ms": 6749.4,
+      "tg_tok_s": 75.71,
+      "wall_s": 480.32
+    },
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 249837,
+      "prompt_ms": 439407.5,
+      "pp_tok_s": 568.58,
+      "gen_tokens": 64,
+      "gen_ms": 1139.3,
+      "tg_tok_s": 55.3,
+      "wall_s": 446.98,
+      "max_ctx_request": 250000
+    }
+  ],
+  "max_ctx_pp": 568.58,
+  "max_ctx_tg": 55.3,
+  "max_ctx_tokens": 249837,
+  "pass": true,
+  "record_note": "peak_vram backfilled from 262k_b4864_ub4864_r2.vram.json"
+}

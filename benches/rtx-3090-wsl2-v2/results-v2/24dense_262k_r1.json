@@ -1,0 +1,94 @@
+{
+  "preset": "24dense",
+  "variant": "24dense_262k",
+  "rep": 1,
+  "extra_args": "",
+  "ctx_actual": 262144,
+  "batch_params": "batch=4096 ubatch=2048",
+  "max_ctx_tokens": 256901,
+  "load_seconds": 81,
+  "probe_seconds": 1571,
+  "peak_vram_mib": 21528,
+  "ceiling_mib": 23552,
+  "headroom_mib": 2024,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "prompt_tokens": 16472,
+      "prompt_ms": 12899.7,
+      "pp_tok_s": 1276.93,
+      "gen_tokens": 512,
+      "gen_ms": 3650.1,
+      "tg_tok_s": 140.0,
+      "wall_s": 16.69
+    },
+    {
+      "task": "coding_64k",
+      "prompt_tokens": 65499,
+      "prompt_ms": 46396.7,
+      "pp_tok_s": 1411.72,
+      "gen_tokens": 512,
+      "gen_ms": 3838.4,
+      "tg_tok_s": 133.13,
+      "wall_s": 50.77
+    },
+    {
+      "task": "coding_128k",
+      "prompt_tokens": 130883,
+      "prompt_ms": 117558.4,
+      "pp_tok_s": 1113.34,
+      "gen_tokens": 512,
+      "gen_ms": 4456.2,
+      "tg_tok_s": 114.67,
+      "wall_s": 123.52
+    },
+    {
+      "task": "coding_160k",
+      "prompt_tokens": 163624,
+      "prompt_ms": 163218.4,
+      "pp_tok_s": 1002.48,
+      "gen_tokens": 512,
+      "gen_ms": 4856.0,
+      "tg_tok_s": 105.23,
+      "wall_s": 170.28
+    },
+    {
+      "task": "coding_200k",
+      "prompt_tokens": 204486,
+      "prompt_ms": 232946.3,
+      "pp_tok_s": 877.82,
+      "gen_tokens": 512,
+      "gen_ms": 4609.9,
+      "tg_tok_s": 110.85,
+      "wall_s": 240.06
+    },
+    {
+      "task": "coding_250k",
+      "prompt_tokens": 255676,
+      "prompt_ms": 471174.1,
+      "pp_tok_s": 542.64,
+      "gen_tokens": 512,
+      "gen_ms": 5319.5,
+      "tg_tok_s": 96.06,
+      "wall_s": 484.19
+    },
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 256495,
+      "prompt_ms": 473576.6,
+      "pp_tok_s": 541.61,
+      "gen_tokens": 64,
+      "gen_ms": 1019.4,
+      "tg_tok_s": 61.8,
+      "wall_s": 481.23,
+      "max_ctx_request": 256901
+    }
+  ],
+  "max_ctx_pp": 541.61,
+  "max_ctx_tg": 61.8,
+  "max_ctx_prompt_tokens": 256495,
+  "pass": true,
+  "record_note": "oom_lines reset to 0: the old grep matched the fit warning text \"may run out of memory while writing\"; no allocation failed. Detector fixed in run_preset.sh."
+}
