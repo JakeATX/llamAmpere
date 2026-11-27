@@ -4202,7 +4202,11 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_logits();
 
     // add backend sampling layers (if any)
-    llm->build_sampling();
+    // [TSPLITBS] with a single-card sampler backend under tensor split the sampler nodes go last: the scheduler gives
+    // unassigned nodes the backend of the node before them, and nothing but the sampler belongs on that card
+    if (!params.backend_sampler) {
+        llm->build_sampling();
+    }
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
@@ -4213,6 +4217,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_layer_inp_dev();
 
     llm->build_h_nextn_dev();
+
+    if (params.backend_sampler) {
+        llm->build_sampling();
+    }
 
     llm->res->set_outputs(params);
 

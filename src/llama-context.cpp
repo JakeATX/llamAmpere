@@ -7,6 +7,7 @@
 #define LLAMA_OUTPUT_RESERVE_MIN 8
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
+#include "../ggml/src/ggml-backend-impl.h" // [TSPLITBS] ggml_backend_is_meta, ggml_backend_meta_simple_backend
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
@@ -419,6 +420,13 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.name             =*/ "fused top-k mask",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER: "1" = backend sampler chains run on one card under -sm tensor; unset or
+// anything else = off (the chains fall back to CPU sampling there)
+static bool llama_tsplit_backend_sampler_wanted() {
+    const char * env = getenv("LLAMA_TSPLIT_BACKEND_SAMPLER");
+    return env != nullptr && strcmp(env, "1") == 0;
+}
 
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     model(model),
@@ -1019,6 +1027,31 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev_other.dev)));
                 }
                 backends.emplace_back(backend);
+            }
+        }
+
+        // [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER=1: under tensor split the backend sampler chains (draft top-k, -bs)
+        // run on the meta device's first card instead of falling back to CPU sampling; build_sampling() gathers the
+        // vocab-split logits rows onto it. Unset or 0 = off (CPU sampling, as before).
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tsplit_backend_sampler_wanted()) {
+            for (auto & backend : backends) {
+                if (!ggml_backend_is_meta(backend.get()) || ggml_backend_meta_n_backends(backend.get()) == 0) {
+                    continue;
+                }
+                ggml_backend_dev_t dev0 = ggml_backend_get_device(ggml_backend_meta_simple_backend(backend.get(), 0));
+                ggml_backend_t bs = dev0 ? ggml_backend_dev_init(dev0, nullptr) : nullptr;
+                if (bs == nullptr) {
+                    LLAMA_LOG_WARN("%s: [TSPLITBS] cannot start a %s backend for the samplers; using CPU sampling\n",
+                            __func__, dev0 ? ggml_backend_dev_name(dev0) : "first-card");
+                    break;
+                }
+                backend_tsplit_sampler = bs;
+                LLAMA_LOG_INFO("%s: [TSPLITBS] backend samplers run on %s (LLAMA_TSPLIT_BACKEND_SAMPLER=1)\n",
+                        __func__, ggml_backend_dev_name(dev0));
+                break;
+            }
+            if (backend_tsplit_sampler) {
+                backends.emplace_back(backend_tsplit_sampler);
             }
         }
 
@@ -5361,7 +5394,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return false;
     }
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !backend_tsplit_sampler) {
         static bool warned = false;
         if (!warned) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
@@ -5378,7 +5411,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampler && sampler->iface->backend_init && sampler->iface->backend_apply && llama_sampler_chain_n(sampler) > 0;
 
     if (sampler && can_offload) {
-        auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
+        // [TSPLITBS] the sampler state lives on the card its nodes run on
+        auto * buft = backend_tsplit_sampler ? ggml_backend_get_default_buffer_type(backend_tsplit_sampler)
+                                             : ggml_backend_dev_buffer_type(model.dev_output());
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
@@ -9477,6 +9512,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
     };
     p.ple_pf = ple_pf.get();
     p.moe_stream = ink_stream && ink_stream->armed() ? ink_stream.get() : nullptr;
+    p.backend_sampler = backend_tsplit_sampler;
     p.mtp_tok_row = mtp_pipe.active;
     p.moe_onepath_live = ggml_moe_bank_onepath_live();
     if (b1_cur.active) {

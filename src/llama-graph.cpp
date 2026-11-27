@@ -2337,6 +2337,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_inverses (params.hadamard_inverses),
     moe_cache        (params.moe_cache),
     moe_stream       (params.moe_stream),
+    backend_sampler  (params.backend_sampler),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -10527,8 +10528,19 @@ void llm_graph_context::build_sampling() const {
         return;
     }
 
+    // [TSPLITBS] tensor split: the head's logits are split by vocab rows across the cards, while the sampler ops (argmax,
+    // top-k, softmax) need whole rows. Gather the logits rows into one contiguous tensor on backend_sampler (a single
+    // card; the scheduler copies the rows there as plain FP32 bytes, no reduce, so the values are the ones the host
+    // would read) and run every sampler node on that card.
+    ggml_tensor * t_logits = res->t_logits;
+    const int n_nodes_pre = ggml_graph_n_nodes(gf);
+    if (backend_sampler) {
+        t_logits = ggml_cont(ctx0, t_logits);
+        ggml_set_name(t_logits, "tsplit_sampler_logits");
+    }
+
     std::array<ggml_tensor *, 2> outs;
-    outs[0] = res->t_logits;
+    outs[0] = t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     auto * sampling_input = inp_sampling.get();
@@ -10569,10 +10581,10 @@ void llm_graph_context::build_sampling() const {
     }
 
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
-    GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
+    GGML_ASSERT(t_logits != nullptr && "missing t_logits tensor");
 
     if (!res->greedy_rows.empty()) {
-        res->t_greedy_rows = ggml_argmax(ctx0, res->t_logits);
+        res->t_greedy_rows = ggml_argmax(ctx0, t_logits);
         if (ids_map) {
             ggml_tensor * rows = ggml_reshape_2d(ctx0, ids_map, 1, ids_map->ne[0]);
             res->t_greedy_rows = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, rows, res->t_greedy_rows), res->t_greedy_rows->ne[0]);
@@ -10585,10 +10597,10 @@ void llm_graph_context::build_sampling() const {
     // this trick makes the graph static, regardless of which samplers are activated
     // this is important in order to minimize graph reallocations
     // The single-row samplers below read row 0 at most when no row is an output, so the pad is only
-    // needed when there are no logit rows; otherwise they view res->t_logits directly (same row
+    // needed when there are no logit rows; otherwise they view t_logits directly (same row
     // stride, same bytes) and the copy is not run. Graph reuse already compares n_outputs.
-    ggml_tensor * logits_t = res->t_logits->ne[1] > 0 && ggml_is_contiguous(res->t_logits)
-            ? res->t_logits : ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = t_logits->ne[1] > 0 && ggml_is_contiguous(t_logits)
+            ? t_logits : ggml_pad(ctx0, t_logits, 0, 1, 0, 0);
 
     // upstream: give stateful backend sampler chains a chance to reset before the graph is rebuilt
     for (const auto & entry : samplers) {
@@ -10624,7 +10636,7 @@ void llm_graph_context::build_sampling() const {
             ggml_set_input(t_rows);
             sampling_input->row_inputs[seq_id] = { t_rows, rows };
 
-            ggml_tensor * logits_rows = ggml_get_rows(ctx0, res->t_logits, t_rows); // [n_vocab, n_rows]
+            ggml_tensor * logits_rows = ggml_get_rows(ctx0, t_logits, t_rows); // [n_vocab, n_rows]
             ggml_format_name(logits_rows, "logits_rows_%d", seq_id);
 
             struct llama_sampler_data data = {
@@ -10716,6 +10728,13 @@ void llm_graph_context::build_sampling() const {
             res->t_candidates[seq_id] = data.candidates;
             outs[1] = data.candidates;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+        }
+    }
+
+    // [TSPLITBS] every node added above reads the gathered copy (or the sampler's own state on that card)
+    if (backend_sampler) {
+        for (int i = n_nodes_pre; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_backend_sched_set_tensor_backend(sched, ggml_graph_node(gf, i), backend_sampler);
         }
     }
 

@@ -1162,6 +1162,9 @@ struct llm_graph_params {
     // [PLEPF] the context's PLE page prefetch (null when off); set after construction
     llama_ple_prefetch * ple_pf = nullptr;
     const llama_ink_stream * moe_stream = nullptr; // fork (INKSTREAM): armed prompt expert streamer, or nullptr
+    // [TSPLITBS] tensor split: the backend sampler chains run on this single-card backend (logits rows gathered
+    // to it), or nullptr (LLAMA_TSPLIT_BACKEND_SAMPLER)
+    ggml_backend_t backend_sampler = nullptr;
 
     // [RTPORT] 1-row MTP step whose token embedding row is a device input (LLAMA_MTP_PIPELINE); set after construction
     bool mtp_tok_row = false;
@@ -1459,6 +1462,7 @@ struct llm_graph_context {
     const llama_moe_cache        * moe_cache;
     const llama_ink_stream       * moe_stream = nullptr;
     mutable int                    moe_stream_il = -1; // visit whose experts build_lora_mm_id reads from the streamer
+    ggml_backend_t                 backend_sampler = nullptr; // [TSPLITBS] see llm_graph_params
 
     const llama_prec_policy * prec_policy;
 

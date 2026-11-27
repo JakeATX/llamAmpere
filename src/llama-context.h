@@ -721,6 +721,9 @@ private:
     int32_t n_reallocs_diff = 0;
 
     ggml_backend_t backend_cpu = nullptr;
+    // [TSPLITBS] tensor split: a single-card backend (the meta device's first card) for the backend sampler chains,
+    // owned by backends; nullptr unless LLAMA_TSPLIT_BACKEND_SAMPLER=1
+    ggml_backend_t backend_tsplit_sampler = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
     // training
