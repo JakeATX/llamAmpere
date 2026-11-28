@@ -2006,7 +2006,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     // [TSPLITVOCAB] a range of whole rows of a 2-D matrix split by rows (AXIS_1, one segment, plain row types): each
     // row lives on exactly one device, so copy the overlap from each device's slice. The chunk path below only reads
     // the whole matrix (its chunk along AXIS_1 is nb[2]); this lets a caller read single rows (draft shortlist rows).
-    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 && tensor->ne[2] == 1 && tensor->ne[3] == 1 && slab == 1 &&
             (offset % tensor->nb[2] != 0 || size % tensor->nb[2] != 0)) {
         const size_t row = tensor->nb[1];
         GGML_ASSERT(offset % row == 0);
