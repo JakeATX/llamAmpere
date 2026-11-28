@@ -43,7 +43,8 @@ every output row of the ubatch owned by a sequence with a backend sampler (`--sp
 the default). Otherwise the graph silently uses the full head, which keeps every output correct.
 Under `--split-mode tensor` the head lives on the Meta device (sharded across the GPUs). Since v0.7.5.2 the shortlist
 is kept there by default: `LLAMA_TSPLIT_BACKEND_SAMPLER` (MTP draft sampler on one card) and `LLAMA_TSPLIT_DRAFT_VOCAB`
-are on unless set to `0` (kill switches; either one at `0` makes the draft score the full sharded head). The shortlisted head rows are copied (raw bytes, same type) into a plain tensor on the sampler card
+are on when unset or `1` (`LLAMA_TSPLIT_BACKEND_SAMPLER=2` also covers the target context); `0` (or any other value) turns
+each off, and either one off makes the draft score the full sharded head. The shortlisted head rows are copied (raw bytes, same type) into a plain tensor on the sampler card
 (about 98 MiB for the 24,576-row Qwen3.8-27B list with a Q6_K head), the draft scores it there and the backend sampler
 reads the logits on the same card. Plain row types only (no EXL3 / AI+ heads, no Hadamard-rotated or scaled head); the
 in-graph MTP chain keeps the full head. Look for the `[TSPLITVOCAB]` lines in the log (WARN level).

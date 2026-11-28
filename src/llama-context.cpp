@@ -1078,7 +1078,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 }
             }
             if (tsplitbs_host_weight) {
-                LLAMA_LOG_WARN("%s: [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER=1 ignored: weights in host memory (%s); "
+                LLAMA_LOG_WARN("%s: [TSPLITBS] backend sampler card not used: weights in host memory (%s); "
                         "using CPU sampling\n", __func__, tsplitbs_host_weight);
             }
         }
@@ -1114,8 +1114,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 draft_vocab_tsplit_backend = backend_tsplit_sampler;
                 init_draft_vocab(draft_vocab_tsplit_path.c_str(), draft_vocab_tsplit_hot);
             } else {
-                LLAMA_LOG_WARN("%s: [TSPLITVOCAB] LLAMA_TSPLIT_DRAFT_VOCAB=1 ignored: needs the sampler card "
-                        "(LLAMA_TSPLIT_BACKEND_SAMPLER=1); the draft scores the full head\n", __func__);
+                LLAMA_LOG_WARN("%s: [TSPLITVOCAB] draft vocabulary shortlist not applied under tensor split: needs the sampler card "
+                        "(LLAMA_TSPLIT_BACKEND_SAMPLER on); the draft scores the full head\n", __func__);
             }
         }
 
@@ -2302,6 +2302,7 @@ int32_t llama_context::draft_vocab_apply(const std::vector<llama_mtp_hot_vocab::
         const size_t row = draft_vocab.compact->nb[1];
         std::vector<uint8_t> buf(row);
         for (const auto & rep : reps) {
+            GGML_ASSERT(rep.id >= 0 && rep.id < draft_vocab.compact_src->ne[1]);
             ggml_backend_tensor_get(draft_vocab.compact_src, buf.data(), (size_t) rep.id * row, row);
             ggml_backend_tensor_set(draft_vocab.compact, buf.data(), (size_t) (base + rep.slot) * row, row);
         }
