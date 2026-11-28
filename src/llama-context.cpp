@@ -421,16 +421,16 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-// [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER: "1" = backend sampler chains run on one card under -sm tensor in MTP draft
-// contexts only; "2" = in every context (also the target, where the server then turns on GPU top-K verification);
-// unset or anything else = off (the chains fall back to CPU sampling there).
+// [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER (read only under -sm tensor): unset or "1" (default ON since v0.7.5.2) =
+// backend sampler chains run on one card in MTP draft contexts only; "2" = in every context (also the target, where
+// the server then turns on GPU top-K verification); "0" or anything else = off (kill switch: CPU sampling there).
 // Why "1" skips the target: the gather to one card is host-staged (no peer access between the cards on our boards),
 // so GPU verification moves the (w+1) x n_vocab verify rows D2H and back H2D, where CPU verification reads them once.
 // GH #143 gate r4 (Taichi 2x3090, 27B): verify +0.7 ms/round with the target included.
 static bool llama_tsplit_backend_sampler_wanted(llama_context_type ctx_type) {
     const char * env = getenv("LLAMA_TSPLIT_BACKEND_SAMPLER");
     if (env == nullptr) {
-        return false;
+        return ctx_type == LLAMA_CONTEXT_TYPE_MTP; // default ON (= "1"); gate: Taichi 2x3090 300 W, 27B, 100K +4.7%
     }
     if (strcmp(env, "2") == 0) {
         return true;
@@ -438,12 +438,12 @@ static bool llama_tsplit_backend_sampler_wanted(llama_context_type ctx_type) {
     return strcmp(env, "1") == 0 && ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 }
 
-// [TSPLITVOCAB] LLAMA_TSPLIT_DRAFT_VOCAB: "1" = under -sm tensor the MTP draft context keeps its vocabulary shortlist as a
-// non-split copy of the shortlisted head rows on the sampler card (needs LLAMA_TSPLIT_BACKEND_SAMPLER=1); unset or
-// anything else = off (the draft scores the full sharded head, as before)
+// [TSPLITVOCAB] LLAMA_TSPLIT_DRAFT_VOCAB (read only under -sm tensor): unset or "1" (default ON since v0.7.5.2) = the MTP
+// draft context keeps its vocabulary shortlist as a non-split copy of the shortlisted head rows on the sampler card
+// (needs the backend sampler card); "0" or anything else = off (kill switch: the draft scores the full sharded head)
 static bool llama_tsplit_draft_vocab_wanted() {
     const char * env = getenv("LLAMA_TSPLIT_DRAFT_VOCAB");
-    return env != nullptr && strcmp(env, "1") == 0;
+    return env == nullptr || strcmp(env, "1") == 0;
 }
 
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
@@ -1097,7 +1097,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 backend_tsplit_sampler = bs;
                 // WARN, not INFO: the server's default verbosity drops library INFO lines, and the gate greps this line
                 LLAMA_LOG_WARN("%s: [TSPLITBS] backend samplers run on %s (LLAMA_TSPLIT_BACKEND_SAMPLER=%s, %s context)\n",
-                        __func__, ggml_backend_dev_name(dev0), getenv("LLAMA_TSPLIT_BACKEND_SAMPLER"),
+                        __func__, ggml_backend_dev_name(dev0),
+                        getenv("LLAMA_TSPLIT_BACKEND_SAMPLER") ? getenv("LLAMA_TSPLIT_BACKEND_SAMPLER") : "unset = default on",
                         cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "MTP draft" : "non-MTP");
                 break;
             }
