@@ -421,11 +421,21 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-// [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER: "1" = backend sampler chains run on one card under -sm tensor; unset or
-// anything else = off (the chains fall back to CPU sampling there)
-static bool llama_tsplit_backend_sampler_wanted() {
+// [TSPLITBS] LLAMA_TSPLIT_BACKEND_SAMPLER: "1" = backend sampler chains run on one card under -sm tensor in MTP draft
+// contexts only; "2" = in every context (also the target, where the server then turns on GPU top-K verification);
+// unset or anything else = off (the chains fall back to CPU sampling there).
+// Why "1" skips the target: the gather to one card is host-staged (no peer access between the cards on our boards),
+// so GPU verification moves the (w+1) x n_vocab verify rows D2H and back H2D, where CPU verification reads them once.
+// GH #143 gate r4 (Taichi 2x3090, 27B): verify +0.7 ms/round with the target included.
+static bool llama_tsplit_backend_sampler_wanted(llama_context_type ctx_type) {
     const char * env = getenv("LLAMA_TSPLIT_BACKEND_SAMPLER");
-    return env != nullptr && strcmp(env, "1") == 0;
+    if (env == nullptr) {
+        return false;
+    }
+    if (strcmp(env, "2") == 0) {
+        return true;
+    }
+    return strcmp(env, "1") == 0 && ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 }
 
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
@@ -1038,7 +1048,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         // the flag is refused (CPU sampling, as with the flag off) when any weight other than the token embedding is in
         // host memory (-ngl below all layers, -ot / CPU-MoE overrides, host expert buffers).
         const char * tsplitbs_host_weight = nullptr;
-        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tsplit_backend_sampler_wanted()) {
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tsplit_backend_sampler_wanted(cparams.ctx_type)) {
             if (model.has_tensor_overrides()) {
                 tsplitbs_host_weight = "tensor buffer overrides (-ot / CPU-MoE)";
             } else if (model.n_gpu_layers() <= model.hparams.n_layer_all) {
@@ -1059,7 +1069,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                         "using CPU sampling\n", __func__, tsplitbs_host_weight);
             }
         }
-        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tsplit_backend_sampler_wanted() && !tsplitbs_host_weight) {
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tsplit_backend_sampler_wanted(cparams.ctx_type) && !tsplitbs_host_weight) {
             for (auto & backend : backends) {
                 if (!ggml_backend_is_meta(backend.get()) || ggml_backend_meta_n_backends(backend.get()) == 0) {
                     continue;
@@ -1073,8 +1083,9 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 }
                 backend_tsplit_sampler = bs;
                 // WARN, not INFO: the server's default verbosity drops library INFO lines, and the gate greps this line
-                LLAMA_LOG_WARN("%s: [TSPLITBS] backend samplers run on %s (LLAMA_TSPLIT_BACKEND_SAMPLER=1)\n",
-                        __func__, ggml_backend_dev_name(dev0));
+                LLAMA_LOG_WARN("%s: [TSPLITBS] backend samplers run on %s (LLAMA_TSPLIT_BACKEND_SAMPLER=%s, %s context)\n",
+                        __func__, ggml_backend_dev_name(dev0), getenv("LLAMA_TSPLIT_BACKEND_SAMPLER"),
+                        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "MTP draft" : "non-MTP");
                 break;
             }
             if (backend_tsplit_sampler) {
