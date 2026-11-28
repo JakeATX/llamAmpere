@@ -438,6 +438,14 @@ static bool llama_tsplit_backend_sampler_wanted(llama_context_type ctx_type) {
     return strcmp(env, "1") == 0 && ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 }
 
+// [TSPLITVOCAB] LLAMA_TSPLIT_DRAFT_VOCAB: "1" = under -sm tensor the MTP draft context keeps its vocabulary shortlist as a
+// non-split copy of the shortlisted head rows on the sampler card (needs LLAMA_TSPLIT_BACKEND_SAMPLER=1); unset or
+// anything else = off (the draft scores the full sharded head, as before)
+static bool llama_tsplit_draft_vocab_wanted() {
+    const char * env = getenv("LLAMA_TSPLIT_DRAFT_VOCAB");
+    return env != nullptr && strcmp(env, "1") == 0;
+}
+
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
@@ -580,7 +588,12 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             path = nullptr;
         }
         if (path != nullptr && path[0] != '\0') {
-            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                    llama_tsplit_draft_vocab_wanted()) {
+                // [TSPLITVOCAB] LLAMA_TSPLIT_DRAFT_VOCAB=1: built after the backends exist, on the sampler card
+                draft_vocab_tsplit_path = path;
+                draft_vocab_tsplit_hot  = params.draft_vocab_hot;
+            } else if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
                 // the head is sharded across the Meta device and backend sampling is unavailable there:
                 // the draft scores the full head, so the map tensor is not created (see draft_vocab_direct)
                 LLAMA_LOG_WARN("%s: --spec-draft-vocab-map is not used with SPLIT_MODE_TENSOR, the draft scores the full head\n", __func__);
@@ -1090,6 +1103,18 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             }
             if (backend_tsplit_sampler) {
                 backends.emplace_back(backend_tsplit_sampler);
+            }
+        }
+
+        // [TSPLITVOCAB] the draft shortlist head is a plain (non-split) copy of the shortlisted rows on the sampler card:
+        // the shortlist logits are then computed where the sampler chain runs, no logits gather
+        if (!draft_vocab_tsplit_path.empty()) {
+            if (backend_tsplit_sampler) {
+                draft_vocab_tsplit_backend = backend_tsplit_sampler;
+                init_draft_vocab(draft_vocab_tsplit_path.c_str(), draft_vocab_tsplit_hot);
+            } else {
+                LLAMA_LOG_WARN("%s: [TSPLITVOCAB] LLAMA_TSPLIT_DRAFT_VOCAB=1 ignored: needs the sampler card "
+                        "(LLAMA_TSPLIT_BACKEND_SAMPLER=1); the draft scores the full head\n", __func__);
             }
         }
 
@@ -2029,6 +2054,71 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
                     n_hot, (long long) n_sel));
     }
 
+    // [TSPLITVOCAB] tensor split (LLAMA_TSPLIT_DRAFT_VOCAB=1, MTP context): the head is sharded by vocab rows across the
+    // cards, so the one-row-expert path over it does not exist. The shortlist head is a plain copy of the shortlisted
+    // head rows (same type, raw bytes: each score is the same row dot product as on the full head) on the sampler card,
+    // with the id map beside it; the draft graph scores it there and the backend sampler chain reads the logits on the
+    // same card. The hot tail stays live: draft_vocab_apply copies replaced rows out of the sharded head (row reads).
+    if (draft_vocab_tsplit_backend != nullptr) {
+        ggml_backend_buffer_type_t hb = ggml_backend_buffer_get_type(head->buffer);
+        ggml_backend_buffer_type_t tb = ggml_backend_get_default_buffer_type(draft_vocab_tsplit_backend);
+        const char * why = nullptr;
+        if (!ggml_backend_buft_is_meta(hb)) {
+            why = "head is not on the tensor-split device";
+        } else if (n_sel >= head->ne[1]) {
+            why = "the map has as many rows as the head";
+        } else if (!ggml_is_contiguous(head) || ggml_n_dims(head) != 2) {
+            why = "head is not a contiguous matrix";
+        } else if (ggml_get_type_traits(head->type)->to_float == nullptr || ggml_exl3_bits(head->type) != 0 ||
+                ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0 || llama_draft_vocab_aif_head(head->type)) {
+            why = "head type has no plain rows (EXL3 / AI+ slabs)";
+        } else if (head_model->hadamard_rotations.count(head) || head_model->hadamard_inverses.count(head)) {
+            why = "the output head is Hadamard-rotated";
+        } else if (head == head_model->output && head_model->output_s != nullptr) {
+            why = "the output head has a scale tensor (it stays on the tensor-split device)";
+        }
+        if (why != nullptr) {
+            LLAMA_LOG_WARN("%s: [TSPLITVOCAB] draft vocabulary shortlist not applied (%s: %s %s), the draft scores the full head\n",
+                    __func__, why, ggml_get_name(head), ggml_type_name(head->type));
+            return;
+        }
+        ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+        draft_vocab.ctx.reset(ggml_init(ip));
+        draft_vocab.ids = ggml_new_tensor_1d(draft_vocab.ctx.get(), GGML_TYPE_I32, n_sel);
+        ggml_set_name(draft_vocab.ids, "draft_vocab_ids");
+        draft_vocab.compact = ggml_new_tensor_2d(draft_vocab.ctx.get(), head->type, head->ne[0], n_sel);
+        ggml_set_name(draft_vocab.compact, "draft_vocab_compact");
+        draft_vocab.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_vocab.ctx.get(), tb));
+        if (!draft_vocab.buf) {
+            throw std::runtime_error("draft vocabulary map: failed to allocate the tensor-split shortlist head");
+        }
+        ggml_backend_buffer_set_usage(draft_vocab.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_tensor_set(draft_vocab.ids, map.ids.data(), 0, (size_t) n_sel * sizeof(int32_t));
+        const size_t row = head->nb[1];
+        GGML_ASSERT(row == draft_vocab.compact->nb[1]);
+        const int64_t t0 = ggml_time_us();
+        std::vector<uint8_t> rows((size_t) n_sel * row);
+        for (int64_t i = 0; i < n_sel; ++i) {
+            GGML_ASSERT(map.ids[i] >= 0 && map.ids[i] < head->ne[1]);
+            ggml_backend_tensor_get(head, rows.data() + (size_t) i * row, (size_t) map.ids[i] * row, row);
+        }
+        ggml_backend_tensor_set(draft_vocab.compact, rows.data(), 0, rows.size());
+        draft_vocab.compact_src = head;
+        draft_vocab.compact_raw = true;
+        draft_vocab.host  = std::move(map.ids);
+        draft_vocab.n_hot = n_hot;
+        if (n_hot > 0) {
+            draft_vocab.hot.init(draft_vocab.host, n_vocab, n_hot);
+        }
+        // WARN so it shows at the server's default verbosity (engagement proof + resident memory on that card)
+        LLAMA_LOG_WARN("%s: [TSPLITVOCAB] draft shortlist head on %s: %lld of %lld tokens from %s, %d hot slots, "
+                "%s %.1f MiB + map %.1f KiB (row copies of %s, %.2f s)\n", __func__, ggml_backend_buft_name(tb),
+                (long long) n_sel, (long long) n_vocab, source.c_str(), n_hot, ggml_type_name(head->type),
+                ggml_nbytes(draft_vocab.compact) / 1024.0 / 1024.0, (double) n_sel * sizeof(int32_t) / 1024.0,
+                ggml_get_name(head), (ggml_time_us() - t0) / 1e6);
+        return;
+    }
+
     // [#81] compact resident draft head: auto for EXL3 and AI+ heads (no one-row path), LLAMA_DRAFT_VOCAB_COMPACT=1
     // forces it on any head (A/B), =0 keeps the full-head fallback; prism-rotated heads keep their fallback.
     // Row type: iq4_xs from an EXL3 head, q6_K from an AI+ head (the IQ4_XS model's head is Q6_K: same draft-head
@@ -2206,6 +2296,15 @@ int32_t llama_context::draft_vocab_apply(const std::vector<llama_mtp_hot_vocab::
     // one upload of the whole hot region: cheap at request granularity and keeps the tensor fixed
     ggml_backend_tensor_set(draft_vocab.ids, draft_vocab.host.data() + base,
             (size_t) base * sizeof(int32_t), (size_t) draft_vocab.n_hot * sizeof(int32_t));
+
+    if (draft_vocab.compact_raw && draft_vocab.compact != nullptr && draft_vocab.compact_src != nullptr) {
+        const size_t row = draft_vocab.compact->nb[1];
+        std::vector<uint8_t> buf(row);
+        for (const auto & rep : reps) {
+            ggml_backend_tensor_get(draft_vocab.compact_src, buf.data(), (size_t) rep.id * row, row);
+            ggml_backend_tensor_set(draft_vocab.compact, buf.data(), (size_t) (base + rep.slot) * row, row);
+        }
+    }
 
     return (int32_t) reps.size();
 }
@@ -9573,6 +9672,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
     p.ple_pf = ple_pf.get();
     p.moe_stream = ink_stream && ink_stream->armed() ? ink_stream.get() : nullptr;
     p.backend_sampler = backend_tsplit_sampler;
+    p.draft_vocab_backend = draft_vocab.ids ? draft_vocab_tsplit_backend : nullptr;
     p.mtp_tok_row = mtp_pipe.active;
     p.moe_onepath_live = ggml_moe_bank_onepath_live();
     if (b1_cur.active) {

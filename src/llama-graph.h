@@ -1165,6 +1165,9 @@ struct llm_graph_params {
     // [TSPLITBS] tensor split: the backend sampler chains run on this single-card backend (logits rows gathered
     // to it), or nullptr (LLAMA_TSPLIT_BACKEND_SAMPLER)
     ggml_backend_t backend_sampler = nullptr;
+    // [TSPLITVOCAB] tensor split: the draft shortlist head (draft_vocab_compact) and its id map live on this single-card
+    // backend (the sampler card), or nullptr (LLAMA_TSPLIT_DRAFT_VOCAB)
+    ggml_backend_t draft_vocab_backend = nullptr;
 
     // [RTPORT] 1-row MTP step whose token embedding row is a device input (LLAMA_MTP_PIPELINE); set after construction
     bool mtp_tok_row = false;
@@ -1463,6 +1466,7 @@ struct llm_graph_context {
     const llama_ink_stream       * moe_stream = nullptr;
     mutable int                    moe_stream_il = -1; // visit whose experts build_lora_mm_id reads from the streamer
     ggml_backend_t                 backend_sampler = nullptr; // [TSPLITBS] see llm_graph_params
+    ggml_backend_t                 draft_vocab_backend = nullptr; // [TSPLITVOCAB] see llm_graph_params
 
     const llama_prec_policy * prec_policy;
 

@@ -1815,6 +1815,32 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         return;
     }
 
+    // [TSPLITVOCAB] a range of whole rows of a 2-D matrix split by rows (AXIS_1, one segment, plain row types): each
+    // row lives on exactly one device, so copy the overlap from each device's slice. The chunk path below only reads
+    // the whole matrix (its chunk along AXIS_1 is nb[2]); this lets a caller read single rows (draft shortlist rows).
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 && tensor->ne[2] == 1 && tensor->ne[3] == 1 && slab == 1 &&
+            (offset % tensor->nb[2] != 0 || size % tensor->nb[2] != 0)) {
+        const size_t row = tensor->nb[1];
+        GGML_ASSERT(offset % row == 0);
+        GGML_ASSERT(size   % row == 0);
+        const int64_t r0 = offset / row;
+        const int64_t r1 = (offset + size) / row;
+        int64_t first = 0; // first row of device j's slice
+        for (size_t j = 0; j < n_bufs && first < r1; j++) {
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            GGML_ASSERT(simple_tensor->nb[1] == row);
+            const int64_t last = first + simple_tensor->ne[1];
+            const int64_t a = std::max(first, r0);
+            const int64_t b = std::min(last,  r1);
+            if (a < b) {
+                ggml_backend_tensor_get(simple_tensor, (char *) data + (a - r0)*row, (a - first)*row, (b - a)*row);
+            }
+            first = last;
+        }
+        GGML_ASSERT(first >= r1);
+        return;
+    }
+
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:

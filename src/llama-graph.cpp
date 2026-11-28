@@ -2338,6 +2338,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     moe_stream       (params.moe_stream),
     backend_sampler  (params.backend_sampler),
+    draft_vocab_backend(params.draft_vocab_backend),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -10915,6 +10916,20 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         ggml_tensor * logits = build_draft_vocab_compact(head_w, head_s, cur); // [n_sel, n_outputs]
         cb(logits, "draft_vocab_logits", -1);
         res->t_logits_ids = draft_vocab_ids;
+        if (draft_vocab_backend) {
+            // [TSPLITVOCAB] the shortlist head and its map sit on the sampler card: score there (the scheduler copies the
+            // n_embd-wide input rows over), so build_sampling reads whole logits rows on the card it runs on
+            for (ggml_tensor * t = logits; t != nullptr && t != draft_vocab_compact; t = t->src[0]) {
+                ggml_backend_sched_set_tensor_backend(sched, t, draft_vocab_backend);
+            }
+            static std::atomic<bool> told{false};
+            if (!is_reserve && !told.exchange(true)) {
+                // WARN, not INFO: the server drops library INFO lines and the gate greps this one
+                LLAMA_LOG_WARN("%s: [TSPLITVOCAB] draft scores the %lld-row shortlist head on %s (n_outputs = %d)\n",
+                        __func__, (long long) draft_vocab_compact->ne[1], ggml_backend_name(draft_vocab_backend),
+                        (int) n_outputs);
+            }
+        }
         return logits;
     }
 
@@ -10961,6 +10976,10 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
         ggml_tensor * cur) const {
     if (draft_vocab_ids == nullptr || head_w == nullptr) {
         return nullptr;
+    }
+    if (draft_vocab_backend) {
+        // [TSPLITVOCAB] the in-graph chain samples on the meta device; the shortlist head lives on the sampler card
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, "tensor split: the in-graph MTP chain keeps the full head");
     }
     const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
     const bool full_head = !compact && llama_draft_vocab_full_head(head_w);

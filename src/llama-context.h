@@ -547,6 +547,7 @@ private:
         // from; set for EXL3 heads (or LLAMA_DRAFT_VOCAB_COMPACT=1), see llama-draft-vocab-compact.h
         ggml_tensor           * compact     = nullptr;
         const ggml_tensor     * compact_src = nullptr;
+        bool                    compact_raw = false; // compact rows are raw copies of compact_src rows (hot tail refreshed by row copy)
         std::vector<int32_t>    host;          // same ids, host copy
         int32_t                 n_hot = 0;     // trailing adaptive slots (0 = fully static map)
         llama_mtp_hot_vocab     hot;           // ranking policy for those slots
@@ -554,6 +555,11 @@ private:
     };
 
     draft_vocab_info draft_vocab;
+    // [TSPLITVOCAB] LLAMA_TSPLIT_DRAFT_VOCAB=1 under -sm tensor: the map is built after the backends exist (path kept
+    // here), and its head copy lives on this backend's card (the sampler card), or nullptr
+    std::string    draft_vocab_tsplit_path;
+    int32_t        draft_vocab_tsplit_hot     = 0;
+    ggml_backend_t draft_vocab_tsplit_backend = nullptr;
 
     // [#69] sampled MTP chain inputs: the packed sampling params, then one uniform per chain step
     std::vector<float> dspark_noise; // INKSPEC: fixed capacity, so the graph input pointer stays valid
