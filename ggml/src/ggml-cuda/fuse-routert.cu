@@ -15,7 +15,7 @@ static __device__ unsigned int g_routert_done[ROUTERT_MAX_SLOTS];
 // nv_bfloat162 branch, per-column warp / block reductions). The last block to finish selects: warp r takes row r.
 template <int n_experts, bool has_bias, int ncols>
 static __global__ void __launch_bounds__(ROUTERT_BLOCK)
-k_fuse_routert(const nv_bfloat16 * GGML_CUDA_RESTRICT w, const float * GGML_CUDA_RESTRICT y, float * logits, float * weights,
+k_fuse_routert(const nv_bfloat16 * w_ptr, const float * y_ptr, float * logits, float * weights,
                int32_t * ids, const float * bias, const int ncols2, const int64_t stride_row, const int64_t stride_col_y2,
                const int n_expert_used, const float clamp_val, const float scale_val, const topk_moe_config config,
                const int slot) {
@@ -24,6 +24,8 @@ k_fuse_routert(const nv_bfloat16 * GGML_CUDA_RESTRICT w, const float * GGML_CUDA
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     NO_DEVICE_CODE;
 #else
+    const nv_bfloat16 * GGML_CUDA_RESTRICT w = w_ptr;
+    const float       * GGML_CUDA_RESTRICT y = y_ptr;
     const int row = blockIdx.x;
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 
