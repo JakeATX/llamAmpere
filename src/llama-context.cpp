@@ -1072,7 +1072,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                     break;
                 }
                 backend_tsplit_sampler = bs;
-                LLAMA_LOG_INFO("%s: [TSPLITBS] backend samplers run on %s (LLAMA_TSPLIT_BACKEND_SAMPLER=1)\n",
+                // WARN, not INFO: the server's default verbosity drops library INFO lines, and the gate greps this line
+                LLAMA_LOG_WARN("%s: [TSPLITBS] backend samplers run on %s (LLAMA_TSPLIT_BACKEND_SAMPLER=1)\n",
                         __func__, ggml_backend_dev_name(dev0));
                 break;
             }
@@ -5445,6 +5446,15 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
                                              : ggml_backend_dev_buffer_type(model.dev_output());
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+
+        if (backend_tsplit_sampler) {
+            static bool told = false; // [TSPLITBS] proof the chain really attached (gate ENGAGED line)
+            if (!told) {
+                LLAMA_LOG_WARN("%s: [TSPLITBS] sampler chain attached on %s (seq_id = %d)\n", __func__,
+                        ggml_backend_name(backend_tsplit_sampler), seq_id);
+                told = true;
+            }
+        }
 
         sampling.samplers[seq_id] = sampler;
 
